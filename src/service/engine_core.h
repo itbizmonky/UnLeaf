@@ -33,9 +33,9 @@ namespace unleaf {
 
 // Process monitoring phase - v8.0 Event-Driven Adaptive Phase Control
 enum class ProcessPhase {
-    AGGRESSIVE,   // 起動直後: One-shot SET + 遅延検証 (3秒間)
-    STABLE,       // 定常監視: イベント駆動のみ (アクティブポーリングなし)
-    PERSISTENT    // 頑固対策: SET @ 5秒間隔
+    AGGRESSIVE,   // Startup: One-shot SET + deferred verification (3s)
+    STABLE,       // Steady-state: Event-driven only (no active polling)
+    PERSISTENT    // Stubborn EcoQoS: SET @ 5s interval
 };
 
 // v8.0: Enforcement request type (queued from ETW callbacks and timers)
@@ -289,7 +289,7 @@ private:
     // v5.0: Set process phase externally
     void SetProcessPhase(DWORD pid, ProcessPhase phase);
 
-    // === State checks (v7.0: GET復活 - Adaptive Phase Control) ===
+    // === State checks (v7.0: GET reinstated - Adaptive Phase Control) ===
 
     // v7.0: Check if EcoQoS (Efficiency Mode) is currently enabled
     bool IsEcoQoSEnabled(HANDLE hProcess) const;

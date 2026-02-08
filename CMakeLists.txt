@@ -1,8 +1,8 @@
-# UnLeaf v6.00 - CMake Build Configuration
+# UnLeaf v1.00 - CMake Build Configuration
 # Windows Native C++ Implementation with Multi-layer EcoQoS Defense
 
 cmake_minimum_required(VERSION 3.20)
-project(UnLeaf VERSION 6.0.0 LANGUAGES CXX)
+project(UnLeaf VERSION 1.0.0 LANGUAGES CXX)
 
 # Require C++17
 set(CMAKE_CXX_STANDARD 17)

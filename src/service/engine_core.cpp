@@ -1056,10 +1056,10 @@ bool EngineCore::PulseEnforce(HANDLE hProcess, DWORD pid, bool isIntensive) {
         static_cast<PROCESS_INFORMATION_CLASS>(UNLEAF_PROCESS_POWER_THROTTLING),
         &state, sizeof(state));
 
-    // v5.6: 優先度設定は常に実行（EcoQoS失敗でもスキップしない）
+    // v5.6: Always set priority (never skip even if EcoQoS fails)
     // Step 3: Set HIGH priority (unconditional - critical for OS resistance)
-    // Chrome sandbox等でSetProcessInformationが失敗しても、
-    // HIGH_PRIORITY_CLASSを設定することでOSによるEcoQoS再適用を防ぐ
+    // Even if SetProcessInformation fails (e.g. Chrome sandbox),
+    // setting HIGH_PRIORITY_CLASS prevents OS from reapplying EcoQoS
     SetPriorityClass(hProcess, UNLEAF_TARGET_PRIORITY);
 
     // Step 4: Thread throttling (INTENSIVE phase only - more expensive operation)
@@ -1068,7 +1068,7 @@ bool EngineCore::PulseEnforce(HANDLE hProcess, DWORD pid, bool isIntensive) {
         DisableThreadThrottling(pid, false);
     }
 
-    // エラーハンドリングは優先度設定後に実行
+    // Handle errors after priority has been set
     if (!ecoResult) {
         HandleEnforceError(hProcess, pid, GetLastError());
         return false;
@@ -1291,7 +1291,7 @@ bool EngineCore::CreateAndAssignJobObject(DWORD rootPid, HANDLE hProcess) {
     IsProcessInJob(hProcess, nullptr, &inJob);
     if (inJob) {
         LOG_DEBUG(L"Job: PID " + std::to_wstring(rootPid) + L" already in Job - pulse-only mode");
-        return false;  // PulseEnforce継続のためTrackedProcessは作成される
+        return false;  // TrackedProcess still created to continue PulseEnforce
     }
 
     // Create Job Object
@@ -1792,9 +1792,9 @@ void EngineCore::CleanupRemovedTargets() {
             bool shouldRemove = false;
 
             if (tp->isChild) {
-                // 親が生きている → 削除しない
+                // Parent still alive -> do not remove
                 bool parentAlive = trackedProcesses_.find(tp->parentPid) != trackedProcesses_.end();
-                // 自分自身がターゲット名 → 絶対に削除しない
+                // Process itself is a target name -> never remove
                 bool selfIsTarget = IsTargetName(tp->name);
 
                 if (!parentAlive && !selfIsTarget) {
