@@ -3,6 +3,7 @@
 
 #include "../common/types.h"
 #include "../common/config.h"
+#include "../common/registry_manager.h"
 #include "service_controller.h"
 #include "ipc_client.h"
 #include <string>

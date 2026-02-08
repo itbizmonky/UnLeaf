@@ -187,8 +187,8 @@ bool EngineCore::Initialize(const std::wstring& baseDir) {
         LOG_INFO(ss.str());
     }
 
-    // v6.0: Initialize registry policy controller
-    RegistryPolicyController::Instance().Initialize(baseDir);
+    // Initialize registry policy manager (centralized)
+    RegistryPolicyManager::Instance().Initialize(baseDir);
 
     LOG_INFO(L"Engine: Initialized (Event-Driven Architecture)");
     return true;
@@ -305,8 +305,8 @@ void EngineCore::Stop() {
     // v5.0: Cleanup Job Objects
     CleanupJobObjects();
 
-    // v6.0: Cleanup registry policies
-    RegistryPolicyController::Instance().CleanupAllPolicies();
+    // Cleanup all registry policies (both PowerThrottling + IFEO)
+    RegistryPolicyManager::Instance().CleanupAllPolicies();
     {
         CSLockGuard lock(policySetCs_);
         policyAppliedSet_.clear();
@@ -1023,7 +1023,7 @@ bool EngineCore::ApplyRegistryPolicy(const std::wstring& exePath, const std::wst
     }
 
     // Apply full registry exclusion
-    bool success = RegistryPolicyController::Instance().ApplyFullExclusion(exePath, exeName);
+    bool success = RegistryPolicyManager::Instance().ApplyPolicy(exeName, exePath);
 
     if (success) {
         CSLockGuard lock(policySetCs_);

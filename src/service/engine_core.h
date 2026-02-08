@@ -21,7 +21,7 @@
 #include "../common/config.h"
 #include "../common/logger.h"
 #include "process_monitor.h"
-#include "registry_policy.h"
+#include "../common/registry_manager.h"
 #include <tlhelp32.h>
 #include <map>
 #include <set>

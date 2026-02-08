@@ -106,43 +106,8 @@ cmake --build . --config Release
 
 ## アンインストール
 
-### 推奨: Manager UI からのアンインストール (完全)
-
-1. `UnLeaf_Manager.exe` を管理者として起動
-2. 「サービス登録解除 (Unregister)」をクリック
-3. UnLeaf フォルダを削除
-
-> Manager UI からの登録解除は、レジストリの完全なクリーンアップを保証します。
-> `RemoveAllPolicies` は冪等 (idempotent) に設計されており、マニフェスト不存在・レジストリキー不存在・
-> 内部状態が空の場合でもすべて正常系として安全に完了します。
-
-### バッチファイルによるアンインストール
-
-`uninstall_service.bat` はサービスの登録解除のみを行います。
-**レジストリのクリーンアップは行われません。**
-
-完全なクリーンアップが必要な場合は、Manager UI からのアンインストールを使用してください。
-
----
-
-## UnLeaf が変更するレジストリ
-
-UnLeaf は以下の **2箇所のみ** をレジストリに書き込みます。これ以外のレジストリキーには一切触れません。
-
-| # | パス | 値 | 目的 |
-|---|------|-----|------|
-| 1 | `HKLM\SYSTEM\CurrentControlSet\Control\Power\PowerThrottling\<FullExePath>` | DWORD `1` | EcoQoS 永続除外 |
-| 2 | `HKLM\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Image File Execution Options\<ExeName>\PerfOptions\CpuPriorityClass` | DWORD `3` | CPU 優先度 High |
-
-> **保証**: サービス停止時およびサービス登録解除時に、上記エントリはすべて自動削除されます。
-
-### レジストリのライフサイクル
-
-| 操作 | レジストリ | 説明 |
-|------|-----------|------|
-| プロセス追加・削除・無効化 | 変化なし | Manager UI の操作ではレジストリを変更しません |
-| サービス停止 | **全削除** | そのセッションで適用したエントリをすべて削除します |
-| サービス登録解除 | **全削除** | マニフェストファイル経由で過去の全エントリを削除します (クラッシュ後も安全) |
+1. `uninstall_service.bat` を**右クリック → 管理者として実行**
+2. UnLeaf フォルダを削除
 
 ---
 

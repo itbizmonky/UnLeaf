@@ -51,6 +51,7 @@ endif()
 set(COMMON_SOURCES
     src/common/logger.cpp
     src/common/config.cpp
+    src/common/registry_manager.cpp
 )
 
 set(COMMON_HEADERS
@@ -58,6 +59,7 @@ set(COMMON_HEADERS
     src/common/scoped_handle.h
     src/common/logger.h
     src/common/config.h
+    src/common/registry_manager.h
 )
 
 # ============================================================
@@ -69,7 +71,6 @@ set(SERVICE_SOURCES
     src/service/engine_core.cpp
     src/service/process_monitor.cpp
     src/service/ipc_server.cpp
-    src/service/registry_policy.cpp
 )
 
 set(SERVICE_HEADERS
@@ -77,7 +78,6 @@ set(SERVICE_HEADERS
     src/service/engine_core.h
     src/service/process_monitor.h
     src/service/ipc_server.h
-    src/service/registry_policy.h
 )
 
 add_executable(UnLeaf_Service

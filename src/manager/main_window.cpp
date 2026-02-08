@@ -29,6 +29,69 @@ static const wchar_t* WND_CLASS = L"UnLeafDashboard";
 #define DWMWA_USE_IMMERSIVE_DARK_MODE 20
 #endif
 
+// Parent-centered MessageBox helper (CBT hook)
+namespace {
+
+thread_local HWND g_msgBoxParent = nullptr;
+thread_local HHOOK g_hCBTHook = nullptr;
+
+LRESULT CALLBACK CenterMsgBoxCBTProc(int nCode, WPARAM wParam, LPARAM lParam) {
+    if (nCode == HCBT_ACTIVATE) {
+        HWND hwndMsgBox = reinterpret_cast<HWND>(wParam);
+        HWND hwndParent = g_msgBoxParent;
+
+        if (hwndParent && IsWindow(hwndParent) && !IsIconic(hwndParent)) {
+            RECT parentRect;
+            GetWindowRect(hwndParent, &parentRect);
+            int parentCX = (parentRect.left + parentRect.right) / 2;
+            int parentCY = (parentRect.top + parentRect.bottom) / 2;
+
+            RECT msgRect;
+            GetWindowRect(hwndMsgBox, &msgRect);
+            int msgW = msgRect.right - msgRect.left;
+            int msgH = msgRect.bottom - msgRect.top;
+
+            int newX = parentCX - msgW / 2;
+            int newY = parentCY - msgH / 2;
+
+            HMONITOR hMon = MonitorFromWindow(hwndParent, MONITOR_DEFAULTTONEAREST);
+            MONITORINFO mi = { sizeof(mi) };
+            if (GetMonitorInfoW(hMon, &mi)) {
+                const RECT& wa = mi.rcWork;
+                if (newX < wa.left) newX = wa.left;
+                if (newY < wa.top) newY = wa.top;
+                if (newX + msgW > wa.right) newX = wa.right - msgW;
+                if (newY + msgH > wa.bottom) newY = wa.bottom - msgH;
+            }
+
+            SetWindowPos(hwndMsgBox, nullptr, newX, newY, 0, 0,
+                         SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE);
+        }
+
+        if (g_hCBTHook) {
+            UnhookWindowsHookEx(g_hCBTHook);
+            g_hCBTHook = nullptr;
+        }
+        return 0;
+    }
+    return CallNextHookEx(g_hCBTHook, nCode, wParam, lParam);
+}
+
+int CenteredMessageBoxW(HWND hWndParent, LPCWSTR lpText, LPCWSTR lpCaption, UINT uType) {
+    g_msgBoxParent = hWndParent;
+    g_hCBTHook = SetWindowsHookExW(WH_CBT, CenterMsgBoxCBTProc,
+                                    nullptr, GetCurrentThreadId());
+    int result = MessageBoxW(hWndParent, lpText, lpCaption, uType);
+    if (g_hCBTHook) {
+        UnhookWindowsHookEx(g_hCBTHook);
+        g_hCBTHook = nullptr;
+    }
+    g_msgBoxParent = nullptr;
+    return result;
+}
+
+} // anonymous namespace
+
 MainWindow::MainWindow()
     : hInstance_(nullptr)
     , hwnd_(nullptr)
@@ -930,7 +993,7 @@ void MainWindow::RefreshLogDisplay() {
 
 void MainWindow::OnStartService() {
     if (!ServiceController::IsRunningAsAdmin()) {
-        int result = MessageBoxW(hwnd_,
+        int result = CenteredMessageBoxW(hwnd_,
             L"管理者権限が必要です。\n\n管理者として再起動しますか？",
             L"権限が必要", MB_YESNO | MB_ICONQUESTION);
         if (result == IDYES) {
@@ -946,7 +1009,7 @@ void MainWindow::OnStartService() {
     // Already running - notify user and do nothing
     if (state == ServiceState::Running) {
         AppendLog(L"サービスは既に実行中です");
-        MessageBoxW(hwnd_, L"サービスは既に実行中です。",
+        CenteredMessageBoxW(hwnd_, L"サービスは既に実行中です。",
             L"サービス登録・実行", MB_OK | MB_ICONINFORMATION);
         return;
     }
@@ -966,7 +1029,7 @@ void MainWindow::OnStartService() {
             AppendLog(L"サービス登録完了");
         } else {
             AppendLog(L"エラー: " + serviceCtrl_.GetLastError());
-            MessageBoxW(hwnd_, (L"サービス登録に失敗しました:\n" + serviceCtrl_.GetLastError()).c_str(),
+            CenteredMessageBoxW(hwnd_, (L"サービス登録に失敗しました:\n" + serviceCtrl_.GetLastError()).c_str(),
                 L"エラー", MB_OK | MB_ICONERROR);
             return;
         }
@@ -978,7 +1041,7 @@ void MainWindow::OnStartService() {
         AppendLog(L"サービス開始コマンド送信完了");
     } else {
         AppendLog(L"エラー: " + serviceCtrl_.GetLastError());
-        MessageBoxW(hwnd_, (L"サービス開始に失敗しました:\n" + serviceCtrl_.GetLastError()).c_str(),
+        CenteredMessageBoxW(hwnd_, (L"サービス開始に失敗しました:\n" + serviceCtrl_.GetLastError()).c_str(),
             L"エラー", MB_OK | MB_ICONERROR);
     }
 
@@ -987,7 +1050,7 @@ void MainWindow::OnStartService() {
 
 void MainWindow::OnStopService() {
     if (!ServiceController::IsRunningAsAdmin()) {
-        int result = MessageBoxW(hwnd_,
+        int result = CenteredMessageBoxW(hwnd_,
             L"管理者権限が必要です。\n\n管理者として再起動しますか？",
             L"権限が必要", MB_YESNO | MB_ICONQUESTION);
         if (result == IDYES) {
@@ -998,7 +1061,7 @@ void MainWindow::OnStopService() {
     }
 
     // Confirm unregistration
-    int result = MessageBoxW(hwnd_,
+    int result = CenteredMessageBoxW(hwnd_,
         L"サービスを停止し、登録を解除します。\n\nよろしいですか？",
         L"サービス登録解除", MB_YESNO | MB_ICONQUESTION);
     if (result != IDYES) {
@@ -1010,11 +1073,17 @@ void MainWindow::OnStopService() {
     // Use the unified UninstallService which handles stop + wait + delete
     if (serviceCtrl_.UninstallService()) {
         AppendLog(L"サービス登録解除完了");
-        MessageBoxW(hwnd_, L"サービスの登録解除が完了しました。",
+
+        // Safety net: Remove any remaining registry policies via manifest
+        RegistryPolicyManager::Instance().Initialize(baseDir_);
+        RegistryPolicyManager::Instance().RemoveAllPolicies();
+        AppendLog(L"レジストリポリシー削除完了");
+
+        CenteredMessageBoxW(hwnd_, L"サービスの登録解除が完了しました。\n\nレジストリは初期状態に復元されました。",
             L"サービス登録解除", MB_OK | MB_ICONINFORMATION);
     } else {
         AppendLog(L"エラー: " + serviceCtrl_.GetLastError());
-        MessageBoxW(hwnd_, (L"サービス登録解除に失敗しました:\n" + serviceCtrl_.GetLastError()).c_str(),
+        CenteredMessageBoxW(hwnd_, (L"サービス登録解除に失敗しました:\n" + serviceCtrl_.GetLastError()).c_str(),
             L"エラー", MB_OK | MB_ICONERROR);
     }
 
@@ -1165,7 +1234,7 @@ void MainWindow::OnAddTarget() {
             RefreshTargetList();
             AppendLog(L"[+] REGISTERED : " + result);
         } else {
-            MessageBoxW(hwnd_, L"追加に失敗しました（既に存在するか保護されています）",
+            CenteredMessageBoxW(hwnd_, L"追加に失敗しました（既に存在するか保護されています）",
                 L"対象の追加", MB_OK | MB_ICONWARNING);
         }
     }
@@ -1174,7 +1243,7 @@ void MainWindow::OnAddTarget() {
 void MainWindow::OnRemoveTarget() {
     int sel = (int)SendMessageW(hwndTargetList_, LB_GETCURSEL, 0, 0);
     if (sel == LB_ERR) {
-        MessageBoxW(hwnd_, L"対象を選択してください", L"削除", MB_OK | MB_ICONINFORMATION);
+        CenteredMessageBoxW(hwnd_, L"対象を選択してください", L"削除", MB_OK | MB_ICONINFORMATION);
         return;
     }
 
