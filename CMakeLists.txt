@@ -23,8 +23,8 @@ endif()
 
 # Compiler-specific flags
 if(MSVC)
-    # Warning level 3 (less strict to avoid excessive warnings)
-    add_compile_options(/W3)
+    # Warning level 4 for strict compile-time quality gate
+    add_compile_options(/W4)
 
     # Disable specific warnings
     add_compile_options(/wd4100)  # unreferenced formal parameter
@@ -80,11 +80,17 @@ set(SERVICE_HEADERS
     src/service/ipc_server.h
 )
 
+# Resource file (icon and version info)
+set(SERVICE_RESOURCES
+    resources/service.rc
+)
+
 add_executable(UnLeaf_Service
     ${SERVICE_SOURCES}
     ${SERVICE_HEADERS}
     ${COMMON_SOURCES}
     ${COMMON_HEADERS}
+    ${SERVICE_RESOURCES}
 )
 
 target_include_directories(UnLeaf_Service PRIVATE
@@ -170,6 +176,47 @@ endif()
 install(TARGETS UnLeaf_Service UnLeaf_Manager
     RUNTIME DESTINATION bin
 )
+
+# ============================================================
+# Unit Tests (GoogleTest)
+# ============================================================
+option(UNLEAF_BUILD_TESTS "Build unit tests" ON)
+
+if(UNLEAF_BUILD_TESTS)
+    include(FetchContent)
+    FetchContent_Declare(
+        googletest
+        GIT_REPOSITORY https://github.com/google/googletest.git
+        GIT_TAG        v1.15.2
+    )
+    # MSVC static runtime matching
+    set(gtest_force_shared_crt OFF CACHE BOOL "" FORCE)
+    FetchContent_MakeAvailable(googletest)
+
+    enable_testing()
+
+    add_executable(UnLeaf_Tests
+        tests/test_types.cpp
+        tests/test_config.cpp
+        tests/test_logger.cpp
+        ${COMMON_SOURCES}
+        ${COMMON_HEADERS}
+    )
+
+    target_include_directories(UnLeaf_Tests PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/src
+    )
+
+    target_link_libraries(UnLeaf_Tests PRIVATE
+        GTest::gtest_main
+        advapi32
+        kernel32
+        user32
+    )
+
+    include(GoogleTest)
+    gtest_add_tests(TARGET UnLeaf_Tests)
+endif()
 
 # ============================================================
 # Build Info

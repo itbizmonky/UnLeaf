@@ -1,6 +1,5 @@
-// UnLeaf v7.90 - Configuration Manager Implementation
+// UnLeaf - Configuration Manager Implementation
 // INI-based configuration with JSON migration support
-// v7.90: Added INI validation (IsValidProcessName, IsCriticalProcess) and unknown section/key warnings
 
 #include "config.h"
 #include "logger.h"
@@ -12,6 +11,17 @@
 
 namespace fs = std::filesystem;
 
+namespace {
+void StripUtf8Bom(std::string& content) {
+    if (content.size() >= 3 &&
+        static_cast<unsigned char>(content[0]) == 0xEF &&
+        static_cast<unsigned char>(content[1]) == 0xBB &&
+        static_cast<unsigned char>(content[2]) == 0xBF) {
+        content.erase(0, 3);
+    }
+}
+} // anonymous namespace
+
 namespace unleaf {
 
 UnLeafConfig& UnLeafConfig::Instance() {
@@ -20,8 +30,8 @@ UnLeafConfig& UnLeafConfig::Instance() {
 }
 
 UnLeafConfig::UnLeafConfig()
-    : logLevel_(LogLevel::LOG_INFO)  // v7.6: Default to INFO
-    , logEnabled_(true)              // v7.93: Default to enabled
+    : logLevel_(LogLevel::LOG_INFO)
+    , logEnabled_(true)
     , lastModTime_(0) {
 }
 
@@ -81,7 +91,7 @@ bool UnLeafConfig::MigrateFromJson(const std::wstring& baseDir) {
         return true;
     }
     catch (const std::exception& e) {
-        // v7.80: Log exception details
+        // Log exception details
         LOG_ERROR(std::wstring(L"Config: Migration error - ") +
                   std::wstring(e.what(), e.what() + std::strlen(e.what())));
         return false;
@@ -157,7 +167,7 @@ bool UnLeafConfig::Save() {
         return true;
     }
     catch (const std::exception& e) {
-        // v7.80: Log exception details
+        // Log exception details
         LOG_ERROR(std::wstring(L"Config: Save error - ") +
                   std::wstring(e.what(), e.what() + std::strlen(e.what())));
         return false;
@@ -169,11 +179,14 @@ bool UnLeafConfig::Save() {
 }
 
 // INI Parser
-bool UnLeafConfig::ParseIni(const std::string& content) {
+bool UnLeafConfig::ParseIni(const std::string& contentIn) {
     try {
+        std::string content = contentIn;
+        StripUtf8Bom(content);
+
         targets_.clear();
-        logLevel_ = LogLevel::LOG_INFO;    // v7.6: Reset to default
-        logEnabled_ = true;                // v7.93: Reset to default
+        logLevel_ = LogLevel::LOG_INFO;
+        logEnabled_ = true;
 
         std::istringstream stream(content);
         std::string line;
@@ -196,9 +209,10 @@ bool UnLeafConfig::ParseIni(const std::string& content) {
                 currentSection = line.substr(1, line.size() - 2);
                 // Convert to lowercase for comparison
                 std::transform(currentSection.begin(), currentSection.end(),
-                              currentSection.begin(), ::tolower);
+                              currentSection.begin(),
+                              [](unsigned char c) { return static_cast<char>(::tolower(c)); });
 
-                // v7.90: Warn on unknown sections
+                // Warn on unknown sections
                 if (currentSection != "targets" && currentSection != "logging") {
                     // Convert section name to wide string for logging
                     std::wstring wideSection(currentSection.begin(), currentSection.end());
@@ -231,7 +245,7 @@ bool UnLeafConfig::ParseIni(const std::string& content) {
                 MultiByteToWideChar(CP_UTF8, 0, key.c_str(),
                                    static_cast<int>(key.size()), &wideName[0], size);
 
-                // v7.90: Validate process name before adding
+                // Validate process name before adding
                 if (!IsValidProcessName(wideName)) {
                     LOG_ALERT(L"Config: Invalid target ignored: " + wideName);
                     continue;
@@ -243,14 +257,15 @@ bool UnLeafConfig::ParseIni(const std::string& content) {
 
                 targets_.emplace_back(wideName, enabled);
             }
-            // v7.6: Parse [Logging] section
             else if (currentSection == "logging") {
                 std::string lowerKey = key;
-                std::transform(lowerKey.begin(), lowerKey.end(), lowerKey.begin(), ::tolower);
+                std::transform(lowerKey.begin(), lowerKey.end(), lowerKey.begin(),
+                              [](unsigned char c) { return static_cast<char>(::tolower(c)); });
 
                 if (lowerKey == "loglevel") {
                     std::string lowerValue = value;
-                    std::transform(lowerValue.begin(), lowerValue.end(), lowerValue.begin(), ::toupper);
+                    std::transform(lowerValue.begin(), lowerValue.end(), lowerValue.begin(),
+                                  [](unsigned char c) { return static_cast<char>(::toupper(c)); });
 
                     if (lowerValue == "ERROR") {
                         logLevel_ = LogLevel::LOG_ERROR;
@@ -261,19 +276,19 @@ bool UnLeafConfig::ParseIni(const std::string& content) {
                     } else if (lowerValue == "DEBUG") {
                         logLevel_ = LogLevel::LOG_DEBUG;
                     } else {
-                        // v7.91: Warn on invalid LogLevel value
+                        // Warn on invalid LogLevel value
                         std::wstring wideValue(value.begin(), value.end());
                         LOG_ALERT(L"Config: Invalid LogLevel ignored (using INFO): " + wideValue);
                     }
                 }
-                // v7.93: Parse LogEnabled setting
                 else if (lowerKey == "logenabled") {
                     std::string lowerValue = value;
-                    std::transform(lowerValue.begin(), lowerValue.end(), lowerValue.begin(), ::tolower);
+                    std::transform(lowerValue.begin(), lowerValue.end(), lowerValue.begin(),
+                                  [](unsigned char c) { return static_cast<char>(::tolower(c)); });
                     logEnabled_ = (lowerValue == "1" || lowerValue == "true" || lowerValue == "yes" || lowerValue == "on");
                 }
                 else {
-                    // v7.90: Warn on unknown keys in [Logging]
+                    // Warn on unknown keys in [Logging]
                     std::wstring wideKey(key.begin(), key.end());
                     LOG_DEBUG(L"Config: Unknown key in [Logging]: " + wideKey);
                 }
@@ -283,7 +298,7 @@ bool UnLeafConfig::ParseIni(const std::string& content) {
         return true;
     }
     catch (const std::exception& e) {
-        // v7.80: Log exception details
+        // Log exception details
         LOG_ERROR(std::wstring(L"Config: Parse error - ") +
                   std::wstring(e.what(), e.what() + std::strlen(e.what())));
         return false;
@@ -302,7 +317,6 @@ std::string UnLeafConfig::SerializeIni() const {
     oss << "; UnLeaf Configuration\n";
     oss << "; Auto-generated - Do not edit while service is running\n\n";
 
-    // v7.6: Logging section
     oss << "[Logging]\n";
     oss << "; Log level: ERROR, ALERT, INFO, DEBUG\n";
     switch (logLevel_) {
@@ -311,7 +325,6 @@ std::string UnLeafConfig::SerializeIni() const {
         case LogLevel::LOG_INFO:  oss << "LogLevel=INFO\n";  break;
         case LogLevel::LOG_DEBUG: oss << "LogLevel=DEBUG\n"; break;
     }
-    // v7.93: Log output enable/disable
     oss << "; Log output: 1=enabled, 0=disabled\n";
     oss << "LogEnabled=" << (logEnabled_ ? "1" : "0") << "\n";
     oss << "\n";
@@ -338,8 +351,11 @@ std::string UnLeafConfig::SerializeIni() const {
 }
 
 // Legacy JSON parser (for migration only)
-bool UnLeafConfig::ParseJson(const std::string& content) {
+bool UnLeafConfig::ParseJson(const std::string& contentIn) {
     try {
+        std::string content = contentIn;
+        StripUtf8Bom(content);
+
         targets_.clear();
 
         // Parse targets array
@@ -375,7 +391,7 @@ bool UnLeafConfig::ParseJson(const std::string& content) {
         return true;
     }
     catch (const std::exception& e) {
-        // v7.80: Log exception details
+        // Log exception details
         LOG_ERROR(std::wstring(L"Config: JSON parse error - ") +
                   std::wstring(e.what(), e.what() + std::strlen(e.what())));
         return false;
@@ -459,7 +475,7 @@ uint64_t UnLeafConfig::GetFileModTime() const {
         }
     }
     catch (const std::exception& e) {
-        // v7.80: Log at debug level as this is expected during rotation
+        // Log at debug level (expected during rotation)
         LOG_DEBUG(std::wstring(L"Config: GetFileModTime - ") +
                   std::wstring(e.what(), e.what() + std::strlen(e.what())));
     }
@@ -474,7 +490,6 @@ void UnLeafConfig::SetChangeCallback(ConfigChangeCallback callback) {
     changeCallback_ = std::move(callback);
 }
 
-// v7.93: Set log enabled/disabled
 void UnLeafConfig::SetLogEnabled(bool enabled) {
     CSLockGuard lock(cs_);
     logEnabled_ = enabled;

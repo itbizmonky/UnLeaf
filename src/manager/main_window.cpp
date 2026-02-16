@@ -1,6 +1,5 @@
-// UnLeaf v7.90 - Main Window Implementation
+// UnLeaf - Main Window Implementation
 // Python v1.00 Style Dashboard - Clean, Professional Dark Theme
-// v7.90: Added auto-refresh on config file change
 
 #include "main_window.h"
 #include "resource.h"
@@ -104,7 +103,7 @@ MainWindow::MainWindow()
     , hwndBtnRemove_(nullptr)
     , hwndLogEdit_(nullptr)
     , hwndEngineStatus_(nullptr)
-    , hwndLogToggle_(nullptr)      // v7.93
+    , hwndLogToggle_(nullptr)
     , hFontTitle_(nullptr)
     , hFontNormal_(nullptr)
     , hFontSmall_(nullptr)
@@ -330,7 +329,7 @@ LRESULT MainWindow::HandleMessage(UINT msg, WPARAM wParam, LPARAM lParam) {
         case ID_BTN_REMOVE:
             OnRemoveTarget();
             break;
-        case ID_LOG_TOGGLE:  // v7.93: Log ON/OFF toggle
+        case ID_LOG_TOGGLE:
             OnToggleLogEnabled();
             break;
         case ID_TRAY_OPEN:
@@ -369,7 +368,6 @@ LRESULT MainWindow::HandleMessage(UINT msg, WPARAM wParam, LPARAM lParam) {
             UpdateServiceStatus();
             UpdateEngineStatus();
 
-            // v7.90: Auto-refresh target list on config file change
             if (UnLeafConfig::Instance().HasFileChanged()) {
                 UnLeafConfig::Instance().Reload();
                 RefreshTargetList();
@@ -457,7 +455,6 @@ case WM_CTLCOLORSTATIC: {
             return (LRESULT)hBrushBg_;
         }
 
-        // v7.93: Log toggle checkbox - white text for visibility
         if (hwndCtrl == hwndLogToggle_) {
             SetBkMode(hdc, TRANSPARENT);
             SetTextColor(hdc, clrText_);  // White text
@@ -526,16 +523,8 @@ case WM_CTLCOLORSTATIC: {
         if (logWakeEvent_) {
             SetEvent(logWakeEvent_);
         }
-        // Wait for thread with timeout (max 2 seconds)
         if (logThread_.joinable()) {
-            // Detach thread if it takes too long - it will exit on its own
-            std::thread::id tid = logThread_.get_id();
-            logThread_.detach();
-            // Give thread time to notice shutdown flag
-            for (int i = 0; i < 40; ++i) {  // 2 seconds max
-                Sleep(50);
-                // Thread should have exited by now
-            }
+            logThread_.join();  // shutdownFlag_ + logWakeEvent_ ensures prompt exit
         }
         DestroyWindow(hwnd_);
         return 0;
@@ -630,7 +619,6 @@ void MainWindow::CreateControls() {
         WS_CHILD | WS_VISIBLE | SS_LEFT,
         MARGIN, y, 150, 16, hwnd_, nullptr, hInstance_, nullptr);
 
-    // v7.93: Log ON/OFF toggle checkbox (right side of header)
     hwndLogToggle_ = CreateWindowW(L"BUTTON", L"Log Output",
         WS_CHILD | WS_VISIBLE | BS_AUTOCHECKBOX,
         MARGIN + contentWidth - 90, y - 2, 90, 20,
@@ -648,7 +636,6 @@ void MainWindow::CreateControls() {
     int logHeight = clientHeight - y - MARGIN - statusBarHeight - 4;
     if (logHeight < 80) logHeight = 80;
 
-    // v7.93: No horizontal scrollbar (ES_AUTOHSCROLL prevents line wrap)
     hwndLogEdit_ = CreateWindowExW(0, L"EDIT", L"",
         WS_CHILD | WS_VISIBLE | WS_VSCROLL | WS_BORDER | ES_MULTILINE | ES_READONLY | ES_AUTOVSCROLL | ES_AUTOHSCROLL,
         MARGIN, y, contentWidth, logHeight,
@@ -1898,7 +1885,6 @@ void MainWindow::OnOpenLogFile() {
         param.c_str(), nullptr, SW_SHOWNORMAL);
 }
 
-// v7.93: Toggle log enabled/disabled
 void MainWindow::OnToggleLogEnabled() {
     // Get current checkbox state
     LRESULT checkState = SendMessageW(hwndLogToggle_, BM_GETCHECK, 0, 0);

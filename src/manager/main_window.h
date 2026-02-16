@@ -1,5 +1,5 @@
 #pragma once
-// UnLeaf v2.00 - Main Window (Python v1.00 Style Dashboard)
+// UnLeaf - Main Window (Python v1.00 Style Dashboard)
 
 #include "../common/types.h"
 #include "../common/config.h"
@@ -53,7 +53,7 @@ private:
     void OnAddTarget();
     void OnRemoveTarget();
     void OnSelectProcess();
-    void OnToggleLogEnabled();  // v7.93: Log ON/OFF toggle
+    void OnToggleLogEnabled();
 
     // Context menus
     void ShowTargetListContextMenu(int x, int y);
@@ -100,7 +100,7 @@ private:
     HWND hwndBtnRemove_;
     HWND hwndLogEdit_;
     HWND hwndEngineStatus_;     // Engine status bar at bottom
-    HWND hwndLogToggle_;        // v7.93: Log ON/OFF toggle checkbox
+    HWND hwndLogToggle_;
 
     // Fonts & Brushes
     HFONT hFontTitle_;
@@ -162,7 +162,7 @@ private:
     static constexpr int ID_LIST = 107;
     static constexpr int ID_LOG = 108;
     static constexpr int ID_ENGINE_STATUS = 109;
-    static constexpr int ID_LOG_TOGGLE = 110;     // v7.93: Log toggle checkbox
+    static constexpr int ID_LOG_TOGGLE = 110;
     static constexpr int ID_TIMER = 201;
 
     // Custom messages

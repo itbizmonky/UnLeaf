@@ -1,6 +1,4 @@
-// UnLeaf v7.60 - IPC Server Implementation
-// v7.5: Added DACL security and client authorization
-// v7.6: Structured logging (ERROR/ALERT/INFO/DEBUG)
+// UnLeaf - IPC Server Implementation
 
 #include "ipc_server.h"
 #include "engine_core.h"
@@ -74,10 +72,10 @@ void IPCServer::SetCommandHandler(IPCCommand cmd, CommandHandler handler) {
 void IPCServer::ServerLoop() {
     LOG_INFO(L"IPC: Server loop started (secured)");
 
-    // v7.52: Create security descriptor - REQUIRED for security
+    // Create security descriptor - REQUIRED for security
     PipeSecurityDescriptor pipeSecurity;
     if (!pipeSecurity.Initialize()) {
-        // v7.52: Do NOT continue without DACL - security risk
+        // Do NOT continue without DACL - security risk
         LOG_ERROR(L"IPC: DACL initialization failed - IPC disabled");
         return;
     }
@@ -87,16 +85,15 @@ void IPCServer::ServerLoop() {
 
     while (!stopRequested_.load()) {
         // Create named pipe instance with overlapped I/O support
-        // v7.5: Apply DACL security
         HANDLE pipeHandle = CreateNamedPipeW(
             PIPE_NAME,
             PIPE_ACCESS_DUPLEX | FILE_FLAG_OVERLAPPED,
             PIPE_TYPE_MESSAGE | PIPE_READMODE_MESSAGE | PIPE_WAIT,
             PIPE_UNLIMITED_INSTANCES,
-            4096,   // Output buffer size
-            4096,   // Input buffer size
+            static_cast<DWORD>(UNLEAF_MAX_IPC_DATA_SIZE),   // Output buffer size
+            static_cast<DWORD>(UNLEAF_MAX_IPC_DATA_SIZE),   // Input buffer size
             0,      // Default timeout
-            pipeSecurity.GetSecurityAttributes()  // v7.5: DACL applied
+            pipeSecurity.GetSecurityAttributes()
         );
 
         if (pipeHandle == INVALID_HANDLE_VALUE) {
@@ -167,16 +164,38 @@ void IPCServer::ServerLoop() {
 }
 
 void IPCServer::HandleClient(HANDLE pipeHandle) {
-    // Read message header
+    // Read message header (Overlapped I/O with 5-second timeout)
     IPCMessage header;
     DWORD bytesRead = 0;
 
-    if (!ReadFile(pipeHandle, &header, sizeof(header), &bytesRead, nullptr) ||
-        bytesRead != sizeof(header)) {
+    OVERLAPPED ov = {};
+    ov.hEvent = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+    if (!ov.hEvent) return;
+
+    BOOL ok = ReadFile(pipeHandle, &header, sizeof(header), nullptr, &ov);
+    if (!ok && GetLastError() == ERROR_IO_PENDING) {
+        HANDLE waits[] = { ov.hEvent, stopEvent_ };
+        DWORD wr = WaitForMultipleObjects(2, waits, FALSE, 5000);
+        if (wr != WAIT_OBJECT_0) {
+            CancelIo(pipeHandle);
+            CloseHandle(ov.hEvent);
+            return;
+        }
+        if (!GetOverlappedResult(pipeHandle, &ov, &bytesRead, FALSE)) {
+            CloseHandle(ov.hEvent);
+            return;
+        }
+    } else if (ok) {
+        GetOverlappedResult(pipeHandle, &ov, &bytesRead, FALSE);
+    } else {
+        CloseHandle(ov.hEvent);
         return;
     }
+    CloseHandle(ov.hEvent);
 
-    // v7.5: Authorization check before processing command
+    if (bytesRead != sizeof(header)) return;
+
+    // Authorization check before processing command
     AuthResult auth = AuthorizeClient(pipeHandle, header.command);
     if (auth != AuthResult::AUTHORIZED) {
         LOG_ALERT(L"IPC: Unauthorized command attempt cmd=" +
@@ -190,18 +209,38 @@ void IPCServer::HandleClient(HANDLE pipeHandle) {
     // Read message data (with size validation)
     std::string data;
     if (header.dataLength > 0) {
-        // v7.5: Validate data length
-        // v7.80: Use constant instead of magic number
         if (header.dataLength >= UNLEAF_MAX_IPC_DATA_SIZE) {
             SendResponse(pipeHandle, IPCResponse::RESP_ERROR_INVALID_INPUT,
                          R"({"error": "Data too large"})");
             return;
         }
         data.resize(header.dataLength);
-        if (!ReadFile(pipeHandle, &data[0], header.dataLength, &bytesRead, nullptr) ||
-            bytesRead != header.dataLength) {
+
+        OVERLAPPED ov2 = {};
+        ov2.hEvent = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+        if (!ov2.hEvent) return;
+
+        ok = ReadFile(pipeHandle, &data[0], header.dataLength, nullptr, &ov2);
+        if (!ok && GetLastError() == ERROR_IO_PENDING) {
+            HANDLE waits[] = { ov2.hEvent, stopEvent_ };
+            DWORD wr = WaitForMultipleObjects(2, waits, FALSE, 5000);
+            if (wr != WAIT_OBJECT_0) {
+                CancelIo(pipeHandle);
+                CloseHandle(ov2.hEvent);
+                return;
+            }
+            if (!GetOverlappedResult(pipeHandle, &ov2, &bytesRead, FALSE) ||
+                bytesRead != header.dataLength) {
+                CloseHandle(ov2.hEvent);
+                return;
+            }
+        } else if (ok) {
+            GetOverlappedResult(pipeHandle, &ov2, &bytesRead, FALSE);
+        } else {
+            CloseHandle(ov2.hEvent);
             return;
         }
+        CloseHandle(ov2.hEvent);
     }
 
     // Process command
@@ -211,20 +250,19 @@ void IPCServer::HandleClient(HANDLE pipeHandle) {
     SendResponse(pipeHandle, IPCResponse::RESP_SUCCESS, responseData);
 }
 
-// v7.5: Get command permission level
 CommandPermission IPCServer::GetCommandPermission(IPCCommand cmd) {
     switch (cmd) {
         case IPCCommand::CMD_GET_STATUS:
         case IPCCommand::CMD_GET_LOGS:
         case IPCCommand::CMD_GET_STATS:
         case IPCCommand::CMD_GET_CONFIG:
-        case IPCCommand::CMD_HEALTH_CHECK:  // v7.7: Health check is PUBLIC
+        case IPCCommand::CMD_HEALTH_CHECK:
             return CommandPermission::PUBLIC;
 
         case IPCCommand::CMD_ADD_TARGET:
         case IPCCommand::CMD_REMOVE_TARGET:
         case IPCCommand::CMD_SET_INTERVAL:
-        case IPCCommand::CMD_SET_LOG_ENABLED:  // v7.93
+        case IPCCommand::CMD_SET_LOG_ENABLED:
             return CommandPermission::ADMIN;
 
         case IPCCommand::CMD_STOP_SERVICE:
@@ -235,7 +273,6 @@ CommandPermission IPCServer::GetCommandPermission(IPCCommand cmd) {
     }
 }
 
-// v7.5: Authorize client for command execution
 AuthResult IPCServer::AuthorizeClient(HANDLE pipeHandle, IPCCommand cmd) {
     CommandPermission required = GetCommandPermission(cmd);
 
@@ -272,7 +309,6 @@ AuthResult IPCServer::AuthorizeClient(HANDLE pipeHandle, IPCCommand cmd) {
     return authorized ? AuthResult::AUTHORIZED : AuthResult::UNAUTHORIZED;
 }
 
-// v7.51: UTF-8 to Wide string conversion helper
 static std::wstring Utf8ToWide(const std::string& utf8) {
     if (utf8.empty()) return L"";
     int len = MultiByteToWideChar(CP_UTF8, 0, utf8.c_str(), -1, nullptr, 0);
@@ -282,17 +318,8 @@ static std::wstring Utf8ToWide(const std::string& utf8) {
     return wide;
 }
 
-// v7.7: Wide to UTF-8 string conversion helper
-static std::string WideToUtf8(const std::wstring& wide) {
-    if (wide.empty()) return "";
-    int len = WideCharToMultiByte(CP_UTF8, 0, wide.c_str(), -1, nullptr, 0, nullptr, nullptr);
-    if (len <= 0) return "";
-    std::string utf8(len - 1, '\0');
-    WideCharToMultiByte(CP_UTF8, 0, wide.c_str(), -1, &utf8[0], len, nullptr, nullptr);
-    return utf8;
-}
 
-// v7.7: Get operation mode string
+
 static const char* GetModeString(OperationMode mode) {
     switch (mode) {
         case OperationMode::NORMAL: return "NORMAL";
@@ -305,11 +332,10 @@ static const char* GetModeString(OperationMode mode) {
 std::string IPCServer::ProcessCommand(IPCCommand cmd, const std::string& data) {
     CSLockGuard lock(handlerCs_);
 
-    // v7.51: Input validation BEFORE handler dispatch
+    // Input validation BEFORE handler dispatch
     switch (cmd) {
         case IPCCommand::CMD_ADD_TARGET:
         case IPCCommand::CMD_REMOVE_TARGET: {
-            // v7.51: Process name validation
             if (data.empty()) {
                 LOG_ALERT(L"IPC: Validation failed - empty process name");
                 return "{\"error\": \"Process name required\"}";
@@ -328,7 +354,6 @@ std::string IPCServer::ProcessCommand(IPCCommand cmd, const std::string& data) {
         }
 
         case IPCCommand::CMD_SET_INTERVAL: {
-            // v7.51: Interval range validation
             if (data.size() != sizeof(uint32_t)) {
                 LOG_ALERT(L"IPC: Validation failed - invalid interval format");
                 return R"({"error": "Invalid interval format"})";
@@ -383,7 +408,7 @@ std::string IPCServer::ProcessCommand(IPCCommand cmd, const std::string& data) {
             return std::string(reinterpret_cast<const char*>(&count), sizeof(uint32_t));
         }
         case IPCCommand::CMD_HEALTH_CHECK: {
-            // v7.7: Health check API
+            // Health check API
             auto health = EngineCore::Instance().GetHealthInfo();
 
             // Determine overall status
@@ -403,18 +428,41 @@ std::string IPCServer::ProcessCommand(IPCCommand cmd, const std::string& data) {
             oss << "\"running\":" << (health.engineRunning ? "true" : "false") << ",";
             oss << "\"mode\":\"" << GetModeString(health.mode) << "\",";
             oss << "\"active_processes\":" << health.activeProcesses << ",";
-            oss << "\"total_violations\":" << health.totalViolations;
+            oss << "\"total_violations\":" << health.totalViolations << ",";
+            oss << "\"phases\":{";
+            oss << "\"aggressive\":" << health.aggressiveCount << ",";
+            oss << "\"stable\":" << health.stableCount << ",";
+            oss << "\"persistent\":" << health.persistentCount;
+            oss << "}";
             oss << "},";
             oss << "\"etw\":{";
             oss << "\"healthy\":" << (health.etwHealthy ? "true" : "false") << ",";
             oss << "\"event_count\":" << health.etwEventCount;
+            oss << "},";
+            oss << "\"wakeups\":{";
+            oss << "\"config_change\":" << health.wakeupConfigChange << ",";
+            oss << "\"safety_net\":" << health.wakeupSafetyNet << ",";
+            oss << "\"enforcement_request\":" << health.wakeupEnforcementRequest << ",";
+            oss << "\"process_exit\":" << health.wakeupProcessExit;
+            oss << "},";
+            oss << "\"enforcement\":{";
+            oss << "\"persistent_applied\":" << health.persistentEnforceApplied << ",";
+            oss << "\"persistent_skipped\":" << health.persistentEnforceSkipped;
+            oss << "},";
+            oss << "\"errors\":{";
+            oss << "\"access_denied\":" << health.error5Count << ",";
+            oss << "\"invalid_parameter\":" << health.error87Count << ",";
+            oss << "\"shutdown_warnings\":" << health.shutdownWarnings;
+            oss << "},";
+            oss << "\"config\":{";
+            oss << "\"changes_detected\":" << health.configChangeDetected << ",";
+            oss << "\"reloads\":" << health.configReloadCount;
             oss << "},";
             oss << "\"ipc\":{\"healthy\":true}";
             oss << "}";
             return oss.str();
         }
         case IPCCommand::CMD_SET_LOG_ENABLED: {
-            // v7.93: Set log enabled/disabled
             if (data.empty()) {
                 return R"({"error": "Missing enabled flag"})";
             }
@@ -497,8 +545,6 @@ std::string IPCServer::GetLogsFromOffset(uint64_t clientOffset) {
         return result;
     }
 
-    // Calculate how much to read (max 8KB per request)
-    // v7.80: Use constant instead of magic number
     const uint64_t maxRead = UNLEAF_MAX_LOG_READ_SIZE;
     uint64_t available = currentSize - clientOffset;
     uint64_t toRead = (available > maxRead) ? maxRead : available;

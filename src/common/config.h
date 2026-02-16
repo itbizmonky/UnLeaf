@@ -1,5 +1,5 @@
 #pragma once
-// UnLeaf v3.00 - Configuration Manager
+// UnLeaf - Configuration Manager
 // INI-based configuration with file watching
 
 #include "types.h"
@@ -8,6 +8,8 @@
 #include <vector>
 #include <functional>
 #include <atomic>
+
+class ConfigParserTest;
 
 namespace unleaf {
 
@@ -28,8 +30,8 @@ public:
     // Getters
     const std::vector<TargetProcess>& GetTargets() const { return targets_; }
     const std::wstring& GetConfigPath() const { return configPath_; }
-    LogLevel GetLogLevel() const { return logLevel_; }  // v7.6
-    bool IsLogEnabled() const { return logEnabled_; }   // v7.93
+    LogLevel GetLogLevel() const { return logLevel_; }
+    bool IsLogEnabled() const { return logEnabled_; }
 
     // Target management
     bool AddTarget(const std::wstring& name);
@@ -37,7 +39,6 @@ public:
     bool IsTargetEnabled(const std::wstring& name) const;
     bool SetTargetEnabled(const std::wstring& name, bool enabled);
 
-    // v7.93: Log control
     void SetLogEnabled(bool enabled);
 
     // Check if file has been modified since last load
@@ -48,6 +49,8 @@ public:
     void SetChangeCallback(ConfigChangeCallback callback);
 
 private:
+    friend class ::ConfigParserTest;
+
     UnLeafConfig();
     ~UnLeafConfig() = default;
     UnLeafConfig(const UnLeafConfig&) = delete;
@@ -70,8 +73,8 @@ private:
 
     std::wstring configPath_;
     std::vector<TargetProcess> targets_;
-    LogLevel logLevel_;    // v7.6: Log level setting
-    bool logEnabled_;      // v7.93: Log output enabled/disabled
+    LogLevel logLevel_;
+    bool logEnabled_;
 
     mutable CriticalSection cs_;
     uint64_t lastModTime_;

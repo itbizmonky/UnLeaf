@@ -1,5 +1,5 @@
 #pragma once
-// UnLeaf v1.00 - RAII Handle Management
+// UnLeaf - RAII Handle Management
 // Zero-overhead abstraction for Windows HANDLEs
 
 // Prevent Windows macro conflicts
@@ -97,7 +97,7 @@ public:
 
     void reset() noexcept {
         if (handle_) {
-            ::UnregisterWait(handle_);
+            ::UnregisterWaitEx(handle_, INVALID_HANDLE_VALUE);
             handle_ = nullptr;
         }
     }

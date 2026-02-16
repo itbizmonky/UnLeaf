@@ -1,5 +1,5 @@
 #pragma once
-// UnLeaf v1.00 - Common Type Definitions
+// UnLeaf - Common Type Definitions
 // Windows Native C++ Implementation
 
 // Prevent Windows macro conflicts
@@ -44,10 +44,8 @@ namespace unleaf {
 // Version Information
 constexpr const wchar_t* VERSION = L"1.00";
 
-// v7.94: Windows version detection constants
 constexpr DWORD WINDOWS_11_BUILD_THRESHOLD = 22000;  // Windows 11 starts at build 22000
 
-// v7.6: Log level definitions
 enum class LogLevel : uint8_t {
     LOG_ERROR = 0,   // Always output (critical errors)
     LOG_ALERT = 1,   // ALERT and above (warnings)
@@ -68,12 +66,10 @@ constexpr const wchar_t* LOG_BACKUP_FILENAME = L"UnLeaf.log.1";
 // Default Values
 constexpr size_t MAX_LOG_SIZE = 102400;    // 100KB
 
-// v7.5: Input validation constants
 constexpr DWORD UNLEAF_MIN_INTERVAL_MS = 10;
 constexpr DWORD UNLEAF_MAX_INTERVAL_MS = 60000;
 constexpr size_t UNLEAF_MAX_PROCESS_NAME_LEN = 260;
 
-// v7.80: IPC constants
 constexpr size_t UNLEAF_MAX_IPC_DATA_SIZE = 65536;    // Maximum IPC message data size
 constexpr size_t UNLEAF_MAX_LOG_READ_SIZE = 8192;     // Maximum log read per request
 
@@ -92,15 +88,13 @@ constexpr DWORD UNLEAF_TARGET_PRIORITY = HIGH_PRIORITY_CLASS;
 // Minimum acceptable priority (anything below this triggers re-optimization)
 constexpr DWORD UNLEAF_MIN_PRIORITY = NORMAL_PRIORITY_CLASS;
 
-// v5.0: Fixed-size buffer constants
 constexpr size_t MAX_TRACKED_PROCESSES = 256;
 constexpr size_t MAX_JOB_PIDS = 1024;
 
-// v5.0: Self-healing constants
 constexpr uint8_t MAX_RETRY_COUNT = 5;
 constexpr DWORD RETRY_BACKOFF_BASE_MS = 50;
 
-// v6.0: NT API type definitions for NtSetInformationProcess
+// NT API type definitions for NtSetInformationProcess
 // ProcessInformationClass for power throttling
 constexpr ULONG NT_PROCESS_POWER_THROTTLING_STATE = 77;
 
@@ -109,8 +103,6 @@ using NTSTATUS = LONG;
 constexpr NTSTATUS STATUS_SUCCESS = 0;
 constexpr NTSTATUS STATUS_INFO_LENGTH_MISMATCH = 0xC0000004L;
 constexpr NTSTATUS STATUS_ACCESS_DENIED = 0xC0000022L;
-
-// v8.0: Old polling-based constants removed (replaced by event-driven architecture)
 
 // Background mode constants (for SetPriorityClass)
 #ifndef PROCESS_MODE_BACKGROUND_BEGIN
@@ -141,7 +133,9 @@ struct UnleafThrottleState {
     ULONG StateMask;
 };
 
-// v5.0: Pre-allocated check entry (cache-line aligned for performance)
+// Pre-allocated check entry (cache-line aligned for performance)
+#pragma warning(push)
+#pragma warning(disable: 4324)  // structure padded due to alignment specifier
 struct alignas(64) CheckInfoEntry {
     HANDLE handle;
     DWORD pid;
@@ -151,8 +145,9 @@ struct alignas(64) CheckInfoEntry {
     uint16_t flags;           // 0x01=isChild, 0x02=inJob
     ULONGLONG lastEnforceTime;
 };
+#pragma warning(pop)
 
-// v5.0: Job Object tracking (uses raw HANDLE, managed by EngineCore)
+// Job Object tracking (uses raw HANDLE, managed by EngineCore)
 struct JobObjectInfo {
     HANDLE jobHandle;
     DWORD rootPid;
@@ -205,8 +200,8 @@ enum class IPCCommand : uint32_t {
     CMD_SET_INTERVAL = 6,
     CMD_GET_LOGS = 7,
     CMD_GET_STATS = 8,           // Performance statistics and active count
-    CMD_HEALTH_CHECK = 9,        // v7.7: Health check API
-    CMD_SET_LOG_ENABLED = 10     // v7.93: Enable/disable log output
+    CMD_HEALTH_CHECK = 9,
+    CMD_SET_LOG_ENABLED = 10
 };
 
 // IPC Response Types
@@ -214,8 +209,8 @@ enum class IPCResponse : uint32_t {
     RESP_SUCCESS = 0,
     RESP_ERROR_GENERAL = 1,
     RESP_ERROR_NOT_FOUND = 2,
-    RESP_ERROR_ACCESS_DENIED = 3,     // v7.5: Authorization error
-    RESP_ERROR_INVALID_INPUT = 4,     // v7.5: Input validation error
+    RESP_ERROR_ACCESS_DENIED = 3,
+    RESP_ERROR_INVALID_INPUT = 4,
     RESP_STATUS_UPDATE = 10,
     RESP_LOG_STREAM = 11
 };
@@ -237,10 +232,12 @@ struct LogResponseHeader {
 // System Critical Processes (Protection List)
 inline const std::set<std::wstring>& GetCriticalProcesses() {
 static const std::set<std::wstring> critical = {
-        L"ntoskrnl.exe", L"smss.exe", L"csrss.exe", L"wininit.exe", 
+        L"ntoskrnl.exe", L"smss.exe", L"csrss.exe", L"wininit.exe",
         L"services.exe", L"lsass.exe", L"winlogon.exe", L"svchost.exe",
-        L"explorer.exe", L"dwm.exe", L"ctfmon.exe", L"unleaf_service.exe", 
-        L"unleaf_manager.exe"
+        L"explorer.exe", L"dwm.exe", L"ctfmon.exe", L"unleaf_service.exe",
+        L"unleaf_manager.exe",
+        L"fontdrvhost.exe", L"audiodg.exe", L"conhost.exe",
+        L"securityhealthservice.exe", L"msmpeng.exe"
     };
     return critical;
 }
@@ -254,7 +251,7 @@ inline std::wstring ToLower(const std::wstring& str) {
     return result;
 }
 
-// v7.80: Enhanced process name validation
+// Enhanced process name validation
 // Allowed: alphanumeric, underscore, dot, hyphen; must end with .exe
 // Blocked: path traversal, absolute paths, directory separators
 inline bool IsValidProcessName(const std::wstring& name) {
@@ -262,18 +259,15 @@ inline bool IsValidProcessName(const std::wstring& name) {
         return false;
     }
 
-    // v7.80: Block path traversal attempts
     if (name.find(L"..") != std::wstring::npos) {
         return false;
     }
 
-    // v7.80: Block absolute paths (drive letters or UNC)
     if (name.length() >= 2) {
         if (name[1] == L':') return false;  // C:\path
         if (name[0] == L'\\' || name[0] == L'/') return false;  // \\server or /path
     }
 
-    // v7.80: Block directory separators
     if (name.find(L'\\') != std::wstring::npos ||
         name.find(L'/') != std::wstring::npos) {
         return false;

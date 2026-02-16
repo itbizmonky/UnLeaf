@@ -1,20 +1,5 @@
 #pragma once
-// UnLeaf v8.0 - Engine Core (Event-Driven Architecture)
-//
-// v8.0 Architecture Redesign:
-// - Replaces polling-based enforcement with event-driven WaitForMultipleObjects
-// - ETW events (process/thread creation) are primary enforcement triggers
-// - Safety Net is "insurance consistency check" not monitoring (10s interval)
-// - AGGRESSIVE: One-shot + deferred verification (not polling loop)
-// - STABLE: Purely event-driven (no active polling)
-// - PERSISTENT: 5s interval (not 50ms)
-// - Config change via OS notification (FindFirstChangeNotification)
-// - Merged enforcement + config watcher into single EngineControlThread
-// - Idle CPU: Zero between events (WaitForMultipleObjects INFINITE)
-//
-// Previous versions:
-// v7.0: AGGRESSIVE(10ms SET) -> STABLE(500ms GET) -> PERSISTENT(50ms SET)
-// v7.4: + Resilience: ETW health check, handle robustness, graceful degradation
+// UnLeaf - Engine Core (Event-Driven Architecture)
 
 #include "../common/types.h"
 #include "../common/scoped_handle.h"
@@ -28,17 +13,22 @@
 #include <atomic>
 #include <thread>
 #include <queue>
+#include <memory>
+#include <utility>
+
+// Linker-level guard against accidental timeBeginPeriod usage
+#pragma detect_mismatch("UnLeaf_NoHighResTimer", "enforced")
 
 namespace unleaf {
 
-// Process monitoring phase - v8.0 Event-Driven Adaptive Phase Control
+// Process monitoring phase - Event-Driven Adaptive Phase Control
 enum class ProcessPhase {
     AGGRESSIVE,   // Startup: One-shot SET + deferred verification (3s)
     STABLE,       // Steady-state: Event-driven only (no active polling)
     PERSISTENT    // Stubborn EcoQoS: SET @ 5s interval
 };
 
-// v8.0: Enforcement request type (queued from ETW callbacks and timers)
+// Enforcement request type (queued from ETW callbacks and timers)
 enum class EnforcementRequestType : uint8_t {
     ETW_PROCESS_START,       // New target process detected via ETW
     ETW_THREAD_START,        // Thread created in tracked process (EcoQoS trigger)
@@ -47,7 +37,7 @@ enum class EnforcementRequestType : uint8_t {
     SAFETY_NET               // Insurance consistency check (not monitoring)
 };
 
-// v8.0: Enforcement request structure (queued for processing by EngineControlLoop)
+// Enforcement request structure (queued for processing by EngineControlLoop)
 struct EnforcementRequest {
     DWORD pid;
     EnforcementRequestType type;
@@ -58,31 +48,29 @@ struct EnforcementRequest {
         : pid(p), type(t), verifyStep(step) {}
 };
 
-// v8.0: Wait handle indices for WaitForMultipleObjects
+// Wait handle indices for WaitForMultipleObjects
 enum WaitIndex : DWORD {
     WAIT_STOP = 0,               // stopEvent_ - service stop signal
     WAIT_CONFIG_CHANGE = 1,      // configChangeHandle_ - FindFirstChangeNotification
     WAIT_SAFETY_NET = 2,         // safetyNetTimer_ - Waitable Timer (10s)
     WAIT_ENFORCEMENT_REQUEST = 3, // enforcementRequestEvent_ - queue has items
-    WAIT_COUNT = 4
+    WAIT_PROCESS_EXIT = 4,       // hWakeupEvent_ - process exit pending removal
+    WAIT_COUNT = 5
 };
 
-// v8.0: Deferred verification timer context
-struct DeferredVerifyContext {
-    class EngineCore* engine;
-    DWORD pid;
-    uint8_t step;  // 1, 2, or 3
-};
+// Deferred verification timer context (forward declaration - defined after TrackedProcess)
+struct DeferredVerifyContext;
 
-// v7.4: Operation mode for graceful degradation
+// Operation mode for graceful degradation
 enum class OperationMode {
     NORMAL,         // ETW + QuickRescan (full functionality)
     DEGRADED_ETW,   // QuickRescan only (ETW failed)
     DEGRADED_CONFIG // Config load failed (limited functionality)
 };
 
-// v7.7: Health check info structure
+// Health check info structure
 struct HealthInfo {
+    // Existing
     bool engineRunning;
     OperationMode mode;
     size_t activeProcesses;
@@ -90,9 +78,35 @@ struct HealthInfo {
     bool etwHealthy;
     uint32_t etwEventCount;
     uint64_t uptimeMs;
+
+    // Phase breakdown
+    uint32_t aggressiveCount;
+    uint32_t stableCount;
+    uint32_t persistentCount;
+
+    // Wakeup counters
+    uint32_t wakeupConfigChange;
+    uint32_t wakeupSafetyNet;
+    uint32_t wakeupEnforcementRequest;
+    uint32_t wakeupProcessExit;
+
+    // PERSISTENT enforce applied/skipped
+    uint32_t persistentEnforceApplied;
+    uint32_t persistentEnforceSkipped;
+
+    // Shutdown warnings
+    uint32_t shutdownWarnings;
+
+    // Error counters
+    uint32_t error5Count;
+    uint32_t error87Count;
+
+    // Config monitoring
+    uint32_t configChangeDetected;
+    uint32_t configReloadCount;
 };
 
-// v7.94: Windows version information for compatibility
+// Windows version information for compatibility
 struct WindowsVersionInfo {
     DWORD major;
     DWORD minor;
@@ -102,10 +116,10 @@ struct WindowsVersionInfo {
     WindowsVersionInfo() : major(0), minor(0), build(0), isWindows11OrLater(false) {}
 };
 
-// v7.80: Forward declaration for wait callback context
+// Forward declaration for wait callback context
 struct WaitCallbackContext;
 
-// v6.0: NtSetInformationProcess function pointer type
+// NtSetInformationProcess function pointer type
 typedef NTSTATUS(NTAPI* PFN_NtSetInformationProcess)(
     HANDLE ProcessHandle,
     ULONG ProcessInformationClass,
@@ -113,7 +127,7 @@ typedef NTSTATUS(NTAPI* PFN_NtSetInformationProcess)(
     ULONG ProcessInformationLength
 );
 
-// v6.0: NtQueryInformationProcess function pointer type (for diagnostics)
+// NtQueryInformationProcess function pointer type (for diagnostics)
 typedef NTSTATUS(NTAPI* PFN_NtQueryInformationProcess)(
     HANDLE ProcessHandle,
     ULONG ProcessInformationClass,
@@ -128,38 +142,37 @@ struct TrackedProcess {
     DWORD parentPid;
     std::wstring name;
     ScopedHandle processHandle;       // Control handle (0x1200)
-    ScopedHandle waitProcessHandle;   // v7.0: Exit detection handle (SYNCHRONIZE)
+    ScopedHandle waitProcessHandle;   // Exit detection handle (SYNCHRONIZE)
     HANDLE waitHandle;                // RegisterWaitForSingleObject handle
     bool isChild;
 
-    // v3.0: Phase-based enforcement
+    // Phase-based enforcement
     ProcessPhase phase;           // Current monitoring phase
     ULONGLONG phaseStartTime;     // When current phase started
     ULONGLONG lastCheckTime;      // Last EcoQoS check time
     ULONGLONG lastPriorityCheck;  // Last priority check time
     uint32_t violationCount;      // EcoQoS re-enablement count
 
-    // v5.0: Self-healing
+    // Self-healing
     uint8_t consecutiveFailures;
     DWORD lastErrorCode;
     ULONGLONG nextRetryTime;
 
-    // v5.0: Job Object tracking
+    // Job Object tracking
     DWORD rootTargetPid;
     bool inJobObject;
     bool jobAssignmentFailed;
 
-    // v7.3: STABLE trust-based interval (kept for statistics)
-    ULONGLONG stableCheckInterval;   // Not used in v8.0 (event-driven)
     ULONGLONG lastViolationTime;     // Last violation timestamp (0 = never)
-    bool isTrustedStable;            // Trusted stable flag
 
-    // v8.0: ETW boost for PERSISTENT phase (rate-limited instant response)
+    // ETW boost for PERSISTENT phase (rate-limited instant response)
     ULONGLONG lastEtwEnforceTime;    // Last ETW-triggered enforce time (for rate limiting)
 
-    // v8.0: Timer handles for deferred verification and persistent enforcement
+    // Timer handles for deferred verification and persistent enforcement
     HANDLE deferredTimer;            // AGGRESSIVE phase deferred verification timer
     HANDLE persistentTimer;          // PERSISTENT phase periodic enforcement timer
+    DeferredVerifyContext* persistentTimerContext;  // Recurring timer context (owned pointer)
+    DeferredVerifyContext* deferredTimerContext;    // One-shot timer context (owned pointer)
 
     TrackedProcess()
         : pid(0), parentPid(0), waitHandle(nullptr), isChild(false)
@@ -167,9 +180,19 @@ struct TrackedProcess {
         , lastCheckTime(0), lastPriorityCheck(0), violationCount(0)
         , consecutiveFailures(0), lastErrorCode(0), nextRetryTime(0)
         , rootTargetPid(0), inJobObject(false), jobAssignmentFailed(false)
-        , stableCheckInterval(500), lastViolationTime(0), isTrustedStable(false)
+        , lastViolationTime(0)
         , lastEtwEnforceTime(0)
-        , deferredTimer(nullptr), persistentTimer(nullptr) {}
+        , deferredTimer(nullptr), persistentTimer(nullptr)
+        , persistentTimerContext(nullptr)
+        , deferredTimerContext(nullptr) {}
+};
+
+// Deferred verification timer context (defined after TrackedProcess for shared_ptr)
+struct DeferredVerifyContext {
+    class EngineCore* engine;
+    DWORD pid;
+    uint8_t step;  // 1, 2, or 3
+    std::shared_ptr<TrackedProcess> process;  // prevent premature destruction
 };
 
 class EngineCore {
@@ -192,7 +215,7 @@ public:
     // Get active tracked process count
     size_t GetActiveProcessCount() const;
 
-    // v7.7: Get health check info
+    // Get health check info
     HealthInfo GetHealthInfo() const;
 
 private:
@@ -201,50 +224,53 @@ private:
     EngineCore(const EngineCore&) = delete;
     EngineCore& operator=(const EngineCore&) = delete;
 
-    // === v8.0: Event-Driven Architecture ===
+    // === Event-Driven Architecture ===
 
     // ETW callback: called immediately when a process starts (~1ms)
     void OnProcessStart(DWORD pid, DWORD parentPid, const std::wstring& imageName);
 
-    // v8.0: ETW callback for thread creation events (triggers for tracked processes)
+    // ETW callback for thread creation events (triggers for tracked processes)
     void OnThreadStart(DWORD threadId, DWORD ownerPid);
 
-    // v8.0: Main event-driven control loop (replaces EnforcementLoop + ConfigWatcherLoop)
+    // Main event-driven control loop
     // Waits on: stopEvent, configChangeHandle, safetyNetTimer, enforcementRequestEvent
     void EngineControlLoop();
 
-    // v8.0: Enqueue an enforcement request (called from ETW callbacks and timers)
+    // Enqueue an enforcement request (called from ETW callbacks and timers)
     void EnqueueRequest(const EnforcementRequest& req);
 
-    // v8.0: Process all queued enforcement requests
+    // Process all queued enforcement requests
     void ProcessEnforcementQueue();
 
-    // v8.0: Dispatch a single enforcement request
+    // Dispatch a single enforcement request
     void DispatchEnforcementRequest(const EnforcementRequest& req);
 
-    // v8.0: Handle config file change notification
+    // Handle config file change notification
     void HandleConfigChange();
 
-    // v8.0: SAFETY NET - Insurance consistency check (NOT monitoring)
+    // SAFETY NET - Insurance consistency check (NOT monitoring)
     // Checks only tracked processes for EcoQoS re-enablement
     void HandleSafetyNetCheck();
 
-    // v8.0: Schedule deferred verification timer (AGGRESSIVE phase)
+    // Process pending removal queue (called from EngineControlLoop only)
+    void ProcessPendingRemovals();
+
+    // Schedule deferred verification timer (AGGRESSIVE phase)
     void ScheduleDeferredVerification(DWORD pid, uint8_t step);
 
-    // v8.0: Cancel all timers for a process (cleanup)
+    // Cancel all timers for a process (cleanup)
     void CancelProcessTimers(TrackedProcess& tp);
 
-    // v8.0: Start persistent enforcement timer
+    // Start persistent enforcement timer
     void StartPersistentTimer(DWORD pid);
 
-    // v8.0: Timer callback for deferred verification (thread pool)
+    // Timer callback for deferred verification (thread pool)
     static void CALLBACK DeferredVerifyTimerCallback(PVOID lpParameter, BOOLEAN timerOrWaitFired);
 
-    // v8.0: Timer callback for persistent enforcement (thread pool)
+    // Timer callback for persistent enforcement (thread pool)
     static void CALLBACK PersistentEnforceTimerCallback(PVOID lpParameter, BOOLEAN timerOrWaitFired);
 
-    // v8.0: Periodic maintenance (ETW health, job refresh, stats - piggybacks on wakeups)
+    // Periodic maintenance (ETW health, job refresh, stats - piggybacks on wakeups)
     void PerformPeriodicMaintenance(ULONGLONG now);
 
     // === Process management ===
@@ -261,43 +287,43 @@ private:
     // Remove tracking for a process
     void RemoveTrackedProcess(DWORD pid);
 
-    // v5.0: Stateless pulse enforcement (Set-only, no Get)
+    // Stateless pulse enforcement (Set-only, no Get)
     bool PulseEnforce(HANDLE hProcess, DWORD pid, bool isIntensive);
 
-    // v6.0: Enhanced pulse enforcement with NtSetInformationProcess
+    // Enhanced pulse enforcement with NtSetInformationProcess
     bool PulseEnforceV6(HANDLE hProcess, DWORD pid, bool isIntensive);
 
-    // v6.0: Apply registry policy for a target process
+    // Apply registry policy for a target process
     bool ApplyRegistryPolicy(const std::wstring& exePath, const std::wstring& exeName);
 
-    // v7.80: Consolidated thread throttling (merged Optimized + V6)
-    // @param aggressive: true for V6-style aggressive boost, false for conservative
+    // Consolidated thread throttling
+    // @param aggressive: true for aggressive boost, false for conservative
     int DisableThreadThrottling(DWORD pid, bool aggressive);
 
-    // v5.0: Centralized state update after enforcement
+    // Centralized state update after enforcement
     void UpdateEnforceState(DWORD pid, ULONGLONG now, bool success);
 
-    // v5.0: Self-healing error handling
+    // Self-healing error handling
     void HandleEnforceError(HANDLE hProcess, DWORD pid, DWORD error);
     bool ReopenProcessHandle(DWORD pid);
 
-    // v5.0: Job Object management
+    // Job Object management
     bool CreateAndAssignJobObject(DWORD rootPid, HANDLE hProcess);
     void RefreshJobObjectPids();
     void CleanupJobObjects();
 
-    // v5.0: Set process phase externally
+    // Set process phase externally
     void SetProcessPhase(DWORD pid, ProcessPhase phase);
 
-    // === State checks (v7.0: GET reinstated - Adaptive Phase Control) ===
+    // === State checks ===
 
-    // v7.0: Check if EcoQoS (Efficiency Mode) is currently enabled
+    // Check if EcoQoS (Efficiency Mode) is currently enabled
     bool IsEcoQoSEnabled(HANDLE hProcess) const;
 
-    // v7.0: Phase-based enforcement handler
+    // Phase-based enforcement handler
     void ProcessPhaseEnforcement(DWORD pid, HANDLE hProcess, ProcessPhase phase, ULONGLONG now);
 
-    // v7.80: Phase-specific enforcement handlers (extracted from ProcessPhaseEnforcement)
+    // Phase-specific enforcement handlers
     void HandleAggressivePhase(TrackedProcess& tp, DWORD pid, HANDLE hProcess, ULONGLONG now);
     void HandleStablePhase(TrackedProcess& tp, DWORD pid, HANDLE hProcess, ULONGLONG now);
     void HandlePersistentPhase(TrackedProcess& tp, DWORD pid, HANDLE hProcess, ULONGLONG now);
@@ -313,6 +339,9 @@ private:
 
     // === Configuration ===
 
+    // Release all kernel handles (idempotent - safe for multiple calls)
+    void CleanupHandles();
+
     // Build target set from config
     void RefreshTargetSet();
 
@@ -323,7 +352,7 @@ private:
     void InitialScan();
 
     // Initial scan for existing target processes (startup only)
-    // v8.0: Also used as fallback in DEGRADED_ETW mode
+    // Also used as fallback in DEGRADED_ETW mode
     void InitialScanForDegradedMode();
 
     // === Members ===
@@ -332,26 +361,31 @@ private:
     std::atomic<bool> running_;
     std::atomic<bool> stopRequested_;
 
-    // v8.0: Event-driven thread management
+    // Event-driven thread management
     ProcessMonitor processMonitor_;       // ETW-based process monitor
-    std::thread engineControlThread_;     // Single control thread (replaces enforcement + config watcher)
+    std::thread engineControlThread_;     // Single control thread
     HANDLE stopEvent_;                    // Service stop signal (manual reset)
 
-    // v8.0: Event-driven synchronization handles
+    // Event-driven synchronization handles
     HANDLE timerQueue_;                   // Timer Queue for deferred verification and persistent timers
     HANDLE configChangeHandle_;           // FindFirstChangeNotification handle
     HANDLE safetyNetTimer_;               // Waitable Timer for safety net (10s)
     HANDLE enforcementRequestEvent_;      // Auto-reset event to signal queue has items
+    HANDLE hWakeupEvent_;                 // Auto-reset event for process exit wakeup
 
-    // v8.0: Enforcement request queue (thread-safe)
+    // Pending process removal queue (populated by OnProcessExit callback, drained by EngineControlLoop)
+    std::queue<DWORD> pendingRemovalPids_;
+    mutable CriticalSection pendingRemovalCs_;
+
+    // Enforcement request queue (thread-safe)
     std::queue<EnforcementRequest> enforcementQueue_;
     mutable CriticalSection queueCs_;
 
     // Tracked processes (PID -> TrackedProcess)
-    std::map<DWORD, std::unique_ptr<TrackedProcess>> trackedProcesses_;
+    std::map<DWORD, std::shared_ptr<TrackedProcess>> trackedProcesses_;
     mutable CriticalSection trackedCs_;
 
-    // v7.80: Wait callback context tracking for safe cleanup
+    // Wait callback context tracking for safe cleanup
     std::map<DWORD, WaitCallbackContext*> waitContexts_;
 
     // Target process names (lowercase for comparison)
@@ -362,49 +396,77 @@ private:
     std::atomic<uint32_t> totalViolations_;
     ULONGLONG lastStatsLogTime_;
 
-    // v5.0: Job Objects (rootPid -> JobObjectInfo)
+    // Job Objects (rootPid -> JobObjectInfo)
     std::map<DWORD, std::unique_ptr<JobObjectInfo>> jobObjects_;
     mutable CriticalSection jobCs_;
 
-    // v5.0: Self-healing statistics
+    // Self-healing statistics
     std::atomic<uint32_t> totalRetries_;
     std::atomic<uint32_t> totalHandleReopen_;
 
-    // v5.0: Last job refresh time
+    // Last job refresh time
     ULONGLONG lastJobQueryTime_;
 
-    // v8.0: Last safety net check time (for logging only, not timing)
+    // Last safety net check time (for logging only, not timing)
     ULONGLONG lastSafetyNetTime_;
 
-    // v7.4: Resilience - operation mode and health tracking
+    // Config change debounce (FindFirstChangeNotification fires for all directory writes)
+    ULONGLONG lastConfigCheckTime_;
+    bool configChangePending_;
+
+    // Operation mode and health tracking
     OperationMode operationMode_;
     ULONGLONG lastEtwHealthCheck_;
 
-    // v8.0: Last degraded mode scan time
+    // Last degraded mode scan time
     ULONGLONG lastDegradedScanTime_;
 
-    // v7.7: Service start time for uptime calculation
+    // Service start time for uptime calculation
     ULONGLONG startTime_;
 
-    // v6.0: NT API function pointers
+    // NT API function pointers
     HMODULE ntdllHandle_;
     PFN_NtSetInformationProcess pfnNtSetInformationProcess_;
     PFN_NtQueryInformationProcess pfnNtQueryInformationProcess_;
     bool ntApiAvailable_;
 
-    // v7.94: Windows version for compatibility checks
+    // Windows version for compatibility checks
     WindowsVersionInfo winVersion_;
 
-    // v6.0: Registry policy applied set (exeName -> applied)
+    // Registry policy applied set (exeName -> applied)
     std::set<std::wstring> policyAppliedSet_;
     mutable CriticalSection policySetCs_;
 
-    // v6.0: Statistics
+    // Statistics
     std::atomic<uint32_t> ntApiSuccessCount_;
     std::atomic<uint32_t> ntApiFailCount_;
     std::atomic<uint32_t> policyApplyCount_;
 
-    // === v8.0: Event-Driven Timing Constants ===
+    // Shutdown warning counter
+    std::atomic<uint32_t> shutdownWarnings_{0};
+
+    // Event-type wakeup counters
+    std::atomic<uint32_t> wakeupConfigChange_{0};
+    std::atomic<uint32_t> wakeupSafetyNet_{0};
+    std::atomic<uint32_t> wakeupEnforcementRequest_{0};
+    std::atomic<uint32_t> wakeupProcessExit_{0};
+
+    // PERSISTENT enforce counters
+    std::atomic<uint32_t> persistentEnforceApplied_{0};
+    std::atomic<uint32_t> persistentEnforceSkipped_{0};
+
+    // Error counters (independent of log suppression)
+    std::atomic<uint32_t> error5Count_{0};   // ERROR_ACCESS_DENIED
+    std::atomic<uint32_t> error87Count_{0};  // ERROR_INVALID_PARAMETER
+
+    // Error log suppression map (pid, error) -> lastLogTime
+    std::map<std::pair<DWORD, DWORD>, ULONGLONG> errorLogSuppression_;
+
+    // Config monitoring counters
+    std::atomic<uint32_t> configChangeDetected_{0};
+    std::atomic<uint32_t> configReloadCount_{0};
+
+    // === Event-Driven Timing Constants ===
 
     // AGGRESSIVE Phase: Deferred verification timings (One-shot + verify, not polling)
     static constexpr ULONGLONG AGGRESSIVE_DURATION = 3000;       // Total AGGRESSIVE phase duration
@@ -431,6 +493,13 @@ private:
 
     // DEGRADED_ETW mode: Fallback scan interval
     static constexpr ULONGLONG DEGRADED_SCAN_INTERVAL = 30000;   // 30s fallback scan
+
+    // Config change debounce (directory-level notification includes log writes)
+    static constexpr ULONGLONG CONFIG_DEBOUNCE_MS = 2000;        // 2s debounce
+
+    // Error log suppression window (same PID × error code)
+    static constexpr ULONGLONG ERROR_LOG_SUPPRESS_MS = 60000;    // 60s suppression
+    
 };
 
 } // namespace unleaf

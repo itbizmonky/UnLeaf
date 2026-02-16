@@ -34,3 +34,13 @@ Write-Host "Build completed successfully!"
 Write-Host "Output: build\Release\"
 Write-Host "========================================"
 Get-ChildItem Release\*.exe 2>$null
+
+# --- Code Signing (optional) ---
+$signScript = Join-Path $PSScriptRoot "scripts\sign.ps1"
+if (Test-Path $signScript) {
+    $localConfig = Join-Path $PSScriptRoot "scripts\sign_config.local.ps1"
+    if ($env:UNLEAF_SIGN_PFX -or (Test-Path $localConfig)) {
+        Write-Host "`nSigning executables..."
+        & $signScript -BinDir (Join-Path $PSScriptRoot "build\Release")
+    }
+}

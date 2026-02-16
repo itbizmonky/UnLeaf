@@ -1,5 +1,5 @@
 #pragma once
-// UnLeaf v1.00 - Lightweight Logger
+// UnLeaf - Lightweight Logger
 // Thread-safe rotating file logger with 100KB limit
 
 #include "types.h"
@@ -23,7 +23,6 @@ public:
     // Shutdown logger
     void Shutdown();
 
-    // v7.6: Log messages at different levels
     void Error(const std::wstring& message);
     void Error(const std::string& message);
     void Alert(const std::wstring& message);
@@ -33,11 +32,9 @@ public:
     void Debug(const std::wstring& message);
     void Debug(const std::string& message);
 
-    // v7.6: Set minimum log level
     void SetLogLevel(LogLevel level);
     LogLevel GetLogLevel() const { return currentLevel_; }
 
-    // v7.93: Enable/disable log output
     void SetEnabled(bool enabled);
     bool IsEnabled() const;
 
@@ -74,17 +71,15 @@ private:
     CriticalSection cs_;
     bool initialized_;
     bool consoleOutput_;
-    LogLevel currentLevel_;    // v7.6: Minimum log level
-    std::atomic<bool> enabled_;  // v7.93: Log output enabled/disabled
+    LogLevel currentLevel_;
+    std::atomic<bool> enabled_;
 
     // Console handle for debug output
     HANDLE consoleHandle_;
 
-    // v7.6: Internal log method with level check
     void Log(LogLevel level, const wchar_t* levelStr, const std::wstring& message);
 };
 
-// v7.6: Convenience macros for all log levels
 #define LOG_ERROR(msg) unleaf::LightweightLogger::Instance().Error(msg)
 #define LOG_ALERT(msg) unleaf::LightweightLogger::Instance().Alert(msg)
 #define LOG_INFO(msg)  unleaf::LightweightLogger::Instance().Info(msg)

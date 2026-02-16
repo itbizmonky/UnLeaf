@@ -37,4 +37,18 @@ echo Output: build\Release\
 echo ========================================
 dir Release\*.exe 2>nul
 
+:: --- Code Signing (optional) ---
+if defined UNLEAF_SIGN_PFX (
+    echo.
+    echo Signing executables...
+    call "%~dp0scripts\sign.bat" -BinDir "%~dp0build\Release"
+)
+if not defined UNLEAF_SIGN_PFX (
+    if exist "%~dp0scripts\sign_config.local.bat" (
+        echo.
+        echo Signing executables ^(using local config^)...
+        call "%~dp0scripts\sign.bat" -BinDir "%~dp0build\Release"
+    )
+)
+
 pause

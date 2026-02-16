@@ -48,3 +48,10 @@ CLAUDE.md
 .claude/
 Design_Specification_v2.00.md
 Project_Cleanup_Prompt.md
+
+# Code signing
+certs/
+*.pfx
+*.pvk
+scripts/sign_config.local.ps1
+scripts/sign_config.local.bat

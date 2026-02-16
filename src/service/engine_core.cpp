@@ -1,41 +1,17 @@
-// UnLeaf v8.0 - Engine Core Implementation (Event-Driven Architecture)
-//
-// v8.0 Architecture Redesign:
-// - Event-driven WaitForMultipleObjects loop (replaces 10ms polling)
-// - ETW process/thread events are primary enforcement triggers
-// - SAFETY NET is "insurance consistency check" at 10s interval, NOT monitoring
-// - AGGRESSIVE: One-shot SET + deferred verification (not polling loop)
-// - STABLE: Purely event-driven (zero active polling)
-// - PERSISTENT: 5s interval (not 50ms)
-// - Config change via OS notification (FindFirstChangeNotification)
-// - Single EngineControlThread (merged enforcement + config watcher)
-// - Idle CPU: Zero between events
-//
-// Previous versions:
-// v7.0: AGGRESSIVE(10ms SET) -> STABLE(500ms GET) -> PERSISTENT(50ms SET)
-// v7.4: + Resilience: ETW health check, handle robustness, graceful degradation
+// UnLeaf - Engine Core Implementation (Event-Driven Architecture)
 
 #include "engine_core.h"
 #include <algorithm>
-#include <sstream>
 #include <functional>
+#include <cstdio>
 
 namespace unleaf {
-
-// Helper: ProcessPhase to string (for debug logging)
-static const wchar_t* PhaseToString(ProcessPhase p) {
-    switch (p) {
-        case ProcessPhase::AGGRESSIVE: return L"AGGRESSIVE";
-        case ProcessPhase::STABLE:     return L"STABLE";
-        case ProcessPhase::PERSISTENT: return L"PERSISTENT";
-        default:                       return L"UNKNOWN";
-    }
-}
 
 // Context structure for wait callback
 struct WaitCallbackContext {
     EngineCore* engine;
     DWORD pid;
+    std::shared_ptr<TrackedProcess> process;  // prevent premature destruction
 };
 
 EngineCore& EngineCore::Instance() {
@@ -51,6 +27,7 @@ EngineCore::EngineCore()
     , configChangeHandle_(INVALID_HANDLE_VALUE)
     , safetyNetTimer_(nullptr)
     , enforcementRequestEvent_(nullptr)
+    , hWakeupEvent_(nullptr)
     , totalViolations_(0)
     , lastStatsLogTime_(0)
     , totalRetries_(0)
@@ -67,7 +44,9 @@ EngineCore::EngineCore()
     , operationMode_(OperationMode::NORMAL)
     , lastEtwHealthCheck_(0)
     , lastDegradedScanTime_(0)
-    , startTime_(0) {
+    , startTime_(0)
+    , lastConfigCheckTime_(0)
+    , configChangePending_(false) {
 }
 
 EngineCore::~EngineCore() {
@@ -87,29 +66,33 @@ bool EngineCore::Initialize(const std::wstring& baseDir) {
     // Initialize config
     if (!UnLeafConfig::Instance().Initialize(baseDir)) {
         LOG_ERROR(L"Engine: Failed to initialize config");
+        CleanupHandles();
         return false;
     }
 
     // Initialize logger
     if (!LightweightLogger::Instance().Initialize(baseDir)) {
         LOG_ERROR(L"Engine: Failed to initialize logger");
+        CleanupHandles();
         return false;
     }
 
-    // v7.6: Apply log level from config
+    // Apply log level from config
     LightweightLogger::Instance().SetLogLevel(UnLeafConfig::Instance().GetLogLevel());
+    LightweightLogger::Instance().SetEnabled(UnLeafConfig::Instance().IsLogEnabled());
 
     // Load initial targets
     RefreshTargetSet();
 
-    // v8.0: Create Timer Queue for deferred verification and persistent enforcement timers
+    // Create Timer Queue for deferred verification and persistent enforcement timers
     timerQueue_ = CreateTimerQueue();
     if (!timerQueue_) {
         LOG_ERROR(L"Engine: Failed to create Timer Queue");
+        CleanupHandles();
         return false;
     }
 
-    // v8.0: Create config change notification (event-driven, replaces polling)
+    // Create config change notification (event-driven)
     std::wstring configDir = baseDir_;
     configChangeHandle_ = FindFirstChangeNotificationW(
         configDir.c_str(),
@@ -120,24 +103,32 @@ bool EngineCore::Initialize(const std::wstring& baseDir) {
         LOG_ALERT(L"Engine: FindFirstChangeNotification failed - config changes require restart");
     }
 
-    // v8.0: Create Safety Net waitable timer (10s periodic)
+    // Create Safety Net waitable timer (10s periodic)
     // SAFETY NET: This is an insurance consistency check, NOT monitoring
     safetyNetTimer_ = CreateWaitableTimerW(nullptr, FALSE, nullptr);
     if (!safetyNetTimer_) {
         LOG_ERROR(L"Engine: Failed to create Safety Net timer");
+        CleanupHandles();
         return false;
     }
 
-    // v8.0: Create enforcement request event (auto-reset)
+    // Create enforcement request event (auto-reset)
     enforcementRequestEvent_ = CreateEventW(nullptr, FALSE, FALSE, nullptr);
     if (!enforcementRequestEvent_) {
         LOG_ERROR(L"Engine: Failed to create enforcement request event");
+        CleanupHandles();
         return false;
     }
 
-    // v8.0: No longer need 1ms timer precision (event-driven, minimum timer is 200ms)
+    // Create wakeup event for process exit notifications (auto-reset)
+    hWakeupEvent_ = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+    if (!hWakeupEvent_) {
+        LOG_ERROR(L"Engine: Failed to create wakeup event");
+        CleanupHandles();
+        return false;
+    }
 
-    // v6.0: Load NT API functions from ntdll.dll
+    // Load NT API functions from ntdll.dll
     ntdllHandle_ = GetModuleHandleW(L"ntdll.dll");
     if (ntdllHandle_) {
         pfnNtSetInformationProcess_ = reinterpret_cast<PFN_NtSetInformationProcess>(
@@ -155,7 +146,7 @@ bool EngineCore::Initialize(const std::wstring& baseDir) {
         LOG_ALERT(L"Engine: ntdll.dll not loaded");
     }
 
-    // v7.94: Detect Windows version for compatibility
+    // Detect Windows version for compatibility
     {
         typedef NTSTATUS(WINAPI* RtlGetVersionPtr)(PRTL_OSVERSIONINFOW);
         RtlGetVersionPtr RtlGetVersion = nullptr;
@@ -176,15 +167,11 @@ bool EngineCore::Initialize(const std::wstring& baseDir) {
         }
 
         // Log detected version
-        std::wstringstream ss;
-        ss << L"Engine: Windows " << winVersion_.major << L"." << winVersion_.minor
-           << L" (Build " << winVersion_.build << L")";
-        if (winVersion_.isWindows11OrLater) {
-            ss << L" - Full EcoQoS support";
-        } else {
-            ss << L" - Limited EcoQoS (Win10 compatibility mode)";
-        }
-        LOG_INFO(ss.str());
+        wchar_t verBuf[128];
+        swprintf_s(verBuf, L"Engine: Windows %lu.%lu (Build %lu) - %s",
+                   winVersion_.major, winVersion_.minor, winVersion_.build,
+                   winVersion_.isWindows11OrLater ? L"Full EcoQoS support" : L"Limited EcoQoS (Win10 compatibility mode)");
+        LOG_INFO(verBuf);
     }
 
     // Initialize registry policy manager (centralized)
@@ -209,7 +196,7 @@ void EngineCore::Start() {
     startTime_ = now;
     ResetEvent(stopEvent_);
 
-    // v8.0: Start ETW with both process and thread callbacks
+    // Start ETW with both process and thread callbacks
     bool etwStarted = processMonitor_.Start(
         [this](DWORD pid, DWORD parentPid, const std::wstring& imageName) {
             this->OnProcessStart(pid, parentPid, imageName);
@@ -219,7 +206,7 @@ void EngineCore::Start() {
         }
     );
 
-    // v7.4: Set operation mode based on ETW status
+    // Set operation mode based on ETW status
     if (etwStarted) {
         operationMode_ = OperationMode::NORMAL;
     } else {
@@ -227,10 +214,9 @@ void EngineCore::Start() {
         LOG_ALERT(L"ETW: Monitor failed to start - using DEGRADED mode");
     }
 
-    // v7.0: InitialScan AFTER ETW is running (no gap)
     InitialScan();
 
-    // v8.0: Set up Safety Net waitable timer (10s periodic)
+    // Set up Safety Net waitable timer (10s periodic)
     // SAFETY NET: Insurance consistency check - NOT monitoring
     LARGE_INTEGER dueTime;
     dueTime.QuadPart = -static_cast<LONGLONG>(SAFETY_NET_INTERVAL) * 10000LL;  // Relative time in 100ns units
@@ -238,38 +224,80 @@ void EngineCore::Start() {
         LOG_ERROR(L"Engine: Failed to set Safety Net timer");
     }
 
-    // v8.0: Start single EngineControlThread (replaces enforcement + config watcher threads)
+    // Start single EngineControlThread
     engineControlThread_ = std::thread(&EngineCore::EngineControlLoop, this);
 
-    // v8.0: Updated startup log
-    std::wstringstream ss;
-    ss << L"EngineCore started: " << targetSet_.size() << L" targets, "
-       << (operationMode_ == OperationMode::NORMAL ? L"NORMAL" : L"DEGRADED_ETW")
-       << L" mode, Event-Driven, SafetyNet=10s";
-    LOG_DEBUG(ss.str());
+    wchar_t startBuf[128];
+    swprintf_s(startBuf, L"EngineCore started: %zu targets, %s mode, Event-Driven, SafetyNet=10s",
+               targetSet_.size(),
+               (operationMode_ == OperationMode::NORMAL ? L"NORMAL" : L"DEGRADED_ETW"));
+    LOG_DEBUG(startBuf);
 }
 
 void EngineCore::Stop() {
-    if (!running_.load()) return;
+    // Atomically claim the right to stop (prevents concurrent Stop() calls)
+    bool expected = true;
+    if (!running_.compare_exchange_strong(expected, false)) return;
 
     stopRequested_ = true;
     SetEvent(stopEvent_);
+    LOG_DEBUG(L"[STOP] Step 1: Stop signal sent");
 
     // Stop ETW monitor
     processMonitor_.Stop();
+    LOG_DEBUG(L"[STOP] Step 2: ETW monitor stopped");
 
-    // v8.0: Wait for single control thread
+    // Wait for single control thread
     if (engineControlThread_.joinable()) {
         engineControlThread_.join();
     }
+    LOG_DEBUG(L"[STOP] Step 3: Control thread joined");
 
-    // v8.0: Delete Timer Queue (waits for all timer callbacks to complete)
-    if (timerQueue_) {
-        DeleteTimerQueueEx(timerQueue_, INVALID_HANDLE_VALUE);
-        timerQueue_ = nullptr;
+    // Collect timer contexts before destroying timer queue
+    std::vector<DeferredVerifyContext*> timerContextsToDelete;
+    size_t deferredCount = 0, persistentCount = 0;
+    {
+        CSLockGuard lock(trackedCs_);
+        for (auto& [pid, tp] : trackedProcesses_) {
+            if (tp->persistentTimerContext) {
+                timerContextsToDelete.push_back(tp->persistentTimerContext);
+                tp->persistentTimerContext = nullptr;
+                persistentCount++;
+            }
+            if (tp->deferredTimerContext) {
+                timerContextsToDelete.push_back(tp->deferredTimerContext);
+                tp->deferredTimerContext = nullptr;
+                deferredCount++;
+            }
+            tp->persistentTimer = nullptr;
+            tp->deferredTimer = nullptr;
+        }
+    }
+    {
+        wchar_t stepBuf[128];
+        swprintf_s(stepBuf, L"[STOP] Step 4: Timer contexts collected (%zu deferred, %zu persistent)",
+                   deferredCount, persistentCount);
+        LOG_DEBUG(stepBuf);
     }
 
-    // v8.0: Cleanup tracked processes with safe wait handle unregistration
+    // Delete Timer Queue (waits for all timer callbacks to complete)
+    if (timerQueue_) {
+        if (!DeleteTimerQueueEx(timerQueue_, INVALID_HANDLE_VALUE)) {
+            wchar_t alertBuf[96];
+            swprintf_s(alertBuf, L"[STOP] DeleteTimerQueueEx failed (error=%lu)", GetLastError());
+            LOG_ALERT(alertBuf);
+            shutdownWarnings_.fetch_add(1);
+        }
+        timerQueue_ = nullptr;
+    }
+    LOG_DEBUG(L"[STOP] Step 5: Timer Queue deleted");
+
+    // Free persistent timer contexts after timer queue is destroyed
+    for (auto* ctx : timerContextsToDelete) {
+        delete ctx;
+    }
+
+    // Cleanup tracked processes with safe wait handle unregistration
     {
         std::vector<HANDLE> waitHandles;
         std::vector<WaitCallbackContext*> contextsToDelete;
@@ -281,10 +309,6 @@ void EngineCore::Stop() {
                     waitHandles.push_back(pair.second->waitHandle);
                     pair.second->waitHandle = nullptr;
                 }
-                // Note: deferredTimer and persistentTimer are managed by timerQueue_
-                // which was already deleted above
-                pair.second->deferredTimer = nullptr;
-                pair.second->persistentTimer = nullptr;
             }
             for (auto& [pid, ctx] : waitContexts_) {
                 contextsToDelete.push_back(ctx);
@@ -294,16 +318,26 @@ void EngineCore::Stop() {
         }
 
         for (HANDLE h : waitHandles) {
-            UnregisterWaitEx(h, INVALID_HANDLE_VALUE);
+            if (!UnregisterWaitEx(h, INVALID_HANDLE_VALUE)) {
+                shutdownWarnings_.fetch_add(1);
+            }
         }
 
         for (auto* ctx : contextsToDelete) {
             delete ctx;
         }
+
+        {
+            wchar_t stepBuf[96];
+            swprintf_s(stepBuf, L"[STOP] Step 6: Wait handles unregistered (%zu handles)",
+                       waitHandles.size());
+            LOG_DEBUG(stepBuf);
+        }
     }
 
-    // v5.0: Cleanup Job Objects
+    // Cleanup Job Objects
     CleanupJobObjects();
+    LOG_DEBUG(L"[STOP] Step 7: Job Objects cleaned up");
 
     // Cleanup all registry policies (both PowerThrottling + IFEO)
     RegistryPolicyManager::Instance().CleanupAllPolicies();
@@ -311,8 +345,36 @@ void EngineCore::Stop() {
         CSLockGuard lock(policySetCs_);
         policyAppliedSet_.clear();
     }
+    LOG_DEBUG(L"[STOP] Step 8: Registry policies cleaned up");
 
-    // v8.0: Cleanup event-driven handles
+    CleanupHandles();
+    LOG_DEBUG(L"[STOP] Step 9: Event handles closed");
+
+    // running_ already set to false by compare_exchange_strong at entry
+
+    {
+        wchar_t stopBuf[256];
+        swprintf_s(stopBuf, L"[STOP] Complete: ShutdownWarnings=%u",
+                   shutdownWarnings_.load());
+        LOG_DEBUG(stopBuf);
+    }
+
+    wchar_t stopBuf[256];
+    swprintf_s(stopBuf, L"EngineCore stopped. Violations=%u Retries=%u HandleReopen=%u NtApiSuccess=%u NtApiFail=%u PolicyApply=%u",
+               totalViolations_.load(), totalRetries_.load(), totalHandleReopen_.load(),
+               ntApiSuccessCount_.load(), ntApiFailCount_.load(), policyApplyCount_.load());
+    LOG_DEBUG(stopBuf);
+}
+
+void EngineCore::CleanupHandles() {
+    if (stopEvent_) {
+        CloseHandle(stopEvent_);
+        stopEvent_ = nullptr;
+    }
+    if (timerQueue_) {
+        DeleteTimerQueueEx(timerQueue_, nullptr);
+        timerQueue_ = nullptr;
+    }
     if (configChangeHandle_ != INVALID_HANDLE_VALUE) {
         FindCloseChangeNotification(configChangeHandle_);
         configChangeHandle_ = INVALID_HANDLE_VALUE;
@@ -325,17 +387,10 @@ void EngineCore::Stop() {
         CloseHandle(enforcementRequestEvent_);
         enforcementRequestEvent_ = nullptr;
     }
-
-    running_ = false;
-
-    std::wstringstream ss;
-    ss << L"EngineCore stopped. Violations=" << totalViolations_.load()
-       << L" Retries=" << totalRetries_.load()
-       << L" HandleReopen=" << totalHandleReopen_.load()
-       << L" NtApiSuccess=" << ntApiSuccessCount_.load()
-       << L" NtApiFail=" << ntApiFailCount_.load()
-       << L" PolicyApply=" << policyApplyCount_.load();
-    LOG_DEBUG(ss.str());
+    if (hWakeupEvent_) {
+        CloseHandle(hWakeupEvent_);
+        hWakeupEvent_ = nullptr;
+    }
 }
 
 // === ETW Callbacks ===
@@ -360,7 +415,7 @@ void EngineCore::OnProcessStart(DWORD pid, DWORD parentPid, const std::wstring& 
     }
 }
 
-// v8.0: ETW callback for thread creation events
+// ETW callback for thread creation events
 // Thread creation is a trigger point where OS may re-apply EcoQoS
 void EngineCore::OnThreadStart(DWORD threadId, DWORD ownerPid) {
     (void)threadId;  // Not used, we only care about the owner PID
@@ -381,9 +436,6 @@ void EngineCore::OnThreadStart(DWORD threadId, DWORD ownerPid) {
 
     if (!isTracked) return;
 
-    LOG_DEBUG(L"[ETW] Thread event for PID:" + std::to_wstring(ownerPid) +
-              L" phase=" + PhaseToString(currentPhase));
-
     // Queue check for STABLE and PERSISTENT phase processes
     // AGGRESSIVE already has active deferred verification
     // PERSISTENT has 5s timer but ETW boost provides instant response on tab switch
@@ -392,7 +444,7 @@ void EngineCore::OnThreadStart(DWORD threadId, DWORD ownerPid) {
     }
 }
 
-// === v8.0 Event-Driven Engine Control Loop ===
+// === Event-Driven Engine Control Loop ===
 
 void EngineCore::EngineControlLoop() {
     LOG_INFO(L"Engine: Event-driven control loop started (SafetyNet=10s, Event-triggered)");
@@ -403,69 +455,85 @@ void EngineCore::EngineControlLoop() {
     waitHandles[WAIT_CONFIG_CHANGE] = (configChangeHandle_ != INVALID_HANDLE_VALUE) ? configChangeHandle_ : stopEvent_;
     waitHandles[WAIT_SAFETY_NET] = safetyNetTimer_;
     waitHandles[WAIT_ENFORCEMENT_REQUEST] = enforcementRequestEvent_;
+    waitHandles[WAIT_PROCESS_EXIT] = hWakeupEvent_;
 
     while (!stopRequested_.load()) {
-        DWORD result = WaitForMultipleObjects(WAIT_COUNT, waitHandles, FALSE, INFINITE);
+        DWORD waitResult = WaitForMultipleObjects(WAIT_COUNT, waitHandles, FALSE, INFINITE);
 
-        if (stopRequested_.load()) break;
+        if (waitResult == WAIT_OBJECT_0 + WAIT_STOP)
+            break;
+
+        if (waitResult == WAIT_FAILED) {
+            wchar_t errBuf[96];
+            swprintf_s(errBuf, L"Engine: WaitForMultipleObjects failed (error=%lu)", GetLastError());
+            LOG_ERROR(errBuf);
+            break;
+        }
 
         ULONGLONG now = GetTickCount64();
 
-        switch (result) {
-            case WAIT_OBJECT_0 + WAIT_STOP:
-                // Stop requested
-                LOG_DEBUG(L"Engine: Stop event received");
-                return;
-
+        switch (waitResult) {
             case WAIT_OBJECT_0 + WAIT_CONFIG_CHANGE:
-                // Config file changed (OS notification)
-                HandleConfigChange();
+                wakeupConfigChange_.fetch_add(1);
+                configChangeDetected_.fetch_add(1);
+                // Debounce: notification fires for ALL file changes in directory
+                // (including log writes). Defer actual check to reduce unnecessary file stats.
+                configChangePending_ = true;
                 if (configChangeHandle_ != INVALID_HANDLE_VALUE) {
                     FindNextChangeNotification(configChangeHandle_);
                 }
                 break;
 
             case WAIT_OBJECT_0 + WAIT_SAFETY_NET:
-                // SAFETY NET: Insurance consistency check (NOT monitoring)
-                LOG_DEBUG(L"[SAFETY_NET] tick");
+                wakeupSafetyNet_.fetch_add(1);
                 HandleSafetyNetCheck();
                 lastSafetyNetTime_ = now;
                 break;
 
             case WAIT_OBJECT_0 + WAIT_ENFORCEMENT_REQUEST:
-                // Process queued enforcement requests from ETW callbacks and timers
+                wakeupEnforcementRequest_.fetch_add(1);
                 ProcessEnforcementQueue();
                 break;
 
-            case WAIT_TIMEOUT:
-                // Should not happen with INFINITE, but handle gracefully
+            case WAIT_OBJECT_0 + WAIT_PROCESS_EXIT:
+                wakeupProcessExit_.fetch_add(1);
+                ProcessPendingRemovals();
                 break;
 
-            case WAIT_FAILED:
             default:
-                // Error - log and continue
-                LOG_ERROR(L"Engine: WaitForMultipleObjects failed (error=" + std::to_wstring(GetLastError()) + L")");
-                Sleep(1000);  // Avoid tight error loop
                 break;
         }
 
-        // v8.0: Periodic maintenance (piggybacks on any wakeup)
+        // Process debounced config change
+        if (configChangePending_ && now - lastConfigCheckTime_ >= CONFIG_DEBOUNCE_MS) {
+            HandleConfigChange();
+            lastConfigCheckTime_ = now;
+            configChangePending_ = false;
+        }
+
         PerformPeriodicMaintenance(now);
     }
+
+    // Final drain: process any remaining removals before loop exit
+    ProcessPendingRemovals();
 
     LOG_INFO(L"Engine: Event-driven control loop ended");
 }
 
-// v8.0: Enqueue enforcement request (called from ETW callbacks and timer callbacks)
+// Enqueue enforcement request (called from ETW callbacks and timer callbacks)
 void EngineCore::EnqueueRequest(const EnforcementRequest& req) {
+    bool wasEmpty;
     {
         CSLockGuard lock(queueCs_);
+        wasEmpty = enforcementQueue_.empty();
         enforcementQueue_.push(req);
     }
-    SetEvent(enforcementRequestEvent_);  // Wake control loop
+    if (wasEmpty) {
+        SetEvent(enforcementRequestEvent_);
+    }
 }
 
-// v8.0: Process all queued enforcement requests
+// Process all queued enforcement requests
 void EngineCore::ProcessEnforcementQueue() {
     // Copy queue under lock, process outside lock
     std::queue<EnforcementRequest> pending;
@@ -482,7 +550,7 @@ void EngineCore::ProcessEnforcementQueue() {
     }
 }
 
-// v8.0: Dispatch a single enforcement request
+// Dispatch a single enforcement request
 void EngineCore::DispatchEnforcementRequest(const EnforcementRequest& req) {
     CSLockGuard lock(trackedCs_);
     auto it = trackedProcesses_.find(req.pid);
@@ -508,18 +576,18 @@ void EngineCore::DispatchEnforcementRequest(const EnforcementRequest& req) {
                     if (tp.violationCount >= VIOLATION_THRESHOLD) {
                         tp.phase = ProcessPhase::PERSISTENT;
                         StartPersistentTimer(req.pid);
-                        std::wstringstream ss;
-                        ss << L"[PERSISTENT] " << tp.name << L" (PID:" << req.pid
-                           << L") via thread event (violations=" << tp.violationCount << L")";
-                        LOG_DEBUG(ss.str());
+                        wchar_t logBuf[256];
+                        swprintf_s(logBuf, L"[PERSISTENT] %s (PID:%lu) via thread event (violations=%u)",
+                                   tp.name.c_str(), req.pid, tp.violationCount);
+                        LOG_DEBUG(logBuf);
                     } else {
                         tp.phase = ProcessPhase::AGGRESSIVE;
                         tp.phaseStartTime = now;
                         ScheduleDeferredVerification(req.pid, 1);
-                        std::wstringstream ss;
-                        ss << L"[VIOLATION] " << tp.name << L" (PID:" << req.pid
-                           << L") via thread event -> AGGRESSIVE";
-                        LOG_DEBUG(ss.str());
+                        wchar_t logBuf[256];
+                        swprintf_s(logBuf, L"[VIOLATION] %s (PID:%lu) via thread event -> AGGRESSIVE",
+                                   tp.name.c_str(), req.pid);
+                        LOG_DEBUG(logBuf);
                     }
                 }
                 tp.lastCheckTime = now;
@@ -528,8 +596,12 @@ void EngineCore::DispatchEnforcementRequest(const EnforcementRequest& req) {
                 // Provides immediate EcoQoS correction on tab switch without waiting for 5s timer
                 if (now - tp.lastEtwEnforceTime >= ETW_BOOST_RATE_LIMIT) {
                     bool ecoQoSOn = IsEcoQoSEnabled(tp.processHandle.get());
-                    LOG_DEBUG(L"[ETW_BOOST] " + tp.name + L" (PID:" + std::to_wstring(req.pid) +
-                              L") EcoQoS=" + (ecoQoSOn ? L"ON->enforce" : L"OFF->skip"));
+                    {
+                        wchar_t logBuf[256];
+                        swprintf_s(logBuf, L"[ETW_BOOST] %s (PID:%lu) EcoQoS=%s",
+                                   tp.name.c_str(), req.pid, ecoQoSOn ? L"ON->enforce" : L"OFF->skip");
+                        LOG_DEBUG(logBuf);
+                    }
                     if (ecoQoSOn) {
                         PulseEnforceV6(tp.processHandle.get(), req.pid, true);
                         tp.lastViolationTime = now;
@@ -543,6 +615,11 @@ void EngineCore::DispatchEnforcementRequest(const EnforcementRequest& req) {
         case EnforcementRequestType::DEFERRED_VERIFICATION:
             // Timer-based verification during AGGRESSIVE phase
             if (tp.phase == ProcessPhase::AGGRESSIVE) {
+                // Clean up fired timer's context
+                delete tp.deferredTimerContext;
+                tp.deferredTimerContext = nullptr;
+                tp.deferredTimer = nullptr;
+
                 bool ecoQoSOn = IsEcoQoSEnabled(tp.processHandle.get());
 
                 if (!ecoQoSOn) {
@@ -551,12 +628,10 @@ void EngineCore::DispatchEnforcementRequest(const EnforcementRequest& req) {
                         // Final verification passed -> transition to STABLE
                         tp.phase = ProcessPhase::STABLE;
                         tp.phaseStartTime = now;
-                        tp.isTrustedStable = false;
-                        tp.stableCheckInterval = 500;  // Not used in v8.0 but kept for stats
                         CancelProcessTimers(tp);
-                        std::wstringstream ss;
-                        ss << L"[PHASE] " << tp.name << L" (PID:" << req.pid << L") -> STABLE";
-                        LOG_DEBUG(ss.str());
+                        wchar_t logBuf[256];
+                        swprintf_s(logBuf, L"[PHASE] %s (PID:%lu) -> STABLE", tp.name.c_str(), req.pid);
+                        LOG_DEBUG(logBuf);
                     } else {
                         // Schedule next verification
                         ScheduleDeferredVerification(req.pid, req.verifyStep + 1);
@@ -571,10 +646,10 @@ void EngineCore::DispatchEnforcementRequest(const EnforcementRequest& req) {
                         tp.phase = ProcessPhase::PERSISTENT;
                         CancelProcessTimers(tp);
                         StartPersistentTimer(req.pid);
-                        std::wstringstream ss;
-                        ss << L"[PERSISTENT] " << tp.name << L" (PID:" << req.pid
-                           << L") violations=" << tp.violationCount;
-                        LOG_DEBUG(ss.str());
+                        wchar_t logBuf[256];
+                        swprintf_s(logBuf, L"[PERSISTENT] %s (PID:%lu) violations=%u",
+                                   tp.name.c_str(), req.pid, tp.violationCount);
+                        LOG_DEBUG(logBuf);
                     } else {
                         // Restart AGGRESSIVE with fresh verification sequence
                         tp.phaseStartTime = now;
@@ -589,25 +664,30 @@ void EngineCore::DispatchEnforcementRequest(const EnforcementRequest& req) {
         case EnforcementRequestType::PERSISTENT_ENFORCE:
             // Periodic enforcement for PERSISTENT phase (5s interval)
             if (tp.phase == ProcessPhase::PERSISTENT) {
-                LOG_DEBUG(L"[PERSISTENT_ENFORCE] " + tp.name + L" (PID:" + std::to_wstring(req.pid) + L")");
-                PulseEnforceV6(tp.processHandle.get(), req.pid, true);
+                bool ecoQoSOn = IsEcoQoSEnabled(tp.processHandle.get());
+                if (ecoQoSOn) {
+                    // EcoQoS re-enabled -> enforce and mark violation
+                    PulseEnforceV6(tp.processHandle.get(), req.pid, true);
+                    tp.lastViolationTime = now;
+                    persistentEnforceApplied_.fetch_add(1);
+                } else {
+                    persistentEnforceSkipped_.fetch_add(1);
+                }
                 tp.lastCheckTime = now;
 
                 // Check if process has been clean long enough to exit PERSISTENT
                 // (60 seconds without violation)
-                ULONGLONG timeSinceLastViolation = (tp.lastViolationTime > 0) ?
-                    (now - tp.lastViolationTime) : (now - tp.phaseStartTime);
-                if (timeSinceLastViolation >= PERSISTENT_CLEAN_THRESHOLD) {
-                    bool ecoQoSOn = IsEcoQoSEnabled(tp.processHandle.get());
-                    if (!ecoQoSOn) {
-                        // Clean for 60s -> transition to STABLE
+                if (!ecoQoSOn) {
+                    ULONGLONG timeSinceLastViolation = (tp.lastViolationTime > 0) ?
+                        (now - tp.lastViolationTime) : (now - tp.phaseStartTime);
+                    if (timeSinceLastViolation >= PERSISTENT_CLEAN_THRESHOLD) {
                         tp.phase = ProcessPhase::STABLE;
                         tp.phaseStartTime = now;
                         CancelProcessTimers(tp);
-                        std::wstringstream ss;
-                        ss << L"[PHASE] " << tp.name << L" (PID:" << req.pid
-                           << L") PERSISTENT -> STABLE (clean 60s)";
-                        LOG_DEBUG(ss.str());
+                        wchar_t logBuf[256];
+                        swprintf_s(logBuf, L"[PHASE] %s (PID:%lu) PERSISTENT -> STABLE (clean 60s)",
+                                   tp.name.c_str(), req.pid);
+                        LOG_DEBUG(logBuf);
                     }
                 }
             }
@@ -632,10 +712,10 @@ void EngineCore::DispatchEnforcementRequest(const EnforcementRequest& req) {
                         tp.phaseStartTime = now;
                         ScheduleDeferredVerification(req.pid, 1);
                     }
-                    std::wstringstream ss;
-                    ss << L"[SAFETY_NET] " << tp.name << L" (PID:" << req.pid
-                       << L") violation detected";
-                    LOG_DEBUG(ss.str());
+                    wchar_t logBuf[256];
+                    swprintf_s(logBuf, L"[SAFETY_NET] %s (PID:%lu) violation detected",
+                               tp.name.c_str(), req.pid);
+                    LOG_DEBUG(logBuf);
                 }
                 tp.lastCheckTime = now;
             }
@@ -646,7 +726,7 @@ void EngineCore::DispatchEnforcementRequest(const EnforcementRequest& req) {
     }
 }
 
-// v8.0: Handle config file change notification
+// Handle config file change notification
 void EngineCore::HandleConfigChange() {
     // Confirm INI file specifically changed (notification is for any file in directory)
     if (!UnLeafConfig::Instance().HasFileChanged()) {
@@ -656,11 +736,17 @@ void EngineCore::HandleConfigChange() {
     LOG_INFO(L"Config: Reloading (event-driven notification)");
 
     UnLeafConfig::Instance().Reload();
+    configReloadCount_.fetch_add(1, std::memory_order_relaxed);
+
+    // Apply logger settings from reloaded config
+    LightweightLogger::Instance().SetLogLevel(UnLeafConfig::Instance().GetLogLevel());
+    LightweightLogger::Instance().SetEnabled(UnLeafConfig::Instance().IsLogEnabled());
+
     RefreshTargetSet();
 
-    std::wstringstream ss;
-    ss << L"[CONFIG] Reloaded: " << targetSet_.size() << L" targets";
-    LOG_DEBUG(ss.str());
+    wchar_t cfgBuf[96];
+    swprintf_s(cfgBuf, L"[CONFIG] Reloaded: %zu targets", targetSet_.size());
+    LOG_DEBUG(cfgBuf);
 
     // Remove tracked processes that are no longer targets
     CleanupRemovedTargets();
@@ -671,7 +757,7 @@ void EngineCore::HandleConfigChange() {
     LOG_INFO(L"Config: Reload complete");
 }
 
-// v8.0: SAFETY NET - Insurance consistency check (NOT monitoring)
+// SAFETY NET - Insurance consistency check (NOT monitoring)
 // This is NOT polling - it's a last-resort check for event misses and OS quirks
 // Only checks already-tracked processes, never scans all processes
 void EngineCore::HandleSafetyNetCheck() {
@@ -688,6 +774,8 @@ void EngineCore::HandleSafetyNetCheck() {
         }
     }
 
+    if (pidsToCheck.empty()) return;
+
     // Queue safety net checks for each tracked process
     for (DWORD pid : pidsToCheck) {
         if (stopRequested_.load()) break;
@@ -698,7 +786,24 @@ void EngineCore::HandleSafetyNetCheck() {
     ProcessEnforcementQueue();
 }
 
-// v8.0: Schedule deferred verification timer (AGGRESSIVE phase)
+// Drain pending process removal queue (called from EngineControlLoop thread only)
+void EngineCore::ProcessPendingRemovals() {
+    for (;;) {
+        std::queue<DWORD> pending;
+        {
+            CSLockGuard lock(pendingRemovalCs_);
+            if (pendingRemovalPids_.empty())
+                break;
+            std::swap(pending, pendingRemovalPids_);
+        }
+        while (!pending.empty()) {
+            RemoveTrackedProcess(pending.front());
+            pending.pop();
+        }
+    }
+}
+
+// Schedule deferred verification timer (AGGRESSIVE phase)
 void EngineCore::ScheduleDeferredVerification(DWORD pid, uint8_t step) {
     if (!timerQueue_) return;
 
@@ -711,17 +816,15 @@ void EngineCore::ScheduleDeferredVerification(DWORD pid, uint8_t step) {
         default: return;
     }
 
-    // Create context for timer callback
-    auto* context = new DeferredVerifyContext{this, pid, step};
-
-    // Get reference to tracked process to store timer handle
+    // Get reference to tracked process and create context with shared_ptr
     {
         CSLockGuard lock(trackedCs_);
         auto it = trackedProcesses_.find(pid);
         if (it == trackedProcesses_.end()) {
-            delete context;
             return;
         }
+
+        auto* context = new DeferredVerifyContext{this, pid, step, it->second};
 
         HANDLE timer = nullptr;
         if (CreateTimerQueueTimer(
@@ -733,41 +836,60 @@ void EngineCore::ScheduleDeferredVerification(DWORD pid, uint8_t step) {
                 0,  // One-shot
                 WT_EXECUTEONLYONCE)) {
             it->second->deferredTimer = timer;
+            it->second->deferredTimerContext = context;
         } else {
             delete context;
         }
     }
 }
 
-// v8.0: Cancel all timers for a process
+// Cancel all timers for a process
 void EngineCore::CancelProcessTimers(TrackedProcess& tp) {
-    // Note: Timer handles are managed by the timer queue
-    // When the timer queue is deleted, all timers are automatically cleaned up
-    // Here we just clear our references
-    tp.deferredTimer = nullptr;
-    tp.persistentTimer = nullptr;
+    if (tp.deferredTimer && timerQueue_) {
+        if (!DeleteTimerQueueTimer(timerQueue_, tp.deferredTimer, INVALID_HANDLE_VALUE)) {
+            DWORD err = GetLastError();
+            if (err != ERROR_IO_PENDING) {
+                shutdownWarnings_.fetch_add(1);
+            }
+        }
+        delete tp.deferredTimerContext;
+        tp.deferredTimerContext = nullptr;
+        tp.deferredTimer = nullptr;
+    }
+    if (tp.persistentTimer && timerQueue_) {
+        if (!DeleteTimerQueueTimer(timerQueue_, tp.persistentTimer, INVALID_HANDLE_VALUE)) {
+            DWORD err = GetLastError();
+            if (err != ERROR_IO_PENDING) {
+                shutdownWarnings_.fetch_add(1);
+            }
+        }
+        delete tp.persistentTimerContext;
+        tp.persistentTimerContext = nullptr;
+        tp.persistentTimer = nullptr;
+    }
 }
 
-// v8.0: Start persistent enforcement timer (5s recurring)
+// Start persistent enforcement timer (5s recurring)
 void EngineCore::StartPersistentTimer(DWORD pid) {
     if (!timerQueue_) return;
-
-    // Create context
-    auto* context = new DeferredVerifyContext{this, pid, 0};
 
     {
         CSLockGuard lock(trackedCs_);
         auto it = trackedProcesses_.find(pid);
         if (it == trackedProcesses_.end()) {
-            delete context;
             return;
         }
 
         // Cancel existing persistent timer if any
         if (it->second->persistentTimer) {
-            DeleteTimerQueueTimer(timerQueue_, it->second->persistentTimer, nullptr);
+            // INVALID_HANDLE_VALUE: block until callback completes before freeing context
+            DeleteTimerQueueTimer(timerQueue_, it->second->persistentTimer, INVALID_HANDLE_VALUE);
+            delete it->second->persistentTimerContext;
             it->second->persistentTimer = nullptr;
+            it->second->persistentTimerContext = nullptr;
         }
+
+        auto* context = new DeferredVerifyContext{this, pid, 0, it->second};
 
         HANDLE timer = nullptr;
         if (CreateTimerQueueTimer(
@@ -779,13 +901,15 @@ void EngineCore::StartPersistentTimer(DWORD pid) {
                 static_cast<DWORD>(PERSISTENT_ENFORCE_INTERVAL),  // Period (recurring)
                 WT_EXECUTEDEFAULT)) {
             it->second->persistentTimer = timer;
+            it->second->persistentTimerContext = context;
         } else {
             delete context;
         }
     }
 }
 
-// v8.0: Timer callback for deferred verification
+// Timer callback for deferred verification
+// Context lifetime managed by TrackedProcess::deferredTimerContext (not self-deleted)
 void CALLBACK EngineCore::DeferredVerifyTimerCallback(PVOID lpParameter, BOOLEAN timerOrWaitFired) {
     (void)timerOrWaitFired;
     auto* context = static_cast<DeferredVerifyContext*>(lpParameter);
@@ -793,10 +917,9 @@ void CALLBACK EngineCore::DeferredVerifyTimerCallback(PVOID lpParameter, BOOLEAN
         context->engine->EnqueueRequest(
             EnforcementRequest(context->pid, EnforcementRequestType::DEFERRED_VERIFICATION, context->step));
     }
-    delete context;
 }
 
-// v8.0: Timer callback for persistent enforcement
+// Timer callback for persistent enforcement
 void CALLBACK EngineCore::PersistentEnforceTimerCallback(PVOID lpParameter, BOOLEAN timerOrWaitFired) {
     (void)timerOrWaitFired;
     auto* context = static_cast<DeferredVerifyContext*>(lpParameter);
@@ -807,7 +930,7 @@ void CALLBACK EngineCore::PersistentEnforceTimerCallback(PVOID lpParameter, BOOL
     // Note: Do NOT delete context for recurring timer - it's reused
 }
 
-// v8.0: Periodic maintenance (piggybacks on wakeups)
+// Periodic maintenance (piggybacks on wakeups)
 void EngineCore::PerformPeriodicMaintenance(ULONGLONG now) {
     // ETW health check (every 30s)
     if (now - lastEtwHealthCheck_ >= ETW_HEALTH_CHECK_INTERVAL) {
@@ -834,13 +957,20 @@ void EngineCore::PerformPeriodicMaintenance(ULONGLONG now) {
         lastEtwHealthCheck_ = now;
     }
 
-    // Job Object refresh (every 5s)
+    // Job Object refresh (every 5s) - skip if no active Job Objects
     if (now - lastJobQueryTime_ >= JOB_QUERY_INTERVAL) {
-        RefreshJobObjectPids();
+        bool hasJobs;
+        {
+            CSLockGuard lock(jobCs_);
+            hasJobs = !jobObjects_.empty();
+        }
+        if (hasJobs) {
+            RefreshJobObjectPids();
+        }
         lastJobQueryTime_ = now;
     }
 
-    // v8.0: DEGRADED_ETW mode fallback scan (every 30s)
+    // DEGRADED_ETW mode fallback scan (every 30s)
     if (operationMode_ == OperationMode::DEGRADED_ETW) {
         if (now - lastDegradedScanTime_ >= DEGRADED_SCAN_INTERVAL) {
             InitialScanForDegradedMode();
@@ -867,27 +997,35 @@ void EngineCore::PerformPeriodicMaintenance(ULONGLONG now) {
             CSLockGuard lock(jobCs_);
             jobCount = jobObjects_.size();
         }
-        if (count > 0) {
-            std::wstringstream ss;
-            ss << L"Stats: " << count << L" tracked (A:"
-               << aggressiveCount << L" S:" << stableCount << L" P:" << persistentCount
-               << L"), " << jobCount << L" jobs, "
-               << totalViolations_.load() << L" violations";
-            LOG_DEBUG(ss.str());
+        if (count > 0 && (aggressiveCount > 0 || persistentCount > 0)) {
+            wchar_t statsBuf[512];
+            swprintf_s(statsBuf,
+                L"Stats: %zu tracked (A:%zu S:%zu P:%zu), %zu jobs, viol=%u, "
+                L"wakeup(cfg:%u sn:%u enf:%u exit:%u), persist(apply:%u skip:%u)",
+                count, aggressiveCount, stableCount, persistentCount,
+                jobCount, totalViolations_.load(),
+                wakeupConfigChange_.load(), wakeupSafetyNet_.load(),
+                wakeupEnforcementRequest_.load(), wakeupProcessExit_.load(),
+                persistentEnforceApplied_.load(), persistentEnforceSkipped_.load());
+            LOG_DEBUG(statsBuf);
 
             if (persistentCount > 0) {
                 CSLockGuard lock2(trackedCs_);
-                std::wstringstream pss;
-                pss << L"  PERSISTENT: ";
+                wchar_t pBuf[512];
+                int pos = swprintf_s(pBuf, L"PERSISTENT: ");
                 bool first = true;
                 for (const auto& [p, t] : trackedProcesses_) {
                     if (t->phase == ProcessPhase::PERSISTENT) {
-                        if (!first) pss << L", ";
-                        pss << t->name << L"(" << p << L")";
+                        int remaining = 512 - pos;
+                        if (remaining <= 0) break;
+                        int written = swprintf_s(pBuf + pos, remaining,
+                                                 first ? L"%s(%lu)" : L", %s(%lu)",
+                                                 t->name.c_str(), p);
+                        if (written > 0) pos += written;
                         first = false;
                     }
                 }
-                LOG_DEBUG(pss.str());
+                LOG_DEBUG(pBuf);
             }
         }
         lastStatsLogTime_ = now;
@@ -909,7 +1047,7 @@ bool EngineCore::PulseEnforceV6(HANDLE hProcess, DWORD pid, bool isIntensive) {
 
     bool ecoQoSSuccess = false;
 
-    // v7.94: Determine control mask based on Windows version
+    // Determine control mask based on Windows version
     // IGNORE_TIMER (0x4) is Windows 11 specific - causes errors on Windows 10
     ULONG controlMask = UNLEAF_THROTTLE_EXECUTION_SPEED;
     if (winVersion_.isWindows11OrLater) {
@@ -917,7 +1055,6 @@ bool EngineCore::PulseEnforceV6(HANDLE hProcess, DWORD pid, bool isIntensive) {
     }
 
     // Step 2: Try NtSetInformationProcess first (Windows 11+ only)
-    // v7.94: Skip NT API on Windows 10 - it fails with error=18
     if (winVersion_.isWindows11OrLater && ntApiAvailable_ && pfnNtSetInformationProcess_) {
         UnleafThrottleState state;
         state.Version = UNLEAF_THROTTLE_VERSION;
@@ -959,7 +1096,6 @@ bool EngineCore::PulseEnforceV6(HANDLE hProcess, DWORD pid, bool isIntensive) {
     SetPriorityClass(hProcess, UNLEAF_TARGET_PRIORITY);
 
     // Step 5: Thread throttling (INTENSIVE phase only)
-    // v7.80: Use consolidated function with aggressive=true
     if (isIntensive) {
         DisableThreadThrottling(pid, true);
     }
@@ -1008,9 +1144,7 @@ bool EngineCore::IsEcoQoSEnabled(HANDLE hProcess) const {
     return false;  // Unable to determine, assume not enabled
 }
 
-// v8.0: Old phase handlers removed - enforcement is now event-driven via DispatchEnforcementRequest
-
-// === v6.0 Registry Policy Application ===
+// === Registry Policy Application ===
 
 bool EngineCore::ApplyRegistryPolicy(const std::wstring& exePath, const std::wstring& exeName) {
     // Check if already applied
@@ -1030,15 +1164,15 @@ bool EngineCore::ApplyRegistryPolicy(const std::wstring& exePath, const std::wst
         policyAppliedSet_.insert(ToLower(exeName));
         policyApplyCount_.fetch_add(1, std::memory_order_relaxed);
 
-        std::wstringstream ss;
-        ss << L"[REGISTRY] Policy applied for: " << exeName;
-        LOG_DEBUG(ss.str());
+        wchar_t logBuf[256];
+        swprintf_s(logBuf, L"[REGISTRY] Policy applied for: %s", exeName.c_str());
+        LOG_DEBUG(logBuf);
     }
 
     return success;
 }
 
-// === v5.6 Stateless Pulse Enforcement (fallback) ===
+// === Stateless Pulse Enforcement (fallback) ===
 
 bool EngineCore::PulseEnforce(HANDLE hProcess, DWORD pid, bool isIntensive) {
     // Zero-Trust: Never check current state - always force desired state
@@ -1056,14 +1190,12 @@ bool EngineCore::PulseEnforce(HANDLE hProcess, DWORD pid, bool isIntensive) {
         static_cast<PROCESS_INFORMATION_CLASS>(UNLEAF_PROCESS_POWER_THROTTLING),
         &state, sizeof(state));
 
-    // v5.6: Always set priority (never skip even if EcoQoS fails)
     // Step 3: Set HIGH priority (unconditional - critical for OS resistance)
     // Even if SetProcessInformation fails (e.g. Chrome sandbox),
     // setting HIGH_PRIORITY_CLASS prevents OS from reapplying EcoQoS
     SetPriorityClass(hProcess, UNLEAF_TARGET_PRIORITY);
 
     // Step 4: Thread throttling (INTENSIVE phase only - more expensive operation)
-    // v7.80: Use consolidated function with aggressive=false
     if (isIntensive) {
         DisableThreadThrottling(pid, false);
     }
@@ -1077,7 +1209,7 @@ bool EngineCore::PulseEnforce(HANDLE hProcess, DWORD pid, bool isIntensive) {
     return true;
 }
 
-// v7.80: Consolidated thread throttling (merged Optimized + V6)
+// Consolidated thread throttling
 int EngineCore::DisableThreadThrottling(DWORD pid, bool aggressive) {
     if (pid == 0) return 0;
 
@@ -1111,7 +1243,7 @@ int EngineCore::DisableThreadThrottling(DWORD pid, bool aggressive) {
                     int currentPriority = GetThreadPriority(hThread);
                     if (currentPriority != THREAD_PRIORITY_ERROR_RETURN) {
                         if (aggressive) {
-                            // v6.0 style: boost any thread below ABOVE_NORMAL
+                            // Boost any thread below ABOVE_NORMAL
                             if (currentPriority < THREAD_PRIORITY_ABOVE_NORMAL) {
                                 SetThreadPriority(hThread, THREAD_PRIORITY_ABOVE_NORMAL);
                             }
@@ -1147,7 +1279,6 @@ void EngineCore::UpdateEnforceState(DWORD pid, ULONGLONG now, bool success) {
     if (success) {
         tp->consecutiveFailures = 0;
         tp->nextRetryTime = 0;
-        // v7.0: Phase transition handled in ProcessPhaseEnforcement
     }
 }
 
@@ -1160,12 +1291,16 @@ void EngineCore::SetProcessPhase(DWORD pid, ProcessPhase phase) {
     }
 }
 
-// === v5.0 Self-Healing Error Handling ===
+// === Self-Healing Error Handling ===
 
 void EngineCore::HandleEnforceError(HANDLE hProcess, DWORD pid, DWORD error) {
     totalRetries_.fetch_add(1, std::memory_order_relaxed);
 
-    // v7.4: Check if process is still alive before retrying
+    // Error-code-specific counters (always increment, independent of log suppression)
+    if (error == ERROR_ACCESS_DENIED) error5Count_.fetch_add(1);
+    else if (error == ERROR_INVALID_PARAMETER) error87Count_.fetch_add(1);
+
+    // Check if process is still alive before retrying
     DWORD exitCode = 0;
     bool processAlive = (hProcess && GetExitCodeProcess(hProcess, &exitCode) && exitCode == STILL_ACTIVE);
 
@@ -1177,26 +1312,38 @@ void EngineCore::HandleEnforceError(HANDLE hProcess, DWORD pid, DWORD error) {
     tp->consecutiveFailures++;
     tp->lastErrorCode = error;
 
-    // v7.4: If process has exited, cleanup immediately (no retry)
+    // Error log suppression (same PID × error code within 60s window)
+    auto suppressKey = std::make_pair(pid, error);
+    bool shouldLog = true;
+    ULONGLONG now = GetTickCount64();
+    auto suppIt = errorLogSuppression_.find(suppressKey);
+    if (suppIt != errorLogSuppression_.end() && now - suppIt->second < ERROR_LOG_SUPPRESS_MS) {
+        shouldLog = false;
+    } else {
+        errorLogSuppression_[suppressKey] = now;
+    }
+
+    // If process has exited, cleanup immediately (no retry)
     if (!processAlive) {
-        std::wstringstream ss;
-        ss << L"[CLEANUP] " << tp->name << L" (PID:" << pid
-           << L") process exited (exitCode=" << exitCode << L")";
-        LOG_DEBUG(ss.str());
+        if (shouldLog) {
+            wchar_t logBuf[256];
+            swprintf_s(logBuf, L"[CLEANUP] %s (PID:%lu) process exited (exitCode=%lu)",
+                       tp->name.c_str(), pid, exitCode);
+            LOG_DEBUG(logBuf);
+        }
         tp->processHandle.reset();
         return;
     }
 
     switch (error) {
         case ERROR_ACCESS_DENIED:
-            // v7.4: Max 2 retries, then give up
             if (tp->consecutiveFailures <= 2) {
                 tp->nextRetryTime = GetTickCount64() + RETRY_BACKOFF_BASE_MS;
-            } else {
-                std::wstringstream ss;
-                ss << L"[GIVE_UP] " << tp->name << L" (PID:" << pid
-                   << L") access denied - giving up after 2 retries";
-                LOG_DEBUG(ss.str());
+            } else if (shouldLog) {
+                wchar_t logBuf[256];
+                swprintf_s(logBuf, L"[GIVE_UP] %s (PID:%lu) access denied - giving up after 2 retries",
+                           tp->name.c_str(), pid);
+                LOG_DEBUG(logBuf);
             }
             break;
 
@@ -1205,20 +1352,19 @@ void EngineCore::HandleEnforceError(HANDLE hProcess, DWORD pid, DWORD error) {
             break;
 
         case ERROR_INVALID_PARAMETER:  // 87 - PID is invalid (process already exited)
-            // v7.2: No retry needed - process is dead, Safety Net will re-detect if needed
+            // No retry needed - process is dead, Safety Net will re-detect if needed
             tp->processHandle.reset();
             break;
 
         default:
-            // v7.4: Exponential backoff with max retries and give-up logging
             if (tp->consecutiveFailures <= MAX_RETRY_COUNT) {
                 DWORD backoff = RETRY_BACKOFF_BASE_MS * (1 << (tp->consecutiveFailures - 1));
                 tp->nextRetryTime = GetTickCount64() + backoff;
-            } else {
-                std::wstringstream ss;
-                ss << L"[GIVE_UP] " << tp->name << L" (PID:" << pid
-                   << L") error=" << error << L" - max retries reached";
-                LOG_DEBUG(ss.str());
+            } else if (shouldLog) {
+                wchar_t logBuf[256];
+                swprintf_s(logBuf, L"[GIVE_UP] %s (PID:%lu) error=%lu - max retries reached",
+                           tp->name.c_str(), pid, error);
+                LOG_DEBUG(logBuf);
             }
             break;
     }
@@ -1227,80 +1373,100 @@ void EngineCore::HandleEnforceError(HANDLE hProcess, DWORD pid, DWORD error) {
 bool EngineCore::ReopenProcessHandle(DWORD pid) {
     totalHandleReopen_.fetch_add(1, std::memory_order_relaxed);
 
-    // v7.0: Use minimal permissions matching Python v1.00 (0x1200)
     HANDLE hProcess = OpenProcess(
         PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_SET_INFORMATION,
         FALSE, pid);
 
     if (!hProcess) return false;
 
-    CSLockGuard lock(trackedCs_);
-    auto it = trackedProcesses_.find(pid);
-    if (it == trackedProcesses_.end()) {
-        CloseHandle(hProcess);
-        return false;
-    }
+    HANDLE oldWaitHandle = nullptr;
+    WaitCallbackContext* oldContext = nullptr;
 
-    auto& tp = it->second;
+    {
+        CSLockGuard lock(trackedCs_);
+        auto it = trackedProcesses_.find(pid);
+        if (it == trackedProcesses_.end()) {
+            CloseHandle(hProcess);
+            return false;
+        }
 
-    // Unregister old wait
-    if (tp->waitHandle) {
-        UnregisterWait(tp->waitHandle);
-        tp->waitHandle = nullptr;
-    }
-    tp->waitProcessHandle.reset();
+        auto& tp = it->second;
 
-    // Replace handle
-    tp->processHandle = MakeScopedHandle(hProcess);
-    tp->consecutiveFailures = 0;
-    tp->nextRetryTime = 0;
+        // Collect old wait handle for out-of-lock cleanup
+        if (tp->waitHandle) {
+            oldWaitHandle = tp->waitHandle;
+            tp->waitHandle = nullptr;
+        }
+        tp->waitProcessHandle.reset();
 
-    // v7.0: Re-register wait callback with separate SYNCHRONIZE handle
-    // v7.80: Track context in waitContexts_ for safe cleanup
-    HANDLE hWaitProcess = OpenProcess(SYNCHRONIZE, FALSE, pid);
-    if (hWaitProcess) {
-        auto context = new WaitCallbackContext{this, pid};
-        HANDLE waitHandle = nullptr;
+        // Free old context
+        auto oldCtxIt = waitContexts_.find(pid);
+        if (oldCtxIt != waitContexts_.end()) {
+            oldContext = oldCtxIt->second;
+            waitContexts_.erase(oldCtxIt);
+        }
 
-        if (RegisterWaitForSingleObject(
-                &waitHandle,
-                hWaitProcess,
-                OnProcessExit,
-                context,
-                INFINITE,
-                WT_EXECUTEONLYONCE)) {
-            tp->waitHandle = waitHandle;
-            tp->waitProcessHandle = MakeScopedHandle(hWaitProcess);
-            // v7.80: Track context (still under trackedCs_ lock)
-            waitContexts_[pid] = context;
-        } else {
-            delete context;
-            CloseHandle(hWaitProcess);
+        // Replace handle
+        tp->processHandle = MakeScopedHandle(hProcess);
+        tp->consecutiveFailures = 0;
+        tp->nextRetryTime = 0;
+
+        // Re-register wait callback with separate SYNCHRONIZE handle
+        HANDLE hWaitProcess = OpenProcess(SYNCHRONIZE, FALSE, pid);
+        if (hWaitProcess) {
+            auto context = new WaitCallbackContext{this, pid, it->second};
+            HANDLE waitHandle = nullptr;
+
+            if (RegisterWaitForSingleObject(
+                    &waitHandle,
+                    hWaitProcess,
+                    OnProcessExit,
+                    context,
+                    INFINITE,
+                    WT_EXECUTEONLYONCE)) {
+                tp->waitHandle = waitHandle;
+                tp->waitProcessHandle = MakeScopedHandle(hWaitProcess);
+                waitContexts_[pid] = context;
+            } else {
+                delete context;
+                CloseHandle(hWaitProcess);
+            }
         }
     }
 
-    LOG_DEBUG(L"Engine: Reopened handle for PID " + std::to_wstring(pid));
+    // Unregister old wait outside lock (blocks until callback completes)
+    if (oldWaitHandle) {
+        if (!UnregisterWaitEx(oldWaitHandle, INVALID_HANDLE_VALUE)) {
+            shutdownWarnings_.fetch_add(1);
+        }
+    }
+    delete oldContext;
+
+    wchar_t logBuf[64];
+    swprintf_s(logBuf, L"Engine: Reopened handle for PID %lu", pid);
+    LOG_DEBUG(logBuf);
     return true;
 }
 
-// === v5.0 Job Object Management ===
+// === Job Object Management ===
 
 bool EngineCore::CreateAndAssignJobObject(DWORD rootPid, HANDLE hProcess) {
     // Check if already in a Job (Chrome sandbox case)
     BOOL inJob = FALSE;
     IsProcessInJob(hProcess, nullptr, &inJob);
     if (inJob) {
-        LOG_DEBUG(L"Job: PID " + std::to_wstring(rootPid) + L" already in Job - pulse-only mode");
+        wchar_t logBuf[96];
+        swprintf_s(logBuf, L"Job: PID %lu already in Job - pulse-only mode", rootPid);
+        LOG_DEBUG(logBuf);
         return false;  // TrackedProcess still created to continue PulseEnforce
     }
 
     // Create Job Object
     HANDLE hJob = CreateJobObjectW(nullptr, nullptr);
     if (!hJob) {
-        DWORD error = GetLastError();
-        std::wstringstream ss;
-        ss << L"[JOB] Failed to create Job Object (error=" << error << L")";
-        LOG_DEBUG(ss.str());
+        wchar_t logBuf[96];
+        swprintf_s(logBuf, L"[JOB] Failed to create Job Object (error=%lu)", GetLastError());
+        LOG_DEBUG(logBuf);
         return false;
     }
 
@@ -1315,9 +1481,9 @@ bool EngineCore::CreateAndAssignJobObject(DWORD rootPid, HANDLE hProcess) {
     if (!AssignProcessToJobObject(hJob, hProcess)) {
         DWORD error = GetLastError();
         CloseHandle(hJob);
-        std::wstringstream ss;
-        ss << L"[JOB] Failed to assign PID " << rootPid << L" to Job (error=" << error << L")";
-        LOG_DEBUG(ss.str());
+        wchar_t logBuf[128];
+        swprintf_s(logBuf, L"[JOB] Failed to assign PID %lu to Job (error=%lu)", rootPid, error);
+        LOG_DEBUG(logBuf);
         return false;
     }
 
@@ -1332,11 +1498,15 @@ bool EngineCore::CreateAndAssignJobObject(DWORD rootPid, HANDLE hProcess) {
         jobObjects_[rootPid] = std::move(info);
     }
 
-    LOG_DEBUG(L"Job: Created Job Object for root PID " + std::to_wstring(rootPid));
+    {
+        wchar_t logBuf[96];
+        swprintf_s(logBuf, L"Job: Created Job Object for root PID %lu", rootPid);
+        LOG_DEBUG(logBuf);
+    }
     return true;
 }
 
-// v7.80: Optimized 2-pass approach to minimize lock contention
+// Optimized 2-pass approach to minimize lock contention
 void EngineCore::RefreshJobObjectPids() {
     // Pass 1: Collect job info and PIDs under lock
     struct JobQueryResult {
@@ -1426,14 +1596,10 @@ void EngineCore::UpdatePhase(DWORD pid, ULONGLONG now) {
 
     auto& tp = it->second;
     tp->lastCheckTime = now;
-    // v7.0: Phase transition handled in ProcessPhaseEnforcement
 }
-
-// v8.0: ConfigWatcherLoop removed - config changes detected via FindFirstChangeNotification
 
 // === Process Management ===
 
-// v8.0: QuickRescan removed - replaced by event-driven ETW and Safety Net
 // InitialScanForDegradedMode is used only in DEGRADED_ETW mode as fallback
 
 void EngineCore::InitialScanForDegradedMode() {
@@ -1546,24 +1712,22 @@ bool EngineCore::ApplyOptimization(DWORD pid, const std::wstring& name, bool isC
         return false;
     }
 
-    // v7.0: Use minimal permissions matching Python v1.00 (0x1200)
-    // This allows access to Chrome sandbox processes that reject SYNCHRONIZE
+    // Use minimal permissions (0x1200) for Chrome sandbox process compatibility
     DWORD access = PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_SET_INFORMATION;
     HANDLE hProcess = OpenProcess(access, FALSE, pid);
     if (!hProcess) {
         // Log failure for observability
-        DWORD error = GetLastError();
-        std::wstringstream ss;
-        ss << L"[SKIP] " << name << L" (PID:" << pid
-           << L") OpenProcess failed (error=" << error << L")";
-        LOG_DEBUG(ss.str());
+        wchar_t logBuf[256];
+        swprintf_s(logBuf, L"[SKIP] %s (PID:%lu) OpenProcess failed (error=%lu)",
+                   name.c_str(), pid, GetLastError());
+        LOG_DEBUG(logBuf);
         return false;
     }
 
     ScopedHandle scopedHandle = MakeScopedHandle(hProcess);
     ULONGLONG now = GetTickCount64();
 
-    // v6.0: Apply registry policy for root target processes (once per executable)
+    // Apply registry policy for root target processes (once per executable)
     if (!isChild) {
         // Get full path for registry policy
         wchar_t pathBuffer[MAX_PATH];
@@ -1574,17 +1738,15 @@ bool EngineCore::ApplyOptimization(DWORD pid, const std::wstring& name, bool isC
         }
     }
 
-    // v6.0: Use PulseEnforceV6 with NtSetInformationProcess
-    // v7.0: Initial enforcement in AGGRESSIVE phase
     bool success = PulseEnforceV6(scopedHandle.get(), pid, true);
 
     // Log the optimization
-    std::wstring prefix = isChild ? L"[CHILD]" : L"[TARGET]";
-    std::wstringstream ss;
-    ss << L"Optimized: " << prefix << L" " << name << L" (PID: " << pid << L") Child=" << isChild;
-    LOG_DEBUG(ss.str());
+    wchar_t optBuf[256];
+    swprintf_s(optBuf, L"Optimized: %s %s (PID: %lu) Child=%d",
+               isChild ? L"[CHILD]" : L"[TARGET]", name.c_str(), pid, isChild ? 1 : 0);
+    LOG_DEBUG(optBuf);
 
-    // v5.0: Job Object assignment for root target processes
+    // Job Object assignment for root target processes
     bool inJob = false;
     bool jobFailed = false;
     DWORD rootPid = isChild ? parentPid : pid;
@@ -1606,36 +1768,33 @@ bool EngineCore::ApplyOptimization(DWORD pid, const std::wstring& name, bool isC
     }
 
     // Create tracked process entry
-    auto tracked = std::make_unique<TrackedProcess>();
+    auto tracked = std::make_shared<TrackedProcess>();
     tracked->pid = pid;
     tracked->parentPid = parentPid;
     tracked->name = name;
     tracked->processHandle = std::move(scopedHandle);
     tracked->isChild = isChild;
-    tracked->phase = ProcessPhase::AGGRESSIVE;  // v7.0: Start in AGGRESSIVE phase
+    tracked->phase = ProcessPhase::AGGRESSIVE;
     tracked->phaseStartTime = now;
     tracked->lastCheckTime = now;
     tracked->lastPriorityCheck = now;
     tracked->violationCount = 0;
     tracked->waitHandle = nullptr;
 
-    // v5.0: Self-healing fields
     tracked->consecutiveFailures = 0;
     tracked->lastErrorCode = 0;
     tracked->nextRetryTime = 0;
 
-    // v5.0: Job Object tracking
     tracked->rootTargetPid = rootPid;
     tracked->inJobObject = inJob;
     tracked->jobAssignmentFailed = jobFailed;
 
-    // v7.0: Register wait for process exit using separate SYNCHRONIZE handle
+    // Register wait for process exit using separate SYNCHRONIZE handle
     // Main handle (0x1200) doesn't have SYNCHRONIZE, so we open another handle
-    // v7.80: Track context in waitContexts_ for safe cleanup
     HANDLE hWaitProcess = OpenProcess(SYNCHRONIZE, FALSE, pid);
     WaitCallbackContext* context = nullptr;
     if (hWaitProcess) {
-        context = new WaitCallbackContext{this, pid};
+        context = new WaitCallbackContext{this, pid, tracked};
         HANDLE waitHandle = nullptr;
 
         if (RegisterWaitForSingleObject(
@@ -1659,50 +1818,75 @@ bool EngineCore::ApplyOptimization(DWORD pid, const std::wstring& name, bool isC
     {
         CSLockGuard lock(trackedCs_);
         trackedProcesses_[pid] = std::move(tracked);
-        // v7.80: Track context for safe cleanup
         if (context) {
             waitContexts_[pid] = context;
         }
     }
 
-    // v8.0: Schedule deferred verification (replaces polling-based AGGRESSIVE phase)
+    // Schedule deferred verification
     ScheduleDeferredVerification(pid, 1);
 
     return success;
 }
 
-// v5.0: ForceOptimize and DisableThreadThrottling removed
-// Replaced by PulseEnforce and DisableThreadThrottlingOptimized
-
-// v7.80: OnProcessExit no longer deletes context - RemoveTrackedProcess handles it
 void CALLBACK EngineCore::OnProcessExit(PVOID lpParameter, BOOLEAN timerOrWaitFired) {
     (void)timerOrWaitFired;
-
-    auto context = static_cast<WaitCallbackContext*>(lpParameter);
-    if (context && context->engine) {
-        // v7.80: Just trigger removal; context cleanup is handled by RemoveTrackedProcess
-        // The context will be deleted after UnregisterWaitEx completes
-        context->engine->RemoveTrackedProcess(context->pid);
+    auto* context = static_cast<WaitCallbackContext*>(lpParameter);
+    if (!context || !context->engine) return;
+    EngineCore* engine = context->engine;
+    bool wasEmpty;
+    {
+        CSLockGuard lock(engine->pendingRemovalCs_);
+        wasEmpty = engine->pendingRemovalPids_.empty();
+        engine->pendingRemovalPids_.push(context->pid);
     }
-    // v7.80: Do NOT delete context here - it's managed by waitContexts_
+    if (wasEmpty && !engine->stopRequested_.load(std::memory_order_acquire)) {
+        HANDLE h = engine->hWakeupEvent_;
+        if (h) SetEvent(h);
+    }
 }
 
-// v7.80: Safely remove tracked process with proper wait handle cleanup
+// Safely remove tracked process with proper wait handle cleanup
 void EngineCore::RemoveTrackedProcess(DWORD pid) {
     HANDLE waitHandleToUnregister = nullptr;
     WaitCallbackContext* contextToDelete = nullptr;
+    DeferredVerifyContext* timerCtxToDelete = nullptr;
+    DeferredVerifyContext* deferredCtxToDelete = nullptr;
 
     {
         CSLockGuard lock(trackedCs_);
 
         auto it = trackedProcesses_.find(pid);
         if (it != trackedProcesses_.end()) {
+            // Cancel timers and recover contexts
+            if (it->second->deferredTimer && timerQueue_) {
+                if (!DeleteTimerQueueTimer(timerQueue_, it->second->deferredTimer, INVALID_HANDLE_VALUE)) {
+                    DWORD err = GetLastError();
+                    if (err != ERROR_IO_PENDING) {
+                        shutdownWarnings_.fetch_add(1);
+                    }
+                }
+                deferredCtxToDelete = it->second->deferredTimerContext;
+                it->second->deferredTimerContext = nullptr;
+                it->second->deferredTimer = nullptr;
+            }
+            if (it->second->persistentTimer && timerQueue_) {
+                if (!DeleteTimerQueueTimer(timerQueue_, it->second->persistentTimer, INVALID_HANDLE_VALUE)) {
+                    DWORD err = GetLastError();
+                    if (err != ERROR_IO_PENDING) {
+                        shutdownWarnings_.fetch_add(1);
+                    }
+                }
+                timerCtxToDelete = it->second->persistentTimerContext;
+                it->second->persistentTimerContext = nullptr;
+                it->second->persistentTimer = nullptr;
+            }
+
             waitHandleToUnregister = it->second->waitHandle;
             it->second->waitHandle = nullptr;
             trackedProcesses_.erase(it);
         }
 
-        // v7.80: Get context for deletion
         auto ctxIt = waitContexts_.find(pid);
         if (ctxIt != waitContexts_.end()) {
             contextToDelete = ctxIt->second;
@@ -1710,18 +1894,29 @@ void EngineCore::RemoveTrackedProcess(DWORD pid) {
         }
     }
 
-    // v7.80: Unregister outside lock with INVALID_HANDLE_VALUE to wait for callback completion
+    // Unregister outside lock with INVALID_HANDLE_VALUE to wait for callback completion
     if (waitHandleToUnregister) {
-        UnregisterWaitEx(waitHandleToUnregister, INVALID_HANDLE_VALUE);
+        if (!UnregisterWaitEx(waitHandleToUnregister, INVALID_HANDLE_VALUE)) {
+            shutdownWarnings_.fetch_add(1);
+        }
     }
 
-    // v7.80: Safe to delete context after UnregisterWaitEx completes
-    delete contextToDelete;
-}
+    // Clean up error suppression entries for this PID
+    {
+        CSLockGuard lock(trackedCs_);
+        for (auto it = errorLogSuppression_.begin(); it != errorLogSuppression_.end(); ) {
+            if (it->first.first == pid) {
+                it = errorLogSuppression_.erase(it);
+            } else {
+                ++it;
+            }
+        }
+    }
 
-// === State Checks (v5.0: Get functions removed - using Set-only Zero-Trust model) ===
-// CheckEcoQoSState, IsEcoQoSEnabled, NeedsPriorityBoost, IsInEfficiencyMode removed
-// Replaced by unconditional PulseEnforce
+    delete contextToDelete;
+    delete timerCtxToDelete;
+    delete deferredCtxToDelete;
+}
 
 bool EngineCore::IsTracked(DWORD pid) const {
     CSLockGuard lock(trackedCs_);
@@ -1732,17 +1927,6 @@ bool EngineCore::IsTargetName(const std::wstring& name) const {
     CSLockGuard lock(targetCs_);
     return targetSet_.find(ToLower(name)) != targetSet_.end();
 }
-/*
-bool EngineCore::IsTrackedParent(DWORD parentPid) const {
-    CSLockGuard lock(trackedCs_);
-    auto it = trackedProcesses_.find(parentPid);
-    if (it != trackedProcesses_.end()) {
-        // Only consider non-child processes as valid parents
-        return !it->second->isChild;
-    }
-    return false;
-}
-*/
 
 bool EngineCore::IsTrackedParent(DWORD parentPid) const {
     CSLockGuard lock(trackedCs_);
@@ -1814,23 +1998,15 @@ void EngineCore::CleanupRemovedTargets() {
         }
     }
 
-    // Remove collected processes
+    // Remove collected processes (delegates to RemoveTrackedProcess for proper cleanup)
     if (!toRemove.empty()) {
-        CSLockGuard lock(trackedCs_);
         for (DWORD pid : toRemove) {
-            auto it = trackedProcesses_.find(pid);
-            if (it != trackedProcesses_.end()) {
-                if (it->second->waitHandle) {
-                    UnregisterWait(it->second->waitHandle);
-                    it->second->waitHandle = nullptr;
-                }
-                trackedProcesses_.erase(it);
-            }
+            RemoveTrackedProcess(pid);
         }
-
-        std::wstringstream ss;
-        ss << L"Removed " << toRemove.size() << L" tracked processes (targets changed)";
-        LOG_DEBUG(ss.str());
+        wchar_t logBuf[128];
+        swprintf_s(logBuf, L"Removed %zu tracked processes (targets changed)",
+                   toRemove.size());
+        LOG_DEBUG(logBuf);
     }
 }
 
@@ -1839,9 +2015,9 @@ size_t EngineCore::GetActiveProcessCount() const {
     return trackedProcesses_.size();
 }
 
-// v7.7: Health check info
+// Health check info
 HealthInfo EngineCore::GetHealthInfo() const {
-    HealthInfo info;
+    HealthInfo info = {};  // zero-initialize all fields
     info.engineRunning = running_.load();
     info.mode = operationMode_;
     info.activeProcesses = GetActiveProcessCount();
@@ -1849,6 +2025,40 @@ HealthInfo EngineCore::GetHealthInfo() const {
     info.etwHealthy = processMonitor_.IsHealthy();
     info.etwEventCount = processMonitor_.GetEventCount();
     info.uptimeMs = (startTime_ > 0) ? (GetTickCount64() - startTime_) : 0;
+
+    // Phase breakdown
+    {
+        CSLockGuard lock(trackedCs_);
+        for (const auto& [pid, tp] : trackedProcesses_) {
+            switch (tp->phase) {
+                case ProcessPhase::AGGRESSIVE: info.aggressiveCount++; break;
+                case ProcessPhase::STABLE:     info.stableCount++; break;
+                case ProcessPhase::PERSISTENT: info.persistentCount++; break;
+            }
+        }
+    }
+
+    // Wakeup counters
+    info.wakeupConfigChange = wakeupConfigChange_.load();
+    info.wakeupSafetyNet = wakeupSafetyNet_.load();
+    info.wakeupEnforcementRequest = wakeupEnforcementRequest_.load();
+    info.wakeupProcessExit = wakeupProcessExit_.load();
+
+    // PERSISTENT enforce counters
+    info.persistentEnforceApplied = persistentEnforceApplied_.load();
+    info.persistentEnforceSkipped = persistentEnforceSkipped_.load();
+
+    // Shutdown warnings
+    info.shutdownWarnings = shutdownWarnings_.load();
+
+    // Error counters
+    info.error5Count = error5Count_.load();
+    info.error87Count = error87Count_.load();
+
+    // Config monitoring
+    info.configChangeDetected = configChangeDetected_.load();
+    info.configReloadCount = configReloadCount_.load();
+
     return info;
 }
 

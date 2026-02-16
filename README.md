@@ -1,6 +1,6 @@
 # UnLeaf
 
-**Windows 11 の「効率モード」(EcoQoS) を自動無効化するサービスユーティリティ**
+**Windows 10 / 11 の「効率モード」(EcoQoS) を自動無効化するサービスユーティリティ**
 
 Originally created by kbn.
 
@@ -8,7 +8,7 @@ Originally created by kbn.
 
 ## これは何？ 何を解決するのか
 
-Windows 11 は「EcoQoS」という省電力機能を備えており、OS がバックグラウンドと判断したプロセスの CPU 周波数とスケジューリング優先度を自動的に引き下げます。タスクマネージャーで葉っぱのアイコン (効率モード) が表示されるのがこの機能です。
+Windows 10 / 11 は「EcoQoS (Power Throttling)」という省電力機能を備えており、OS がバックグラウンドと判断したプロセスの CPU 周波数とスケジューリング優先度を自動的に引き下げます。Windows 11 ではタスクマネージャーで葉っぱのアイコン (効率モード) として視覚的に表示されます。
 
 これは省電力には有効ですが、以下のような問題が発生します:
 
@@ -50,12 +50,12 @@ UnLeaf はこの問題を自動で解決します。指定したプロセスの 
 
 | 項目 | 要件 |
 |------|------|
-| OS | Windows 11 (Build 22000 以降) |
+| OS | Windows 10 (1709 以降) / Windows 11 |
 | 権限 | 管理者権限 |
 | メモリ | 約 2MB |
 | ディスク | 約 1.2MB |
 
-> **注意**: Windows 10 では EcoQoS 機能自体が存在しないため、本ツールは不要です。
+> **補足**: Windows 11 では `NtSetInformationProcess` (NT API) を優先使用し、Windows 10 では `SetProcessInformation` (Win32 API) で同等の制御を行います。OS バージョンは起動時に自動判定されます。
 
 ---
 
@@ -160,7 +160,7 @@ UnLeaf は以下の **2箇所のみ** をレジストリに書き込みます。
 ## FAQ
 
 ### EcoQoS とは？
-Windows 11 で導入された省電力 API です。OS がプロセスの CPU 使用効率を下げることで電力消費を抑えます。タスクマネージャーの「効率モード」(葉っぱアイコン) として表示されます。
+Windows 10 (1709) で Power Throttling として導入された省電力 API です。OS がプロセスの CPU 周波数とスケジューリング優先度を引き下げることで電力消費を抑えます。Windows 11 ではタスクマネージャーに「効率モード」(葉っぱアイコン) として視覚的に表示されます。
 
 ### CPU 使用率は上がりませんか？
 **上がりません。** UnLeaf はイベント駆動で動作しており、監視対象のイベントがないときは `WaitForMultipleObjects(INFINITE)` で完全にスリープしています。アイドル時の CPU 使用率は 0% です。
@@ -173,7 +173,7 @@ Windows 11 で導入された省電力 API です。OS がプロセスの CPU �
 - **権限分離**: コマンドごとに PUBLIC / ADMIN / SYSTEM_ONLY の権限レベル
 
 ### Windows 10 で使えますか？
-Windows 10 には EcoQoS 機能自体が存在しないため、本ツールは不要です。
+**はい、動作します。** Windows 10 (1709 以降) では `SetProcessInformation` による Power Throttling 制御を使用し、Windows 11 では `NtSetInformationProcess` を優先しつつ `SetProcessInformation` にフォールバックします。OS バージョンは起動時に自動判定されるため、ユーザー側の設定は不要です。
 
 ### 設定ファイルはどこにありますか？
 `UnLeaf.ini` が `UnLeaf_Service.exe` と同じフォルダに生成されます。テキストエディタで直接編集でき、保存すると自動的にリロードされます (サービス再起動は不要)。
@@ -190,6 +190,94 @@ chrome.exe=1
 
 ### サービスが動いているか確認するには？
 `UnLeaf_Manager.exe` を起動し、ヘルスチェックボタンでサービスの状態を確認できます。コマンドラインからは `sc query UnLeafService` でも確認可能です。
+
+---
+
+## 技術アーキテクチャ
+
+### イベント駆動制御ループ (WFMO)
+
+Engine control thread は `WaitForMultipleObjects(INFINITE)` で 5 つのハンドルを監視し、イベントがないときは CPU を一切消費しません。
+
+| Index | ハンドル | トリガー | 処理 |
+|-------|---------|----------|------|
+| 0 | `stopEvent_` | サービス停止要求 | ループ脱出 |
+| 1 | `configChangeHandle_` | `FindFirstChangeNotification` (INI 変更) | デバウンス後にコンフィグリロード + ターゲット再構築 |
+| 2 | `safetyNetTimer_` | Waitable Timer (10 秒周期) | STABLE フェーズのプロセスのみ EcoQoS 再適用チェック |
+| 3 | `enforcementRequestEvent_` | ETW コールバック / タイマーからの `EnqueueRequest()` | キューを swap → `DispatchEnforcementRequest()` で逐次処理 |
+| 4 | `hWakeupEvent_` | `OnProcessExit` コールバックからの wakeup | `ProcessPendingRemovals()` で制御スレッド上から排他的に削除 |
+
+### コールバック直接削除の禁止
+
+Timer callback (`DeferredVerifyTimerCallback`, `PersistentEnforceTimerCallback`) は `EnqueueRequest()` のみを実行し、ブロッキング操作やコンテキストの自己削除を行いません。
+
+- **Deferred コンテキスト** (one-shot): 制御ループが `DispatchEnforcementRequest()` でリクエスト処理後に `delete` する
+- **Persistent コンテキスト** (recurring): `Stop()` が `DeleteTimerQueueEx(INVALID_HANDLE_VALUE)` で全コールバック完了を待機した後に `delete` する
+
+### pending removal キュー
+
+プロセス終了コールバック `OnProcessExit` は OS スレッドプール上で実行されるため、直接 `RemoveTrackedProcess()` を呼ぶことはできません。
+
+1. `OnProcessExit` → PID を `pendingRemovalPids_` に `push` + `hWakeupEvent_` をシグナル
+2. Engine control loop が `WAIT_PROCESS_EXIT` で起床
+3. `ProcessPendingRemovals()` が `CriticalSection` + `swap` パターンでキューを排他的に排出し、制御スレッド上で `RemoveTrackedProcess()` を実行
+
+### EcoQoS ポリシー: 5 層防御
+
+`PulseEnforceV6()` は以下の 5 層で EcoQoS を無効化します。
+
+| 層 | API | 説明 |
+|----|-----|------|
+| 1 | `SetPriorityClass(PROCESS_MODE_BACKGROUND_END)` | Background Mode を解除 |
+| 2 | `NtSetInformationProcess` (Win11) | 低レベル NT API で Power Throttling を OFF |
+| 3 | `SetProcessInformation` (Win10 / フォールバック) | Win32 API で Power Throttling を OFF |
+| 4 | `SetPriorityClass(HIGH_PRIORITY_CLASS)` | 優先度クラスを HIGH に設定し OS による自動 EcoQoS を防止 |
+| 5 | `DisableThreadThrottling` (INTENSIVE 時のみ) | 全スレッドの Power Throttling を個別無効化 |
+
+加えて、レジストリポリシー (`PowerThrottling` + `Image File Execution Options`) により、OS 再起動後も EcoQoS 除外が永続します。
+
+### 3 フェーズ適応制御
+
+| フェーズ | 動作 | 遷移条件 |
+|---------|------|---------|
+| **AGGRESSIVE** (0-3 秒) | 即時 enforce + 遅延検証 3 回 (200ms / 1s / 3s) | 3 回すべてクリーン → STABLE、違反 3 回以上 → PERSISTENT |
+| **STABLE** | イベント駆動のみ (CPU ゼロ) | ETW スレッドイベント or Safety Net で違反検知 → AGGRESSIVE (違反 < 3) or PERSISTENT (違反 >= 3) |
+| **PERSISTENT** | 5 秒間隔 enforce + ETW ブーストによる即時応答 | 60 秒クリーンで STABLE に復帰 |
+
+### 安全性保証
+
+- **Timer callback = enqueue only**: コールバック内でのブロッキング・`delete`・`RemoveTrackedProcess` を禁止
+- **RemoveTrackedProcess = 制御スレッド専用**: OS スレッドプールからは `pendingRemovalPids_` 経由でのみアクセス
+- **Stop() = 9 ステップバリア順序保証**: ETW 停止 → スレッド join → Timer Queue 破棄 → Wait ハンドル解除 → Job Object 解放 → レジストリクリーンアップ
+- **UAF 防止**: `shared_ptr<TrackedProcess>` による参照カウントで、コールバック実行中のプロセスコンテキスト早期破棄を防止
+
+---
+
+## スレッドモデル
+
+UnLeaf は固定数のスレッドで動作します。長時間稼働してもスレッド数は増加しません。
+
+| コンポーネント | スレッド | 説明 |
+|---------------|---------|------|
+| **Service** | EngineControlThread (1) | WaitForMultipleObjects で全イベントを処理 |
+| | ETW Consumer Thread (1) | OS のイベントトレーシングセッション |
+| | IPC Server Thread (1) | Named Pipe 接続受付 |
+| **Manager** | UI Thread (1) | Win32 メッセージループ |
+| | Log Watcher Thread (1) | ログファイル差分監視 |
+
+Timer Queue のコールバックは OS スレッドプール上で実行されますが、UnLeaf が作成するスレッドではありません。
+
+---
+
+## 24/7 常駐設計
+
+UnLeaf は 24/7/365 常駐サービスとして設計されており、以下の原則に従います:
+
+- **Idle is King**: イベントがなければ CPU を一切使用しない (`WaitForMultipleObjects(INFINITE)`)
+- **固定リソース**: スレッド数・ハンドル数・メモリ使用量は起動後一定。プロセスの追加・削除を繰り返してもリソースが増加しない
+- **RAII + 明示的解放**: 全てのタイマーコンテキスト・Wait コールバックコンテキストはライフサイクルが管理され、プロセス終了・タイマー再作成時に確実に解放される
+- **ブロッキング解除**: `UnregisterWaitEx(INVALID_HANDLE_VALUE)` と `DeleteTimerQueueTimer(INVALID_HANDLE_VALUE)` でコールバック完了を保証してからコンテキストを解放
+- **IPC タイムアウト**: クライアント接続の ReadFile は Overlapped I/O + 5秒タイムアウトで実装。フリーズしたクライアントがサーバースレッドをブロックしない
 
 ---
 

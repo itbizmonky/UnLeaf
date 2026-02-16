@@ -1,7 +1,6 @@
 #pragma once
-// UnLeaf v7.5 - IPC Server
+// UnLeaf - IPC Server
 // Named Pipe server for communication with Manager
-// v7.5: Added DACL security and client authorization
 
 #include "../common/types.h"
 #include "../common/scoped_handle.h"
@@ -68,7 +67,7 @@ private:
     // Get log entries from specified offset
     std::string GetLogsFromOffset(uint64_t clientOffset);
 
-    // v7.5: Client authorization
+    // Client authorization
     AuthResult AuthorizeClient(HANDLE pipeHandle, IPCCommand cmd);
     static CommandPermission GetCommandPermission(IPCCommand cmd);
 

@@ -1,5 +1,5 @@
 #pragma once
-// UnLeaf v7.5 - IPC Security Helpers
+// UnLeaf - IPC Security Helpers
 // Named Pipe DACL and Client Authorization
 
 #include <Windows.h>
@@ -8,14 +8,12 @@
 
 namespace unleaf {
 
-// v7.5: Command permission levels
 enum class CommandPermission {
     PUBLIC,        // Any connected client (GET_STATUS, GET_LOGS, GET_STATS, GET_CONFIG)
     ADMIN,         // Administrator required (ADD_TARGET, REMOVE_TARGET, SET_INTERVAL)
     SYSTEM_ONLY    // SYSTEM or elevated admin (STOP_SERVICE)
 };
 
-// v7.5: Authorization result
 enum class AuthResult {
     AUTHORIZED,
     UNAUTHORIZED,
@@ -23,7 +21,7 @@ enum class AuthResult {
     ERROR_TOKEN
 };
 
-// v7.5: Security descriptor builder for Named Pipe
+// Security descriptor builder for Named Pipe
 // Restricts access to SYSTEM + Administrators only
 class PipeSecurityDescriptor {
 public:
@@ -149,7 +147,7 @@ private:
     bool initialized_;
 };
 
-// v7.5: Token verification helpers
+// Token verification helpers
 
 // Check if token belongs to Administrators group
 inline bool IsTokenAdmin(HANDLE hToken) {

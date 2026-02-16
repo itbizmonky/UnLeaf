@@ -1,6 +1,4 @@
-// UnLeaf v8.0 - ETW Process Monitor Implementation
-// v7.4: Added health check, session recovery, event statistics
-// v8.0: Added thread start event monitoring for event-driven enforcement
+// UnLeaf - ETW Process Monitor Implementation
 
 #include "process_monitor.h"
 #include "../common/logger.h"
@@ -24,7 +22,7 @@ static const GUID KernelProcessProviderGuid = {
 // Event IDs
 static constexpr USHORT EVENT_ID_PROCESS_START = 1;
 static constexpr USHORT EVENT_ID_PROCESS_STOP = 2;
-static constexpr USHORT EVENT_ID_THREAD_START = 3;  // v8.0: Thread creation event
+static constexpr USHORT EVENT_ID_THREAD_START = 3;
 
 ProcessMonitor::ProcessMonitor()
     : sessionHandle_(0)
@@ -51,7 +49,7 @@ bool ProcessMonitor::Start(ProcessStartCallback processCallback, ThreadStartCall
     }
 
     processCallback_ = processCallback;
-    threadCallback_ = threadCallback;  // v8.0: Optional thread callback
+    threadCallback_ = threadCallback;
     instance_ = this;
     stopRequested_ = false;
 
@@ -79,7 +77,7 @@ bool ProcessMonitor::Start(ProcessStartCallback processCallback, ThreadStartCall
     }
 
     // Enable the Kernel-Process provider
-    // v8.0: Keywords 0x30 = WINEVENT_KEYWORD_PROCESS (0x10) | WINEVENT_KEYWORD_THREAD (0x20)
+    // Keywords 0x30 = WINEVENT_KEYWORD_PROCESS (0x10) | WINEVENT_KEYWORD_THREAD (0x20)
     // Thread events allow event-driven detection of EcoQoS re-enablement triggers
     status = EnableTraceEx2(
         sessionHandle_,
@@ -160,24 +158,22 @@ void ProcessMonitor::ConsumerThread() {
         std::wstringstream ss;
         ss << L"[ETW] OpenTrace failed (error=" << error << L")";
         LOG_DEBUG(ss.str());
-        sessionHealthy_ = false;  // v7.4: Mark session unhealthy
+        sessionHealthy_ = false;
         running_ = false;
         return;
     }
 
-    // v7.4: Mark session healthy and record start time
     sessionHealthy_ = true;
     lastEventTime_ = GetTickCount64();
 
     // Process events (blocks until trace is closed)
     ULONG status = ProcessTrace(&traceHandle_, 1, nullptr, nullptr);
 
-    // v7.4: Check exit status
     if (status != ERROR_SUCCESS && status != ERROR_CANCELLED && !stopRequested_.load()) {
         std::wstringstream ss;
         ss << L"[ETW] ProcessTrace ended unexpectedly (status=" << status << L")";
         LOG_DEBUG(ss.str());
-        sessionHealthy_ = false;  // v7.4: Mark session unhealthy
+        sessionHealthy_ = false;
     }
 
     running_ = false;
@@ -188,7 +184,6 @@ void WINAPI ProcessMonitor::EventRecordCallback(PEVENT_RECORD pEvent) {
         return;
     }
 
-    // v7.4: Update event timestamp and counter for health monitoring
     instance_->lastEventTime_ = GetTickCount64();
     instance_->eventCount_.fetch_add(1, std::memory_order_relaxed);
 
@@ -213,7 +208,7 @@ void WINAPI ProcessMonitor::EventRecordCallback(PEVENT_RECORD pEvent) {
         return;
     }
 
-    // v8.0: Handle thread start event
+    // Handle thread start event
     // Thread creation is a trigger point where OS may re-apply EcoQoS
     if (eventId == EVENT_ID_THREAD_START) {
         if (instance_->threadCallback_) {
@@ -314,7 +309,6 @@ bool ProcessMonitor::ParseProcessStartEvent(PEVENT_RECORD pEvent,
     return pid != 0;
 }
 
-// v7.4: Health check implementation
 bool ProcessMonitor::IsHealthy() const {
     // Not running = not healthy
     if (!running_.load()) {

@@ -1,6 +1,4 @@
-// UnLeaf v7.90 - Lightweight Logger Implementation
-// v7.6: Added multi-level logging (ERROR/ALERT/INFO/DEBUG)
-// v7.90: Changed log format to 4-char fixed width (ERR /ALRT/INFO/DEBG)
+// UnLeaf - Lightweight Logger Implementation
 
 #include "logger.h"
 #include <cstdio>
@@ -17,8 +15,8 @@ LightweightLogger::LightweightLogger()
     : fileHandle_(INVALID_HANDLE_VALUE)
     , initialized_(false)
     , consoleOutput_(false)
-    , currentLevel_(LogLevel::LOG_INFO)  // v7.6: Default to INFO
-    , enabled_(true)                     // v7.93: Default to enabled
+    , currentLevel_(LogLevel::LOG_INFO)
+    , enabled_(true)
     , consoleHandle_(nullptr) {
 }
 
@@ -91,16 +89,13 @@ void LightweightLogger::SetConsoleOutput(bool enabled) {
     }
 }
 
-// v7.6: Set minimum log level
 void LightweightLogger::SetLogLevel(LogLevel level) {
     CSLockGuard lock(cs_);
     currentLevel_ = level;
 }
 
-// v7.6: Internal log method with level check
 void LightweightLogger::Log(LogLevel level, const wchar_t* levelStr, const std::wstring& message) {
     if (!initialized_) return;
-    // v7.93: Check if logging is enabled
     if (!enabled_.load(std::memory_order_acquire)) return;
     if (static_cast<uint8_t>(level) > static_cast<uint8_t>(currentLevel_)) return;
 
@@ -110,8 +105,6 @@ void LightweightLogger::Log(LogLevel level, const wchar_t* levelStr, const std::
     WriteMessage(formatted);
 }
 
-// v7.6: Error level (always output)
-// v7.90: Format changed to 4-char fixed width
 void LightweightLogger::Error(const std::wstring& message) {
     Log(LogLevel::LOG_ERROR, L"ERR ", message);
 }
@@ -120,8 +113,6 @@ void LightweightLogger::Error(const std::string& message) {
     Error(Utf8ToWide(message));
 }
 
-// v7.6: Alert level (warnings)
-// v7.90: Format changed to 4-char fixed width
 void LightweightLogger::Alert(const std::wstring& message) {
     Log(LogLevel::LOG_ALERT, L"ALRT", message);
 }
@@ -130,8 +121,6 @@ void LightweightLogger::Alert(const std::string& message) {
     Alert(Utf8ToWide(message));
 }
 
-// Info level (normal operation)
-// v7.90: Format changed to 4-char fixed width
 void LightweightLogger::Info(const std::wstring& message) {
     Log(LogLevel::LOG_INFO, L"INFO", message);
 }
@@ -140,8 +129,6 @@ void LightweightLogger::Info(const std::string& message) {
     Info(Utf8ToWide(message));
 }
 
-// v7.6: Debug level (development details)
-// v7.90: Format changed to 4-char fixed width
 void LightweightLogger::Debug(const std::wstring& message) {
     Log(LogLevel::LOG_DEBUG, L"DEBG", message);
 }
@@ -256,7 +243,6 @@ std::string LightweightLogger::WideToUtf8(const std::wstring& str) const {
     return result;
 }
 
-// v7.93: Enable/disable log output
 void LightweightLogger::SetEnabled(bool enabled) {
     enabled_.store(enabled, std::memory_order_release);
 }
