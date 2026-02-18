@@ -71,8 +71,8 @@ UnLeaf_v1.00/
 ├── UnLeaf_Service.exe      サービス本体
 ├── UnLeaf_Manager.exe      GUI 管理ツール
 ├── UnLeaf.ini              設定ファイル
-├── UnLeaf.log              ログファイル
-└── UnLeaf.log1             ログファイル(世代管理)
+├── README.md               READMEファイル
+└── LICENSE                 ライセンスファイル
 ```
 
 ---
