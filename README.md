@@ -186,7 +186,7 @@ chrome.exe=1
 ```
 
 ### サービスが動いているか確認するには？
-`UnLeaf_Manager.exe` を起動し、ヘルスチェックボタンでサービスの状態を確認できます。コマンドラインからは `sc query UnLeafService` でも確認可能です。
+`UnLeaf_Manager.exe` を起動し、UIからサービスの状態を確認できます。コマンドラインからは `sc query UnLeafService` でも確認可能です。
 
 ---
 
