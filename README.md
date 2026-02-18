@@ -63,19 +63,16 @@ UnLeaf はこの問題を自動で解決します。指定したプロセスの 
 
 1. GitHub Releases から最新の ZIP をダウンロード
 2. 任意のフォルダに展開
-3. `install_service.bat` を**右クリック → 管理者として実行**
-4. `UnLeaf_Manager.exe` を起動してターゲットプロセスを設定
+4. `UnLeaf_Manager.exe` を管理者として起動後、ターゲットプロセスを設定し「サービス登録・実行」ボタンをクリック
+5. 機能はサービスとして駐留するため、「サービス登録・実行」後は`UnLeaf_Manager.exe` を閉じてOK
 
 ```
 UnLeaf_v1.00/
 ├── UnLeaf_Service.exe      サービス本体
 ├── UnLeaf_Manager.exe      GUI 管理ツール
 ├── UnLeaf.ini              設定ファイル
-├── install_service.bat     サービス登録
-├── uninstall_service.bat   サービス削除
-├── README.md
-├── RELEASE_NOTES.md
-└── LICENSE
+├── UnLeaf.log              ログファイル
+└── UnLeaf.log1             ログファイル(世代管理)
 ```
 
 ---
