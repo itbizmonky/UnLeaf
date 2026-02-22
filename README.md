@@ -79,30 +79,6 @@ UnLeaf_v1.00/
 
 ---
 
-## ビルド方法 (ソースから)
-
-### 要件
-
-- Visual Studio 2022 以降 (C++ Desktop Development ワークロード)
-- CMake 3.20 以降
-- Windows SDK 10.0.19041.0 以降
-
-### 手順
-
-```powershell
-git clone https://github.com/<your-repo>/UnLeaf.git
-cd UnLeaf
-
-mkdir build
-cd build
-cmake .. -G "Visual Studio 17 2022" -A x64
-cmake --build . --config Release
-```
-
-ビルド成果物は `build/Release/` に出力されます。
-
----
-
 ## アンインストール
 
 ### 推奨: Manager UI からのアンインストール (完全)
@@ -114,11 +90,6 @@ cmake --build . --config Release
 > Manager UI からの登録解除は、レジストリの完全なクリーンアップを保証します。
 > `RemoveAllPolicies` は冪等 (idempotent) に設計されており、マニフェスト不存在・レジストリキー不存在・
 > 内部状態が空の場合でもすべて正常系として安全に完了します。
-
-### バッチファイルによるアンインストール
-
-`uninstall_service.bat` はサービスの登録解除のみを行います。
-**レジストリのクリーンアップは行われません。**
 
 完全なクリーンアップが必要な場合は、Manager UI からのアンインストールを使用してください。
 
@@ -283,3 +254,4 @@ UnLeaf は 24/7/365 常駐サービスとして設計されており、以下の
 ## ライセンス
 
 [MIT License](LICENSE)
+
