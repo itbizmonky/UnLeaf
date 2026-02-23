@@ -1,6 +1,0 @@
-# UnLeaf code signing local configuration (PowerShell)
-# Copy this file to sign_config.local.ps1 and edit the values.
-# This file is gitignored and should NOT be committed.
-
-$PfxPath = "D:\path\to\certs\UnLeaf_Dev.pfx"
-$PfxPassword = "your-password-here"
