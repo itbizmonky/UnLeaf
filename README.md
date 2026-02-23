@@ -63,44 +63,19 @@ UnLeaf はこの問題を自動で解決します。指定したプロセスの 
 
 1. GitHub Releases から最新の ZIP をダウンロード
 2. 任意のフォルダに展開
-3. `install_service.bat` を**右クリック → 管理者として実行**
-4. `UnLeaf_Manager.exe` を起動してターゲットプロセスを設定
+3. `UnLeaf_Manager.exe` を管理者として起動後、ターゲットプロセスを設定し「サービス登録・実行」ボタンをクリック
+4. 機能はサービスとして駐留するため、「サービス登録・実行」後は`UnLeaf_Manager.exe` を閉じてOK
 
 ```
 UnLeaf_v1.00/
 ├── UnLeaf_Service.exe      サービス本体
 ├── UnLeaf_Manager.exe      GUI 管理ツール
 ├── UnLeaf.ini              設定ファイル
-├── install_service.bat     サービス登録
-├── uninstall_service.bat   サービス削除
-├── README.md
-├── RELEASE_NOTES.md
-└── LICENSE
+├── README.md               READMEファイル
+└── LICENSE                 ライセンスファイル
 ```
 
----
-
-## ビルド方法 (ソースから)
-
-### 要件
-
-- Visual Studio 2022 以降 (C++ Desktop Development ワークロード)
-- CMake 3.20 以降
-- Windows SDK 10.0.19041.0 以降
-
-### 手順
-
-```powershell
-git clone https://github.com/<your-repo>/UnLeaf.git
-cd UnLeaf
-
-mkdir build
-cd build
-cmake .. -G "Visual Studio 17 2022" -A x64
-cmake --build . --config Release
-```
-
-ビルド成果物は `build/Release/` に出力されます。
+> **補足**: ⚠️ インストール時のセキュリティ警告について<br>本ソフトウェアは個人開発のフリーソフトであり、高価なコードサイニング証明書（デジタル署名）を取得していません。そのため、ダウンロード時や初回実行時に Windows Defender の SmartScreen 画面（「Windows によって PC が保護されました」という青い画面）が表示されることがあります。<br>これは未知のファイルに対する標準的な警告です。本ソフトの安全性は公開されているソースコードによって担保されています。警告が出た場合は、「詳細情報」をクリックし、「実行」ボタンを押してインストールを続行してください。
 
 ---
 
@@ -115,13 +90,6 @@ cmake --build . --config Release
 > Manager UI からの登録解除は、レジストリの完全なクリーンアップを保証します。
 > `RemoveAllPolicies` は冪等 (idempotent) に設計されており、マニフェスト不存在・レジストリキー不存在・
 > 内部状態が空の場合でもすべて正常系として安全に完了します。
-
-### バッチファイルによるアンインストール
-
-`uninstall_service.bat` はサービスの登録解除のみを行います。
-**レジストリのクリーンアップは行われません。**
-
-完全なクリーンアップが必要な場合は、Manager UI からのアンインストールを使用してください。
 
 ---
 
@@ -189,7 +157,7 @@ chrome.exe=1
 ```
 
 ### サービスが動いているか確認するには？
-`UnLeaf_Manager.exe` を起動し、ヘルスチェックボタンでサービスの状態を確認できます。コマンドラインからは `sc query UnLeafService` でも確認可能です。
+`UnLeaf_Manager.exe` を起動し、UIからサービスの状態を確認できます。コマンドラインからは `sc query UnLeafService` でも確認可能です。
 
 ---
 

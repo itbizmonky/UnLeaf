@@ -3,6 +3,7 @@
 #include "engine_core.h"
 #include <algorithm>
 #include <functional>
+#include <chrono>
 #include <cstdio>
 
 namespace unleaf {
@@ -34,6 +35,7 @@ EngineCore::EngineCore()
     , totalHandleReopen_(0)
     , lastJobQueryTime_(0)
     , lastSafetyNetTime_(0)
+    , lastProcessLivenessCheck_(0)
     , ntdllHandle_(nullptr)
     , pfnNtSetInformationProcess_(nullptr)
     , pfnNtQueryInformationProcess_(nullptr)
@@ -192,6 +194,7 @@ void EngineCore::Start() {
     lastEtwHealthCheck_ = now;
     lastJobQueryTime_ = now;
     lastSafetyNetTime_ = now;
+    lastProcessLivenessCheck_ = now;
     lastDegradedScanTime_ = now;
     startTime_ = now;
     ResetEvent(stopEvent_);
@@ -542,10 +545,25 @@ void EngineCore::ProcessEnforcementQueue() {
         std::swap(pending, enforcementQueue_);
     }
 
+    // Deduplicate: merge same-PID ETW_THREAD_START requests to prevent
+    // O(N^2) CreateToolhelp32Snapshot storms during thread burst
+    std::vector<EnforcementRequest> deduped;
+    std::set<DWORD> seenEtwPids;
     while (!pending.empty()) {
-        if (stopRequested_.load()) break;
         EnforcementRequest req = pending.front();
         pending.pop();
+        if (req.type == EnforcementRequestType::ETW_THREAD_START) {
+            if (seenEtwPids.count(req.pid)) {
+                etwThreadDeduped_.fetch_add(1, std::memory_order_relaxed);
+                continue;
+            }
+            seenEtwPids.insert(req.pid);
+        }
+        deduped.push_back(req);
+    }
+
+    for (const auto& req : deduped) {
+        if (stopRequested_.load()) break;
         DispatchEnforcementRequest(req);
     }
 }
@@ -565,10 +583,15 @@ void EngineCore::DispatchEnforcementRequest(const EnforcementRequest& req) {
         case EnforcementRequestType::ETW_THREAD_START:
             // Thread created in tracked process - check for EcoQoS violation
             if (tp.phase == ProcessPhase::STABLE) {
-                bool ecoQoSOn = IsEcoQoSEnabled(tp.processHandle.get());
+                // Rate limit to prevent CPU burst during thread storms
+                if (now - tp.lastEtwEnforceTime < ETW_STABLE_RATE_LIMIT) {
+                    break;
+                }
+                bool ecoQoSOn = IsEcoQoSEnabledCached(tp, now);
                 if (ecoQoSOn) {
                     // Violation detected via event
                     PulseEnforceV6(tp.processHandle.get(), req.pid, true);
+                    tp.ecoQosCached = false;  // Invalidate cache after enforcement
                     tp.violationCount++;
                     totalViolations_.fetch_add(1);
                     tp.lastViolationTime = now;
@@ -591,11 +614,12 @@ void EngineCore::DispatchEnforcementRequest(const EnforcementRequest& req) {
                     }
                 }
                 tp.lastCheckTime = now;
+                tp.lastEtwEnforceTime = now;
             } else if (tp.phase == ProcessPhase::PERSISTENT) {
                 // ETW boost: rate-limited instant response for PERSISTENT phase
                 // Provides immediate EcoQoS correction on tab switch without waiting for 5s timer
                 if (now - tp.lastEtwEnforceTime >= ETW_BOOST_RATE_LIMIT) {
-                    bool ecoQoSOn = IsEcoQoSEnabled(tp.processHandle.get());
+                    bool ecoQoSOn = IsEcoQoSEnabledCached(tp, now);
                     {
                         wchar_t logBuf[256];
                         swprintf_s(logBuf, L"[ETW_BOOST] %s (PID:%lu) EcoQoS=%s",
@@ -604,6 +628,7 @@ void EngineCore::DispatchEnforcementRequest(const EnforcementRequest& req) {
                     }
                     if (ecoQoSOn) {
                         PulseEnforceV6(tp.processHandle.get(), req.pid, true);
+                        tp.ecoQosCached = false;  // Invalidate cache after enforcement
                         tp.lastViolationTime = now;
                     }
                     tp.lastEtwEnforceTime = now;
@@ -978,6 +1003,51 @@ void EngineCore::PerformPeriodicMaintenance(ULONGLONG now) {
         }
     }
 
+    // Process liveness check (every 60s) - detect zombie TrackedProcess entries
+    // When OpenProcess(SYNCHRONIZE) fails in ApplyOptimization, no exit callback is registered.
+    // These entries become zombies when the process exits. This scan detects and removes them.
+    if (now - lastProcessLivenessCheck_ >= LIVENESS_CHECK_INTERVAL) {
+        std::vector<DWORD> zombiePids;
+        {
+            CSLockGuard lock(trackedCs_);
+            for (const auto& [pid, tp] : trackedProcesses_) {
+                // Only check entries without a wait handle (no exit notification registered)
+                if (tp->waitHandle != nullptr) continue;
+
+                // Check if process is still alive
+                HANDLE hProbe = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid);
+                if (hProbe) {
+                    DWORD exitCode = 0;
+                    bool exited = GetExitCodeProcess(hProbe, &exitCode) && exitCode != STILL_ACTIVE;
+                    CloseHandle(hProbe);
+                    if (exited) {
+                        zombiePids.push_back(pid);
+                    }
+                } else {
+                    // Cannot open process - it has exited
+                    zombiePids.push_back(pid);
+                }
+            }
+        }
+
+        if (!zombiePids.empty()) {
+            // Use pendingRemovalPids_ to safely remove via the normal path
+            {
+                CSLockGuard lock(pendingRemovalCs_);
+                for (DWORD pid : zombiePids) {
+                    pendingRemovalPids_.push(pid);
+                }
+            }
+            SetEvent(hWakeupEvent_);
+
+            wchar_t logBuf[128];
+            swprintf_s(logBuf, L"[LIVENESS] Detected %zu zombie entries - queued for removal",
+                       zombiePids.size());
+            LOG_DEBUG(logBuf);
+        }
+        lastProcessLivenessCheck_ = now;
+    }
+
     // Stats logging (every 60s)
     if (now - lastStatsLogTime_ >= STATS_LOG_INTERVAL) {
         size_t count = GetActiveProcessCount();
@@ -998,15 +1068,25 @@ void EngineCore::PerformPeriodicMaintenance(ULONGLONG now) {
             jobCount = jobObjects_.size();
         }
         if (count > 0 && (aggressiveCount > 0 || persistentCount > 0)) {
+            uint32_t enfTotal = enforceCount_.load(std::memory_order_relaxed);
+            uint32_t enfOk = enforceSuccessCount_.load(std::memory_order_relaxed);
+            uint32_t enfFail = enforceFailCount_.load(std::memory_order_relaxed);
+            uint32_t enfMaxUs = enforceLatencyMaxUs_.load(std::memory_order_relaxed);
+            uint32_t enfAvgUs = (enfTotal > 0)
+                ? static_cast<uint32_t>(enforceLatencySumUs_.load(std::memory_order_relaxed) / enfTotal)
+                : 0;
+
             wchar_t statsBuf[512];
             swprintf_s(statsBuf,
                 L"Stats: %zu tracked (A:%zu S:%zu P:%zu), %zu jobs, viol=%u, "
-                L"wakeup(cfg:%u sn:%u enf:%u exit:%u), persist(apply:%u skip:%u)",
+                L"wakeup(cfg:%u sn:%u enf:%u exit:%u), persist(apply:%u skip:%u), "
+                L"enforce(total:%u ok:%u fail:%u avg:%uus max:%uus)",
                 count, aggressiveCount, stableCount, persistentCount,
                 jobCount, totalViolations_.load(),
                 wakeupConfigChange_.load(), wakeupSafetyNet_.load(),
                 wakeupEnforcementRequest_.load(), wakeupProcessExit_.load(),
-                persistentEnforceApplied_.load(), persistentEnforceSkipped_.load());
+                persistentEnforceApplied_.load(), persistentEnforceSkipped_.load(),
+                enfTotal, enfOk, enfFail, enfAvgUs, enfMaxUs);
             LOG_DEBUG(statsBuf);
 
             if (persistentCount > 0) {
@@ -1041,6 +1121,11 @@ bool EngineCore::PulseEnforceV6(HANDLE hProcess, DWORD pid, bool isIntensive) {
     // Layer 3: SetProcessInformation (fallback / Win10 primary)
     // Layer 4: Priority class enforcement
     // Layer 5: Thread-level throttling (INTENSIVE mode only)
+
+    // Enforcement telemetry: start timing
+    LARGE_INTEGER qpcStart, qpcEnd, qpcFreq;
+    QueryPerformanceCounter(&qpcStart);
+    QueryPerformanceFrequency(&qpcFreq);
 
     // Step 1: Exit background mode (unconditional)
     SetPriorityClass(hProcess, PROCESS_MODE_BACKGROUND_END);
@@ -1103,7 +1188,37 @@ bool EngineCore::PulseEnforceV6(HANDLE hProcess, DWORD pid, bool isIntensive) {
     // Error handling
     if (!ecoQoSSuccess) {
         HandleEnforceError(hProcess, pid, GetLastError());
+
+        // Enforcement telemetry: record latency and failure
+        QueryPerformanceCounter(&qpcEnd);
+        uint64_t elapsedUs = ((qpcEnd.QuadPart - qpcStart.QuadPart) * 1000000ULL) / qpcFreq.QuadPart;
+        enforceLatencySumUs_.fetch_add(elapsedUs, std::memory_order_relaxed);
+        enforceCount_.fetch_add(1, std::memory_order_relaxed);
+        uint32_t elapsed32 = static_cast<uint32_t>((std::min)(elapsedUs, static_cast<uint64_t>(UINT32_MAX)));
+        uint32_t prevMax = enforceLatencyMaxUs_.load(std::memory_order_relaxed);
+        while (elapsed32 > prevMax &&
+               !enforceLatencyMaxUs_.compare_exchange_weak(prevMax, elapsed32, std::memory_order_relaxed)) {}
+        enforceFailCount_.fetch_add(1, std::memory_order_relaxed);
+
         return false;
+    }
+
+    // Enforcement telemetry: record latency and success
+    QueryPerformanceCounter(&qpcEnd);
+    uint64_t elapsedUs = ((qpcEnd.QuadPart - qpcStart.QuadPart) * 1000000ULL) / qpcFreq.QuadPart;
+    enforceLatencySumUs_.fetch_add(elapsedUs, std::memory_order_relaxed);
+    enforceCount_.fetch_add(1, std::memory_order_relaxed);
+    uint32_t elapsed32 = static_cast<uint32_t>((std::min)(elapsedUs, static_cast<uint64_t>(UINT32_MAX)));
+    uint32_t prevMax = enforceLatencyMaxUs_.load(std::memory_order_relaxed);
+    while (elapsed32 > prevMax &&
+           !enforceLatencyMaxUs_.compare_exchange_weak(prevMax, elapsed32, std::memory_order_relaxed)) {}
+    enforceSuccessCount_.fetch_add(1, std::memory_order_relaxed);
+
+    // Record last enforcement timestamp (Unix Epoch milliseconds)
+    {
+        auto now = std::chrono::system_clock::now();
+        auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(now.time_since_epoch()).count();
+        lastEnforceTimeMs_.store(static_cast<uint64_t>(ms), std::memory_order_relaxed);
     }
 
     return true;
@@ -1142,6 +1257,18 @@ bool EngineCore::IsEcoQoSEnabled(HANDLE hProcess) const {
     }
 
     return false;  // Unable to determine, assume not enabled
+}
+
+// Cached version: avoids repeated NtQueryInformationProcess during thread burst
+bool EngineCore::IsEcoQoSEnabledCached(TrackedProcess& tp, ULONGLONG now) {
+    if (tp.ecoQosCached && (now - tp.ecoQosCacheTime < ECOQOS_CACHE_DURATION)) {
+        return tp.ecoQosCachedValue;
+    }
+    bool result = IsEcoQoSEnabled(tp.processHandle.get());
+    tp.ecoQosCached = true;
+    tp.ecoQosCachedValue = result;
+    tp.ecoQosCacheTime = now;
+    return result;
 }
 
 // === Registry Policy Application ===
@@ -2026,7 +2153,7 @@ HealthInfo EngineCore::GetHealthInfo() const {
     info.etwEventCount = processMonitor_.GetEventCount();
     info.uptimeMs = (startTime_ > 0) ? (GetTickCount64() - startTime_) : 0;
 
-    // Phase breakdown
+    // Phase breakdown + active process details
     {
         CSLockGuard lock(trackedCs_);
         for (const auto& [pid, tp] : trackedProcesses_) {
@@ -2035,6 +2162,18 @@ HealthInfo EngineCore::GetHealthInfo() const {
                 case ProcessPhase::STABLE:     info.stableCount++; break;
                 case ProcessPhase::PERSISTENT: info.persistentCount++; break;
             }
+
+            ActiveProcessDetail detail;
+            detail.pid = tp->pid;
+            detail.name = tp->name;
+            switch (tp->phase) {
+                case ProcessPhase::AGGRESSIVE: detail.phase = "AGGRESSIVE"; break;
+                case ProcessPhase::STABLE:     detail.phase = "STABLE"; break;
+                case ProcessPhase::PERSISTENT: detail.phase = "PERSISTENT"; break;
+            }
+            detail.violations = tp->violationCount;
+            detail.isChild = tp->isChild;
+            info.activeProcessDetails.push_back(std::move(detail));
         }
     }
 
@@ -2048,6 +2187,18 @@ HealthInfo EngineCore::GetHealthInfo() const {
     info.persistentEnforceApplied = persistentEnforceApplied_.load();
     info.persistentEnforceSkipped = persistentEnforceSkipped_.load();
 
+    // Enforcement telemetry
+    {
+        uint32_t count = enforceCount_.load(std::memory_order_relaxed);
+        info.totalEnforcements = count;
+        info.enforceSuccessCount = enforceSuccessCount_.load(std::memory_order_relaxed);
+        info.enforceFailCount = enforceFailCount_.load(std::memory_order_relaxed);
+        info.enforceLatencyMaxUs = enforceLatencyMaxUs_.load(std::memory_order_relaxed);
+        info.enforceLatencyAvgUs = (count > 0)
+            ? static_cast<uint32_t>(enforceLatencySumUs_.load(std::memory_order_relaxed) / count)
+            : 0;
+    }
+
     // Shutdown warnings
     info.shutdownWarnings = shutdownWarnings_.load();
 
@@ -2058,6 +2209,12 @@ HealthInfo EngineCore::GetHealthInfo() const {
     // Config monitoring
     info.configChangeDetected = configChangeDetected_.load();
     info.configReloadCount = configReloadCount_.load();
+
+    // Queue optimization
+    info.etwThreadDeduped = etwThreadDeduped_.load(std::memory_order_relaxed);
+
+    // Last enforcement timestamp
+    info.lastEnforceTimeMs = lastEnforceTimeMs_.load(std::memory_order_relaxed);
 
     return info;
 }

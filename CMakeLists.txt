@@ -47,6 +47,17 @@ if(MSVC)
     set(CMAKE_MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
 endif()
 
+# === External Dependencies ===
+include(FetchContent)
+FetchContent_Declare(
+    nlohmann_json
+    GIT_REPOSITORY https://github.com/nlohmann/json.git
+    GIT_TAG        v3.11.3
+)
+set(JSON_BuildTests OFF CACHE BOOL "" FORCE)
+set(JSON_Install OFF CACHE BOOL "" FORCE)
+FetchContent_MakeAvailable(nlohmann_json)
+
 # Common source files
 set(COMMON_SOURCES
     src/common/logger.cpp
@@ -104,6 +115,7 @@ target_link_libraries(UnLeaf_Service PRIVATE
     kernel32   # Core Windows API
     user32     # User interface
     tdh        # Trace Data Helper (ETW event parsing)
+    nlohmann_json::nlohmann_json
 )
 
 # Service is a console application (required for service dispatch)
@@ -114,7 +126,11 @@ set_target_properties(UnLeaf_Service PROPERTIES
 
 # ============================================================
 # UnLeaf Manager (UI) - Win32 GUI Application
+# Only built when src/manager directory exists (excluded in OSS builds)
 # ============================================================
+if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/src/manager")
+message(STATUS "Manager source found - building UnLeaf_Manager")
+
 set(MANAGER_SOURCES
     src/manager/main.cpp
     src/manager/main_window.cpp
@@ -158,6 +174,7 @@ target_link_libraries(UnLeaf_Manager PRIVATE
     comctl32   # Common controls
     ole32      # COM
     shcore     # DPI awareness
+    nlohmann_json::nlohmann_json
 )
 
 set_target_properties(UnLeaf_Manager PROPERTIES
@@ -170,12 +187,17 @@ if(MSVC)
     set_property(TARGET UnLeaf_Manager APPEND_STRING PROPERTY LINK_FLAGS " /MANIFEST:NO")
 endif()
 
+else()
+    message(STATUS "Manager source not found - skipping UnLeaf_Manager (OSS build)")
+endif()
+
 # ============================================================
 # Installation
 # ============================================================
-install(TARGETS UnLeaf_Service UnLeaf_Manager
-    RUNTIME DESTINATION bin
-)
+install(TARGETS UnLeaf_Service RUNTIME DESTINATION bin)
+if(TARGET UnLeaf_Manager)
+    install(TARGETS UnLeaf_Manager RUNTIME DESTINATION bin)
+endif()
 
 # ============================================================
 # Unit Tests (GoogleTest)
@@ -183,7 +205,6 @@ install(TARGETS UnLeaf_Service UnLeaf_Manager
 option(UNLEAF_BUILD_TESTS "Build unit tests" ON)
 
 if(UNLEAF_BUILD_TESTS)
-    include(FetchContent)
     FetchContent_Declare(
         googletest
         GIT_REPOSITORY https://github.com/google/googletest.git

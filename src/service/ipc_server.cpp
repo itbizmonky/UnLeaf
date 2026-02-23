@@ -5,6 +5,7 @@
 #include "../common/logger.h"
 #include <algorithm>
 #include <sstream>
+#include <nlohmann/json.hpp>
 
 namespace unleaf {
 
@@ -318,7 +319,14 @@ static std::wstring Utf8ToWide(const std::string& utf8) {
     return wide;
 }
 
-
+static std::string WideToUtf8(const std::wstring& wide) {
+    if (wide.empty()) return "";
+    int len = WideCharToMultiByte(CP_UTF8, 0, wide.c_str(), -1, nullptr, 0, nullptr, nullptr);
+    if (len <= 0) return "";
+    std::string utf8(len - 1, '\0');
+    WideCharToMultiByte(CP_UTF8, 0, wide.c_str(), -1, &utf8[0], len, nullptr, nullptr);
+    return utf8;
+}
 
 static const char* GetModeString(OperationMode mode) {
     switch (mode) {
@@ -386,7 +394,7 @@ std::string IPCServer::ProcessCommand(IPCCommand cmd, const std::string& data) {
     switch (cmd) {
         case IPCCommand::CMD_GET_STATUS: {
             std::ostringstream oss;
-            oss << "{\"running\": true, \"version\": \"2.00\"}";
+            oss << "{\"running\": true, \"version\": \"1.00\"}";
             return oss.str();
         }
         case IPCCommand::CMD_STOP_SERVICE: {
@@ -408,7 +416,7 @@ std::string IPCServer::ProcessCommand(IPCCommand cmd, const std::string& data) {
             return std::string(reinterpret_cast<const char*>(&count), sizeof(uint32_t));
         }
         case IPCCommand::CMD_HEALTH_CHECK: {
-            // Health check API
+            // Health check API (nlohmann/json)
             auto health = EngineCore::Instance().GetHealthInfo();
 
             // Determine overall status
@@ -419,48 +427,77 @@ std::string IPCServer::ProcessCommand(IPCCommand cmd, const std::string& data) {
                 status = "degraded";
             }
 
-            // Build JSON response
-            std::ostringstream oss;
-            oss << "{";
-            oss << "\"status\":\"" << status << "\",";
-            oss << "\"uptime_seconds\":" << (health.uptimeMs / 1000) << ",";
-            oss << "\"engine\":{";
-            oss << "\"running\":" << (health.engineRunning ? "true" : "false") << ",";
-            oss << "\"mode\":\"" << GetModeString(health.mode) << "\",";
-            oss << "\"active_processes\":" << health.activeProcesses << ",";
-            oss << "\"total_violations\":" << health.totalViolations << ",";
-            oss << "\"phases\":{";
-            oss << "\"aggressive\":" << health.aggressiveCount << ",";
-            oss << "\"stable\":" << health.stableCount << ",";
-            oss << "\"persistent\":" << health.persistentCount;
-            oss << "}";
-            oss << "},";
-            oss << "\"etw\":{";
-            oss << "\"healthy\":" << (health.etwHealthy ? "true" : "false") << ",";
-            oss << "\"event_count\":" << health.etwEventCount;
-            oss << "},";
-            oss << "\"wakeups\":{";
-            oss << "\"config_change\":" << health.wakeupConfigChange << ",";
-            oss << "\"safety_net\":" << health.wakeupSafetyNet << ",";
-            oss << "\"enforcement_request\":" << health.wakeupEnforcementRequest << ",";
-            oss << "\"process_exit\":" << health.wakeupProcessExit;
-            oss << "},";
-            oss << "\"enforcement\":{";
-            oss << "\"persistent_applied\":" << health.persistentEnforceApplied << ",";
-            oss << "\"persistent_skipped\":" << health.persistentEnforceSkipped;
-            oss << "},";
-            oss << "\"errors\":{";
-            oss << "\"access_denied\":" << health.error5Count << ",";
-            oss << "\"invalid_parameter\":" << health.error87Count << ",";
-            oss << "\"shutdown_warnings\":" << health.shutdownWarnings;
-            oss << "},";
-            oss << "\"config\":{";
-            oss << "\"changes_detected\":" << health.configChangeDetected << ",";
-            oss << "\"reloads\":" << health.configReloadCount;
-            oss << "},";
-            oss << "\"ipc\":{\"healthy\":true}";
-            oss << "}";
-            return oss.str();
+            // Build active_processes JSON array
+            nlohmann::json activeProcs = nlohmann::json::array();
+            for (const auto& p : health.activeProcessDetails) {
+                activeProcs.push_back({
+                    {"pid", p.pid},
+                    {"name", WideToUtf8(p.name)},
+                    {"phase", p.phase},
+                    {"violations", p.violations},
+                    {"is_child", p.isChild}
+                });
+            }
+
+            nlohmann::json j;
+            j["schema_version"] = 1;
+            j["status"] = status;
+            j["uptime_seconds"] = health.uptimeMs / 1000;
+
+            j["engine"] = {
+                {"running", health.engineRunning},
+                {"mode", GetModeString(health.mode)},
+                {"active_processes", activeProcs},
+                {"total_violations", health.totalViolations},
+                {"phases", {
+                    {"aggressive", health.aggressiveCount},
+                    {"stable", health.stableCount},
+                    {"persistent", health.persistentCount}
+                }}
+            };
+
+            j["etw"] = {
+                {"healthy", health.etwHealthy},
+                {"event_count", health.etwEventCount}
+            };
+
+            j["wakeups"] = {
+                {"config_change", health.wakeupConfigChange},
+                {"safety_net", health.wakeupSafetyNet},
+                {"enforcement_request", health.wakeupEnforcementRequest},
+                {"process_exit", health.wakeupProcessExit}
+            };
+
+            j["enforcement"] = {
+                {"persistent_applied", health.persistentEnforceApplied},
+                {"persistent_skipped", health.persistentEnforceSkipped},
+                {"total", health.totalEnforcements},
+                {"success", health.enforceSuccessCount},
+                {"fail", health.enforceFailCount},
+                {"avg_latency_us", health.enforceLatencyAvgUs},
+                {"max_latency_us", health.enforceLatencyMaxUs},
+                {"etw_thread_deduped", health.etwThreadDeduped},
+                {"last_enforce_time_ms", health.lastEnforceTimeMs}
+            };
+
+            j["errors"] = {
+                {"access_denied", health.error5Count},
+                {"invalid_parameter", health.error87Count},
+                {"shutdown_warnings", health.shutdownWarnings}
+            };
+
+            j["config"] = {
+                {"changes_detected", health.configChangeDetected},
+                {"reloads", health.configReloadCount}
+            };
+
+            j["ipc"] = {{"healthy", true}};
+
+            try {
+                return j.dump();
+            } catch (const std::exception&) {
+                return R"({"schema_version":1,"status":"error","error":"JSON serialization failed"})";
+            }
         }
         case IPCCommand::CMD_SET_LOG_ENABLED: {
             if (data.empty()) {

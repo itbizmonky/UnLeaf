@@ -1,9 +1,11 @@
 # Build output
 build/
+deploy/
 out/
 x64/
 Debug/
 Release/
+nul
 
 # Executables and binaries
 *.exe
@@ -42,10 +44,16 @@ Thumbs.db
 Desktop.ini
 nul
 
+# UnLeaf Closed Source / Proprietary
+src/manager
+resources/app*
+resources/UnLeaf_Manager.manifest
+
 # Development documents (not for public repo)
 SESSION_CONTEXT.md
 CLAUDE.md
 .claude/
+.claudeignore
 Design_Specification_v2.00.md
 Project_Cleanup_Prompt.md
 
@@ -55,3 +63,7 @@ certs/
 *.pvk
 scripts/sign_config.local.ps1
 scripts/sign_config.local.bat
+
+# Security & Signing
+scripts/sign*
+scripts/create_cert*

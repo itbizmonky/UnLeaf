@@ -1,7 +1,7 @@
 # UnLeaf Engine 開発者仕様書
 
 > **対象バージョン**: v1.00 (C++ Native)
-> **最終更新**: 2026-02-15
+> **最終更新**: 2026-02-22
 > **対象読者**: 本プロジェクトの保守・拡張を行う開発者
 
 ---
@@ -440,6 +440,9 @@ EngineCore は 2 つのスレッドセーフキューを持つ。
 | `DEGRADED_SCAN_INTERVAL` | 30,000 ms | DEGRADED モードフォールバックスキャン周期 |
 | `CONFIG_DEBOUNCE_MS` | 2,000 ms | 設定変更デバウンス時間 |
 | `ERROR_LOG_SUPPRESS_MS` | 60,000 ms | エラーログ抑制ウィンドウ (同一 PID × エラーコード) |
+| `ETW_STABLE_RATE_LIMIT` | 200 ms | STABLE フェーズでの ETW スレッドイベント レートリミット |
+| `ECOQOS_CACHE_DURATION` | 100 ms | IsEcoQoSEnabledCached マイクロキャッシュ TTL |
+| `LIVENESS_CHECK_INTERVAL` | 60,000 ms | ゾンビ TrackedProcess 検出間隔 |
 
 ---
 
@@ -497,18 +500,25 @@ EngineCore は 2 つのスレッドセーフキューを持つ。
 - **トリガー**: プロセス検出時、または STABLE で violation 検知時 (< 3 回)
 - **動作**: 初回 PulseEnforceV6 実行後、Timer Queue による遅延検証を 3 段階で実施
   - Step 1: 200ms 後に `IsEcoQoSEnabled` チェック
-  - Step 2: 1,000ms 後にチェック
-  - Step 3: 3,000ms 後にチェック (最終検証)
+  - Step 2: Step 1 完了から 800ms 後にチェック (起動から累計 ~1,000ms)
+  - Step 3: Step 2 完了から 2,000ms 後にチェック (起動から累計 ~3,000ms、最終検証)
+- **タイマー間隔の計算** (`ScheduleDeferredVerification`):
+  ```
+  step 1: delayMs = DEFERRED_VERIFY_1                          = 200ms
+  step 2: delayMs = DEFERRED_VERIFY_2 - DEFERRED_VERIFY_1      = 800ms (相対)
+  step 3: delayMs = DEFERRED_VERIFY_FINAL - DEFERRED_VERIFY_2  = 2000ms (相対)
+  ```
+  各 step は前の step のコールバック完了後に次の step をスケジュールするため、相対的な遅延となる。
 - **遷移条件**:
   - 全ステップ clean → **STABLE**
-  - 検証中に EcoQoS ON → `violationCount++`, PulseEnforceV6 再実行, 検証シーケンスリセット
-  - `violationCount >= 3` → **PERSISTENT**
+  - 検証中に EcoQoS ON → `violationCount++`, PulseEnforceV6 再実行, 検証シーケンスリセット (step 1 から再開)
+  - `violationCount >= 3` → **PERSISTENT** (全タイマーキャンセル後、persistent タイマー開始)
 
 #### STABLE フェーズ
 
 - **トリガー**: AGGRESSIVE の 3 回検証パス、または PERSISTENT の 60s clean
 - **動作**: アクティブなポーリングやタイマーなし。以下のイベントでのみ処理:
-  - ETW Thread Start → `IsEcoQoSEnabled` チェック
+  - ETW Thread Start → `IsEcoQoSEnabledCached` チェック (200ms レートリミット: `ETW_STABLE_RATE_LIMIT`)
   - Safety Net (10s) → `IsEcoQoSEnabled` チェック
 - **遷移条件**:
   - EcoQoS violation 検知 → `violationCount++`
@@ -541,39 +551,76 @@ EngineCore は 2 つのスレッドセーフキューを持つ。
 
 ### 6.1 5層防御構造
 
+PulseEnforceV6 は「ゼロトラスト」原則に基づく。現在の EcoQoS 状態を前提とせず、常に OFF を強制する。
+
+> **Note**: コード内コメントでは「Layer 1 = レジストリポリシー」と記載されているが、レジストリポリシーは `ApplyOptimization()` で初回のみ適用されるため、PulseEnforceV6 関数内の処理は Step 1-5 として記載する。
+
 ```
 図4: EcoQoS 解除 5層防御フロー
 
   PulseEnforceV6(hProcess, pid, isIntensive)
   │
-  │  Layer 1: Background Mode Exit (無条件)
+  │  Step 1: Background Mode Exit (無条件)
   │  ├── SetPriorityClass(hProcess, PROCESS_MODE_BACKGROUND_END)
+  │  │   OS がバックグラウンドモード化している場合の即時解除
+  │  │   戻り値は無視 (バックグラウンドでない場合も副作用なし)
   │
-  │  Layer 2: NtSetInformationProcess (Windows 11+ のみ)
-  │  ├── ntdll!NtSetInformationProcess
-  │  │   ProcessInformationClass = 77 (NT_PROCESS_POWER_THROTTLING_STATE)
-  │  │   ControlMask = EXECUTION_SPEED | IGNORE_TIMER (0x5)
-  │  │   StateMask = 0 (Force OFF)
+  │  ControlMask 計算:
+  │  ├── Win11: EXECUTION_SPEED(0x1) | IGNORE_TIMER(0x4) = 0x5
+  │  └── Win10: EXECUTION_SPEED(0x1) のみ = 0x1
+  │        (IGNORE_TIMER は Win10 で ERROR_INVALID_PARAMETER を引き起こすため除外)
+  │
+  │  Step 2: NtSetInformationProcess (Windows 11+ のみ)
+  │  ├── 条件: winVersion_.isWindows11OrLater && ntApiAvailable_
+  │  ├── ntdll!NtSetInformationProcess(hProcess, 77, &state, sizeof(state))
+  │  │   UnleafThrottleState {
+  │  │     Version = 1,
+  │  │     ControlMask = 0x5 (EXECUTION_SPEED | IGNORE_TIMER),
+  │  │     StateMask = 0 (Force OFF)
+  │  │   }
   │  │
-  │  │   成功 → Layer 3 スキップ
-  │  │   失敗 → Layer 3 へフォールバック
+  │  │   STATUS_SUCCESS → ntApiSuccessCount_++, ecoQoSSuccess=true, Step 3 スキップ
+  │  │   失敗 → ntApiFailCount_++, Step 3 へフォールバック
   │
-  │  Layer 3: SetProcessInformation (Win10 primary / Win11 fallback)
-  │  ├── SetProcessInformation(ProcessPowerThrottling)
-  │  │   ControlMask = バージョン依存 (Win11: 0x5, Win10: 0x1)
+  │  Step 3: SetProcessInformation (Win10 primary / Win11 fallback)
+  │  ├── 条件: ecoQoSSuccess == false
+  │  ├── SetProcessInformation(hProcess, ProcessPowerThrottling, &state, sizeof(state))
   │  │   StateMask = 0 (Force OFF)
+  │  │   ControlMask = バージョン依存 (上記計算値)
   │
-  │  Layer 4: Priority Class (無条件)
+  │  Step 4: Priority Class (無条件)
   │  ├── SetPriorityClass(hProcess, HIGH_PRIORITY_CLASS)
-  │  │   OS の自動 EcoQoS 適用を防止
+  │  │   EcoQoS 制御の成否に関わらず実行
+  │  │   OS はプロセス優先度が HIGH の場合、自動 EcoQoS 適用を抑制する
   │
-  │  Layer 5: Thread Throttling (isIntensive == true のみ)
+  │  Step 5: Thread Throttling (isIntensive == true のみ)
   │  └── DisableThreadThrottling(pid, aggressive=true)
-  │       CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD)
-  │       各スレッド:
-  │         SetThreadInformation(ThreadPowerThrottling, StateMask=0)
-  │         GetThreadPriority → ABOVE_NORMAL に昇格 (< ABOVE_NORMAL の場合)
+  │       │
+  │       ├── CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0)
+  │       │
+  │       └── 各スレッド (ownerPid == pid):
+  │           ├── OpenThread(SET_INFORMATION | QUERY_INFORMATION)
+  │           ├── SetThreadInformation(ThreadPowerThrottling)
+  │           │   UnleafThreadThrottleState { Version=1, ControlMask=0x1, StateMask=0 }
+  │           ├── GetThreadPriority(hThread)
+  │           │   aggressive=true:  < ABOVE_NORMAL → SetThreadPriority(ABOVE_NORMAL)
+  │           │   aggressive=false: IDLE/LOWEST/BELOW_NORMAL → SetThreadPriority(ABOVE_NORMAL)
+  │           └── CloseHandle(hThread)
+  │
+  │  Error Handling:
+  │  └── !ecoQoSSuccess → HandleEnforceError(hProcess, pid, GetLastError())
 ```
+
+### 6.1.1 PulseEnforce (レガシーフォールバック)
+
+`PulseEnforce()` は PulseEnforceV6 の簡易版であり、NtSetInformationProcess を使用しない:
+
+- Step 1: Background mode exit
+- Step 2: SetProcessInformation (ControlMask = 0x5 固定、バージョン分岐なし)
+- Step 3: SetPriorityClass(HIGH_PRIORITY_CLASS)
+- Step 4: DisableThreadThrottling(pid, **aggressive=false** ← 保守的モード)
+
+現在のコードでは PulseEnforceV6 がすべてのパスで使用されているため、PulseEnforce はデッドコードとなっている。
 
 ### 6.2 IsEcoQoSEnabled
 
@@ -592,6 +639,19 @@ IsEcoQoSEnabled(hProcess)
 
   判定不能 → false (EcoQoS OFF と見なす)
 ```
+
+### 6.2.1 IsEcoQoSEnabledCached (マイクロキャッシュ)
+
+スレッドバースト時の NtQueryInformationProcess 呼び出し抑制のため、100ms TTL のマイクロキャッシュを使用する。
+
+```
+IsEcoQoSEnabledCached(tp, now)
+  ├── ecoQosCached && (now - ecoQosCacheTime < 100ms)
+  │   → キャッシュ値を返す
+  └── キャッシュミス → IsEcoQoSEnabled() → キャッシュ更新
+```
+
+STABLE / PERSISTENT での ETW_THREAD_START 処理で使用される。enforcement 後はキャッシュを無効化する (`ecoQosCached = false`)。
 
 ### 6.3 Windows バージョン分岐
 
@@ -686,15 +746,60 @@ ETW コールバックは C API であり、`this` ポインタを受け取れ�
                            → false → RESP_ERROR_ACCESS_DENIED
 ```
 
-### 8.3 コマンド処理
+### 8.3 サーバーループとコマンド処理
 
 サーバーループは Overlapped I/O を使用して停止シグナルとの同時待機を実現する:
 
-1. `CreateNamedPipeW()` でパイプインスタンス作成
-2. `ConnectNamedPipe()` + Overlapped で接続待機
-3. `WaitForMultipleObjects(overlapped.hEvent, stopEvent_)` で待機
-4. クライアント接続時: `HandleClient()` でコマンド処理
-5. コマンド処理後: パイプをクローズし、次のインスタンスを作成
+```
+ServerLoop()
+  │
+  ├── PipeSecurityDescriptor 初期化
+  │   失敗 → "IPC disabled" → return (DACL なしでは起動しない)
+  │
+  └── while (!stopRequested_)
+      │
+      ├── CreateNamedPipeW(PIPE_NAME, DUPLEX | OVERLAPPED, MESSAGE)
+      │   DACL = SYSTEM + Admins only
+      │   失敗 → consecutiveFailures++
+      │          backoff = min(1000 * 2^(failures-1), 30000) ms
+      │          10 回連続失敗で LOG_ERROR
+      │
+      ├── ConnectNamedPipe(pipeHandle, &overlapped)
+      │   ERROR_IO_PENDING → WaitForMultipleObjects:
+      │     [0] overlapped.hEvent → クライアント接続
+      │     [1] stopEvent_        → サービス停止
+      │
+      │   WAIT_OBJECT_0 + 1 (stopEvent) → CancelIo → break
+      │   WAIT_OBJECT_0 (接続) → HandleClient()
+      │
+      └── CloseHandle(pipeHandle)
+```
+
+#### HandleClient の詳細フロー
+
+```
+HandleClient(pipeHandle)
+  │
+  ├── ReadFile (Overlapped, 5s timeout)
+  │   WFMO: overlapped.hEvent + stopEvent_
+  │   → IPCMessage { command, dataLength } を読み取り
+  │
+  ├── AuthorizeClient(pipeHandle, command)
+  │   UNAUTHORIZED → SendResponse(RESP_ERROR_ACCESS_DENIED)
+  │                  → return
+  │
+  ├── Data 読み取り (dataLength > 0 の場合)
+  │   サイズ検証: >= UNLEAF_MAX_IPC_DATA_SIZE → RESP_ERROR_INVALID_INPUT
+  │   ReadFile (Overlapped, 5s timeout)
+  │
+  ├── ProcessCommand(command, data)
+  │   ├── 入力バリデーション (ADD_TARGET, REMOVE_TARGET, SET_INTERVAL)
+  │   ├── ハンドラ検索 (handlers_ map)
+  │   └── デフォルトハンドラ (GET_STATUS, STOP_SERVICE, GET_LOGS, etc.)
+  │
+  └── SendResponse(pipe, RESP_SUCCESS, responseData)
+      WriteFile(header) → WriteFile(data) → FlushFileBuffers
+```
 
 失敗時の復旧: `CreateNamedPipeW` が連続失敗した場合、指数バックオフ (1s → 30s) で再試行する。
 
@@ -798,7 +903,32 @@ HandleConfigChange()
   │   InitialScan() (新ターゲットのスキャン)
 ```
 
-### 9.4 JSON マイグレーション
+### 9.4 CleanupRemovedTargets
+
+設定リロード後、ターゲットリストから削除されたプロセスの追跡を解除する。
+
+```
+CleanupRemovedTargets()
+  │
+  ├── targetSet_ のローカルコピーを取得
+  │
+  ├── CSLockGuard(trackedCs_)
+  │   ├── First pass: 有効なルート PID を収集
+  │   │   ルートプロセスかつ targetSet_ に存在 → validRootPids
+  │   │
+  │   └── Second pass: 削除対象を特定
+  │       ├── 子プロセス:
+  │       │   親が trackedProcesses_ に存在しない AND 自身がターゲット名でない → remove
+  │       └── ルートプロセス:
+  │           targetSet_ に存在しない → remove
+  │
+  └── 各 remove 対象: RemoveTrackedProcess(pid)
+      → タイマーキャンセル、Wait 解除、メモリ解放
+```
+
+**重要**: 子プロセスは親の存在と自身のターゲット名の両方でフィルタされる。例えば chrome.exe をターゲットから外しても、子プロセスの chrome.exe は自身がターゲット名に一致するため残る。
+
+### 9.5 JSON マイグレーション
 
 旧バージョンの `UnLeaf.json` が存在し、`UnLeaf.ini` が存在しない場合、自動的に JSON → INI マイグレーションを実行する。マイグレーション成功後、旧 JSON ファイルは削除される。
 
@@ -990,12 +1120,170 @@ EngineControlLoop()
   │       ├── ETW health (30s): restart if unhealthy
   │       ├── Job refresh (5s): RefreshJobObjectPids()
   │       ├── Degraded scan (30s): InitialScanForDegradedMode()
+  │       ├── Liveness check (60s): zombie TrackedProcess 検出・除去
   │       └── Stats log (60s): phase breakdown 出力
   │
   └── 最終ドレイン: ProcessPendingRemovals()
 ```
 
-### 12.4 Stop() 9ステップ シャットダウンシーケンス
+### 12.4 ApplyOptimization() の詳細
+
+`ApplyOptimization()` は新しいプロセスを最適化し、追跡に追加する中核関数である。ETW イベント (OnProcessStart) または InitialScan から呼ばれる。
+
+```
+ApplyOptimization(pid, name, isChild, parentPid)
+  │
+  ├── Guard checks
+  │   ├── IsTracked(pid) → true → return false (二重登録防止)
+  │   └── IsCriticalProcess(name) → true → return false (保護プロセス)
+  │
+  ├── OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_SET_INFORMATION)
+  │   = 0x1200 (Chrome サンドボックス互換の最小権限)
+  │   失敗 → LOG_DEBUG "[SKIP]..." → return false
+  │
+  ├── Registry Policy (ルートターゲットのみ: isChild == false)
+  │   ├── QueryFullProcessImageNameW → フルパス取得
+  │   └── ApplyRegistryPolicy(fullPath, name)
+  │       ├── policyAppliedSet_ チェック (冪等)
+  │       └── RegistryPolicyManager::ApplyPolicy()
+  │           ├── SaveManifest() (クラッシュ安全: レジストリ書き込み前)
+  │           ├── DisablePowerThrottling(exePath) → REG_DWORD 1
+  │           └── SetIFEOPerfOptions(exeName, 3) → CpuPriorityClass=HIGH
+  │
+  ├── PulseEnforceV6(hProcess, pid, isIntensive=true)
+  │   → 5層防御で即座に EcoQoS 解除
+  │
+  ├── Job Object (ルートターゲットのみ)
+  │   ├── CreateAndAssignJobObject(pid, hProcess)
+  │   │   ├── IsProcessInJob → true → "pulse-only mode" (Chrome sandbox)
+  │   │   └── CreateJobObjectW → SetInformation(BREAKAWAY_OK) → AssignProcess
+  │   └── 子プロセスの場合: 親の Job Object に属しているか確認
+  │
+  ├── TrackedProcess 構造体の構築
+  │   ├── phase = AGGRESSIVE
+  │   ├── violationCount = 0
+  │   ├── processHandle = ScopedHandle(hProcess)
+  │   └── rootTargetPid, inJobObject, jobAssignmentFailed 設定
+  │
+  ├── プロセス終了監視の登録
+  │   ├── OpenProcess(SYNCHRONIZE) → 別ハンドル (SYNCHRONIZE は 0x1200 に含まれない)
+  │   ├── WaitCallbackContext{this, pid, tracked} の new 確保
+  │   └── RegisterWaitForSingleObject(OnProcessExit, INFINITE, WT_EXECUTEONLYONCE)
+  │       失敗 → ハンドル無効化で検知 (Safety Net でカバー)
+  │
+  ├── trackedProcesses_[pid] = tracked  (CSLockGuard(trackedCs_))
+  │   waitContexts_[pid] = context
+  │
+  └── ScheduleDeferredVerification(pid, step=1)
+      → AGGRESSIVE フェーズの遅延検証シーケンス開始
+```
+
+**2つのプロセスハンドル**: `processHandle` (0x1200: 制御用) と `waitProcessHandle` (SYNCHRONIZE: 終了検知用) を別々に保持する設計は、Chrome のサンドボックスプロセスが SYNCHRONIZE 権限を許可しない場合にも制御ハンドルを維持するためである。
+
+### 12.5 RemoveTrackedProcess() の詳細
+
+プロセス終了時のクリーンアップは、ロック競合を回避するため「収集→ロック外処理」パターンで実装される。
+
+```
+RemoveTrackedProcess(pid)
+  │
+  │  ──── Phase 1: ロック内でポインタ収集 ────
+  │
+  ├── CSLockGuard(trackedCs_)
+  │   ├── deferredTimer → DeleteTimerQueueTimer(INVALID_HANDLE_VALUE)
+  │   │   → deferredCtxToDelete = deferredTimerContext
+  │   ├── persistentTimer → DeleteTimerQueueTimer(INVALID_HANDLE_VALUE)
+  │   │   → timerCtxToDelete = persistentTimerContext
+  │   ├── waitHandleToUnregister = tp->waitHandle
+  │   ├── trackedProcesses_.erase(pid)
+  │   └── contextToDelete = waitContexts_[pid], erase
+  │
+  │  ──── Phase 2: ロック外でカーネル操作 ────
+  │
+  ├── UnregisterWaitEx(waitHandle, INVALID_HANDLE_VALUE) ← blocking
+  │
+  │  ──── Phase 3: エラー抑制エントリのクリーンアップ ────
+  │
+  ├── CSLockGuard(trackedCs_)  ← 再取得
+  │   └── errorLogSuppression_ から pid のエントリを全削除
+  │
+  │  ──── Phase 4: メモリ解放 ────
+  │
+  └── delete contextToDelete, timerCtxToDelete, deferredCtxToDelete
+```
+
+`INVALID_HANDLE_VALUE` を `UnregisterWaitEx` と `DeleteTimerQueueTimer` に渡すことで、実行中のコールバックが完了するまで blocking する。これにより use-after-free を防止する。
+
+### 12.6 HandleSafetyNetCheck() の詳細
+
+Safety Net は **保険チェック** であり、監視メカニズムではない。ETW イベント漏れや OS の EcoQoS 再適用クイークへの最終防御線として機能する。
+
+```
+HandleSafetyNetCheck()
+  │
+  ├── CSLockGuard(trackedCs_)
+  │   └── STABLE フェーズのプロセス PID を収集
+  │       (AGGRESSIVE は遅延検証中、PERSISTENT はタイマー稼働中なのでスキップ)
+  │
+  ├── 各 PID について:
+  │   └── EnqueueRequest(pid, SAFETY_NET)
+  │       → enforcementRequestEvent_ を SetEvent
+  │
+  └── ProcessEnforcementQueue()  ← 即時処理 (既に制御ループ内)
+      │
+      └── DispatchEnforcementRequest(SAFETY_NET)
+          ├── IsEcoQoSEnabled → OFF → no action
+          └── IsEcoQoSEnabled → ON (STABLE のみ)
+              ├── PulseEnforceV6
+              ├── violationCount++
+              ├── violationCount < 3 → AGGRESSIVE
+              └── violationCount >= 3 → PERSISTENT
+```
+
+**重要**: Safety Net は `HandleSafetyNetCheck()` から直接 `ProcessEnforcementQueue()` を呼ぶため、キューを経由した後すぐに処理される。WFMO の次回 wakeup を待つ必要がない。
+
+### 12.7 OnProcessStart() / OnThreadStart() の詳細
+
+#### OnProcessStart (ETW Process Start コールバック)
+
+```
+OnProcessStart(pid, parentPid, imageName)
+  │
+  ├── stopRequested_ → return
+  ├── IsCriticalProcess(imageName) → return
+  │
+  ├── Case 1: IsTrackedParent(parentPid) → true
+  │   └── ApplyOptimization(pid, imageName, isChild=true, parentPid)
+  │       (親プロセスの子として追跡)
+  │
+  └── Case 2: IsTargetName(imageName) → true
+      └── ApplyOptimization(pid, imageName, isChild=false, parentPid=0)
+          (ルートターゲットとして追跡)
+```
+
+子プロセス検出は親 PID ベースで行う。これにより、ターゲットリストに無いプロセス名であっても、ターゲットプロセスの子であれば自動的に追跡される。
+
+#### OnThreadStart (ETW Thread Start コールバック)
+
+```
+OnThreadStart(threadId, ownerPid)
+  │
+  ├── stopRequested_ → return
+  │
+  ├── CSLockGuard(trackedCs_)
+  │   └── trackedProcesses_.find(ownerPid)
+  │       未追跡 → return (O(1) フィルタ)
+  │       追跡中 → currentPhase を取得
+  │
+  ├── AGGRESSIVE → return (遅延検証がカバー)
+  │
+  └── STABLE / PERSISTENT
+      └── EnqueueRequest(ownerPid, ETW_THREAD_START)
+```
+
+Thread Start イベントは非常に頻繁に発火するため、`trackedProcesses_.find()` による O(1) フィルタが重要。非追跡プロセスのスレッド生成を即座にスキップする。
+
+### 12.8 Stop() 9ステップ シャットダウンシーケンス
 
 ```
 図5: Stop() 9ステップ シャットダウンシーケンス
@@ -1053,6 +1341,74 @@ EngineControlLoop()
 - `INVALID_HANDLE_VALUE` を `DeleteTimerQueueEx` と `UnregisterWaitEx` に渡すことで、実行中のコールバックが完了するまで blocking する。これによりコールバック中のメモリアクセス違反を防止する。
 - Step 4 で Timer contexts を収集し Step 5 で Timer Queue 破棄後に delete する。逆順だと delete 済みメモリへのアクセスが発生する。
 - `compare_exchange_strong` によるアトミックな停止権取得で、並行 `Stop()` 呼び出しを安全に処理する。
+
+---
+
+### 12.9 PerformPeriodicMaintenance() の詳細
+
+定期保守タスクは専用のタイマーを持たず、他の WFMO wakeup に「便乗」して実行される。各タスクは独自のインターバルで最終実行時刻を管理する。
+
+```
+PerformPeriodicMaintenance(now)
+  │
+  ├── ETW ヘルスチェック (30s ごと)
+  │   ├── operationMode_ == NORMAL && !processMonitor_.IsHealthy()
+  │   │   ├── processMonitor_.Stop()
+  │   │   ├── processMonitor_.Start(callbacks)
+  │   │   │   成功 → LOG "Session restarted successfully"
+  │   │   │   失敗 → operationMode_ = DEGRADED_ETW
+  │   │   │          LOG "Restart failed - switching to DEGRADED mode"
+  │   │   └── 成功しても失敗しても lastEtwHealthCheck_ = now
+  │   └── NORMAL && healthy → skip
+  │
+  ├── Job Object PID リフレッシュ (5s ごと)
+  │   ├── jobObjects_.empty() → skip (ロック取得のみで判定)
+  │   └── RefreshJobObjectPids() → 新しい子プロセスを検出
+  │
+  ├── DEGRADED_ETW フォールバックスキャン (30s ごと)
+  │   └── InitialScanForDegradedMode()
+  │       Toolhelp32 で全プロセスをスキャン
+  │       ターゲット名 or 追跡中の親 PID にマッチ → ApplyOptimization
+  │
+  ├── プロセス生存チェック (60s ごと)
+  │   └── waitHandle == nullptr のエントリのみ対象
+  │       OpenProcess + GetExitCodeProcess で確認
+  │       終了済み → pendingRemovalPids_ に push → hWakeupEvent_
+  │
+  └── 統計ログ出力 (60s ごと)
+      └── 条件: count > 0 && (aggressiveCount > 0 || persistentCount > 0)
+          (全プロセスが STABLE の場合はログを出力しない)
+          Stats: N tracked (A:x S:y P:z), M jobs, viol=V, wakeup(...)
+```
+
+### 12.10 InitialScan() の詳細
+
+`InitialScan()` は Start() 時および設定リロード後に呼ばれ、既に起動しているターゲットプロセスを検出する。
+
+```
+InitialScan()
+  │
+  ├── CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS)
+  ├── ScopedSnapshot で RAII 管理
+  │
+  ├── Phase 1: 全プロセスマップ構築
+  │   ProcessMap: PID → { name, parentPid }
+  │
+  ├── Phase 2: ターゲット検出 + 子孫プロセスの再帰収集
+  │   │
+  │   ├── collectDescendants(parentPid, out):
+  │   │   processMap 内で parentPid を親に持つプロセスを再帰的に収集
+  │   │   クリティカルプロセスはスキップ
+  │   │
+  │   └── 各ターゲットプロセス:
+  │       ├── ApplyOptimization(pid, name, isChild=false)
+  │       └── 子孫プロセスを収集:
+  │           └── ApplyOptimization(childPid, childName, isChild=true, rootPid)
+```
+
+**InitialScanForDegradedMode との違い**:
+- `InitialScan`: 子孫プロセスの再帰的な収集を行う (ツリー構造を認識)
+- `InitialScanForDegradedMode`: 直接の親子関係のみチェック (フラットスキャン)
 
 ---
 
@@ -1166,6 +1522,13 @@ jobCs_ → trackedCs_ (RefreshJobObjectPids で使用)
 | `ntApiSuccessCount_` | `atomic<uint32_t>` | NT API 成功数 |
 | `ntApiFailCount_` | `atomic<uint32_t>` | NT API 失敗数 |
 | `policyApplyCount_` | `atomic<uint32_t>` | ポリシー適用数 |
+| `etwThreadDeduped_` | `atomic<uint32_t>` | ETW Thread 重複排除数 |
+| `enforceCount_` | `atomic<uint32_t>` | PulseEnforceV6 総呼び出し数 |
+| `enforceSuccessCount_` | `atomic<uint32_t>` | 成功数 |
+| `enforceFailCount_` | `atomic<uint32_t>` | 失敗数 |
+| `enforceLatencySumUs_` | `atomic<uint64_t>` | レイテンシ合計 (μs) |
+| `enforceLatencyMaxUs_` | `atomic<uint32_t>` | 最大レイテンシ (μs) |
+| `lastEnforceTimeMs_` | `atomic<uint64_t>` | 最終エンフォース時刻 (Unix Epoch ms) |
 | `configChangeDetected_` | `atomic<uint32_t>` | 設定変更検知数 |
 | `configReloadCount_` | `atomic<uint32_t>` | 設定リロード数 |
 | `enabled_` (Logger) | `atomic<bool>` | ログ出力有効/無効 (acquire/release) |
@@ -1179,35 +1542,81 @@ jobCs_ → trackedCs_ (RefreshJobObjectPids で使用)
 
 ### 15.1 HandleEnforceError
 
+HandleEnforceError は PulseEnforceV6 が失敗した際に呼ばれ、エラーの種類に応じた自己修復を行う。
+
 ```
 HandleEnforceError(hProcess, pid, error)
   │
-  ├── totalRetries_++
-  ├── エラーコード別カウンタ更新 (error5Count_ / error87Count_)
+  ├── totalRetries_.fetch_add(1, relaxed)
+  ├── エラーコード別カウンタ更新
+  │   error == 5  → error5Count_++
+  │   error == 87 → error87Count_++
   │
-  ├── プロセス生存確認: GetExitCodeProcess()
-  │   → 終了済み → processHandle.reset() (即クリーンアップ)
+  ├── プロセス生存確認
+  │   GetExitCodeProcess(hProcess, &exitCode)
+  │   exitCode != STILL_ACTIVE → processHandle.reset() → return
+  │   (Safety Net がプロセス再検出を試みる)
+  │
+  ├── CSLockGuard(trackedCs_) ← TrackedProcess の更新はロック内
+  │   ├── tp->consecutiveFailures++
+  │   └── tp->lastErrorCode = error
   │
   ├── エラーログ抑制チェック
-  │   errorLogSuppression_[(pid, error)] → 60s 以内なら抑制
+  │   キー: (pid, error)
+  │   errorLogSuppression_ map で 60s 以内の重複ログを抑制
+  │   → shouldLog = true/false
   │
   └── switch (error)
       │
       ├── ERROR_ACCESS_DENIED (5)
-      │   consecutiveFailures <= 2 → リトライ (50ms backoff)
-      │   consecutiveFailures > 2  → 諦め (ログ出力のみ)
+      │   consecutiveFailures <= 2
+      │     → nextRetryTime = now + 50ms (RETRY_BACKOFF_BASE_MS)
+      │     → 次回の enforcement で再試行
+      │   consecutiveFailures > 2
+      │     → give up (shouldLog なら "[GIVE_UP]" ログ)
+      │     → プロセスは trackedProcesses_ に残り続ける
+      │       (Priority は Set 済みで部分的な保護は維持)
       │
-      ├── ERROR_INVALID_HANDLE
-      │   → processHandle.reset() (ハンドル無効化)
+      ├── ERROR_INVALID_HANDLE (6)
+      │   → processHandle.reset()
+      │   → ハンドルの即時破棄
+      │   → ReopenProcessHandle() による自動回復は別パスで行う
       │
       ├── ERROR_INVALID_PARAMETER (87)
-      │   → processHandle.reset() (プロセス終了と見なす)
+      │   → processHandle.reset()
+      │   → プロセスは既に終了している可能性が高い
+      │   → Wait コールバック経由で RemoveTrackedProcess が呼ばれる
       │
-      └── その他
+      └── その他のエラー
           consecutiveFailures <= MAX_RETRY_COUNT (5)
-          → 指数バックオフ (50ms × 2^n)
+            → backoff = 50ms × 2^(failures-1)
+            → nextRetryTime = now + backoff
+            → 50ms → 100ms → 200ms → 400ms → 800ms
           consecutiveFailures > 5
-          → 諦め (ログ出力のみ)
+            → give up (shouldLog なら "[GIVE_UP]" ログ)
+```
+
+### 15.1.1 ReopenProcessHandle
+
+ハンドルが無効化された場合の自動回復メカニズム:
+
+```
+ReopenProcessHandle(pid)
+  │
+  ├── totalHandleReopen_++
+  ├── OpenProcess(0x1200, pid) → 新しい制御ハンドル
+  │   失敗 → return false
+  │
+  ├── CSLockGuard(trackedCs_)
+  │   ├── 古い waitHandle を収集
+  │   ├── waitProcessHandle.reset()
+  │   ├── processHandle = MakeScopedHandle(新ハンドル)
+  │   ├── consecutiveFailures = 0, nextRetryTime = 0 (カウンタリセット)
+  │   ├── OpenProcess(SYNCHRONIZE) → 新しい待機ハンドル
+  │   └── RegisterWaitForSingleObject(OnProcessExit) → 新 WaitCallbackContext
+  │
+  ├── (ロック外) UnregisterWaitEx(旧waitHandle, INVALID_HANDLE_VALUE)
+  └── delete oldContext
 ```
 
 ### 15.2 リトライ戦略
@@ -1266,48 +1675,103 @@ shouldLog = (now - lastLogTime >= ERROR_LOG_SUPPRESS_MS)
 
 ### 16.1 作成条件
 
-`CreateAndAssignJobObject()` は以下の条件でのみ Job Object を作成する:
+`CreateAndAssignJobObject()` は以下の条件を **すべて** 満たす場合にのみ Job Object を作成する:
 
 1. ルートターゲットプロセス (`isChild == false`)
 2. プロセスが既に Job Object に属していない (`IsProcessInJob()` → `FALSE`)
-   - Chrome のサンドボックスプロセスなどは既に Job に属しているため、作成をスキップ
-   - この場合でも `TrackedProcess` は作成され、PulseEnforce は継続
+
+**既に Job に属している場合** (Chrome サンドボックスなど):
+
+- Job Object の作成はスキップされる
+- `TrackedProcess` は作成され、`jobAssignmentFailed = true` がセットされる
+- PulseEnforceV6 による EcoQoS 解除は継続する ("pulse-only mode")
 
 Job Object 設定:
 ```
+CreateJobObjectW(nullptr, nullptr)  // 無名 Job Object
+
 JOBOBJECT_EXTENDED_LIMIT_INFORMATION:
-  LimitFlags = JOB_OBJECT_LIMIT_BREAKAWAY_OK | JOB_OBJECT_LIMIT_SILENT_BREAKAWAY_OK
+  LimitFlags = JOB_OBJECT_LIMIT_BREAKAWAY_OK
+             | JOB_OBJECT_LIMIT_SILENT_BREAKAWAY_OK
 ```
 
-`BREAKAWAY_OK` により、子プロセスが Job から離脱することを許可する。
+| フラグ | 意味 |
+|--------|------|
+| `BREAKAWAY_OK` | `CREATE_BREAKAWAY_FROM_JOB` 指定の子プロセスが Job から離脱可能 |
+| `SILENT_BREAKAWAY_OK` | 子プロセスがフラグ指定なしでも暗黙的に Job から離脱可能 |
+
+これらのフラグにより、アプリケーション自身の子プロセス管理 (GPU プロセス、レンダラー等) を阻害しない。
+
+### 16.1.1 JobObjectInfo 構造体
+
+```cpp
+struct JobObjectInfo {
+    HANDLE jobHandle;     // カーネル Job Object ハンドル
+    DWORD  rootPid;       // この Job を作成したルートプロセスの PID
+    bool   isOwnJob;      // true = UnLeaf が作成した Job
+};
+```
+
+- Non-copyable, movable
+- デストラクタで `CloseHandle(jobHandle)` を保証
+- `jobObjects_`: `map<DWORD, unique_ptr<JobObjectInfo>>` で管理
 
 ### 16.2 RefreshJobObjectPids 2-pass アルゴリズム
+
+5 秒ごとに `PerformPeriodicMaintenance` から呼ばれ、Job Object 内の新しい子プロセスを検出する。
 
 ```
 RefreshJobObjectPids()
   │
-  │  ──── Pass 1: ロック保持 (データ収集) ────
+  │  ════════════════════════════════════════
+  │  Pass 1: ロック保持 (データ収集のみ)
+  │  ════════════════════════════════════════
   │
-  ├── CSLockGuard(jobCs_)
-  ├── CSLockGuard(trackedCs_)   ← ロック順序: jobCs_ → trackedCs_
+  ├── CSLockGuard(jobCs_)         ← 順序 1
+  ├── CSLockGuard(trackedCs_)     ← 順序 2 (ロック順序は jobCs_ → trackedCs_)
   │
-  ├── 各 JobObjectInfo:
+  ├── 各 JobObjectInfo (isOwnJob == true のみ):
+  │   │
   │   ├── QueryInformationJobObject(JobObjectBasicProcessIdList)
-  │   │   スタック上の固定長バッファ (MAX_JOB_PIDS = 1024)
-  │   ├── PID リストから未追跡の PID を収集
+  │   │   ├── スタック上の固定長バッファ:
+  │   │   │   BYTE buffer[sizeof(JOBOBJECT_BASIC_PROCESS_ID_LIST)
+  │   │   │              + (MAX_JOB_PIDS - 1) * sizeof(ULONG_PTR)]
+  │   │   │   (MAX_JOB_PIDS = 1024: 最大 1024 プロセス分)
+  │   │   │   動的アロケーションなし (パフォーマンス + 例外安全)
+  │   │   │
+  │   │   └── 失敗 → この Job をスキップ (ハンドル無効化等)
+  │   │
+  │   ├── PID リストを走査:
+  │   │   trackedProcesses_.find(pid) == end → newPids に追加
+  │   │
   │   └── JobQueryResult { rootPid, newPids[] }
+  │       newPids が空なら jobResults に追加しない
   │
-  │  ──── Pass 2: ロック解放 (処理実行) ────
+  │  ════════════════════════════════════════
+  │  Pass 2: ロック解放 (カーネル操作 + 最適化)
+  │  ════════════════════════════════════════
   │
   └── 各 newPid:
-      ├── IsTracked(pid) → true → skip (二重チェック)
+      ├── IsTracked(pid) → true → skip
+      │   (Pass 1-2 間に別スレッドで追加された可能性がある: 二重チェック)
+      │
       ├── OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION)
-      ├── QueryFullProcessImageNameW → ファイル名抽出
-      ├── IsCriticalProcess → skip
-      └── ApplyOptimization(pid, name, isChild=true, rootPid)
+      │   失敗 → skip (プロセス終了済み)
+      │
+      ├── QueryFullProcessImageNameW → フルパスからファイル名抽出
+      │   pos = fullPath.find_last_of("\\/")
+      │   name = fullPath.substr(pos + 1)
+      │
+      ├── IsCriticalProcess(name) → skip
+      │
+      └── ApplyOptimization(pid, name, isChild=true, rootPid=result.rootPid)
+          → PulseEnforceV6 + TrackedProcess 登録 + 遅延検証開始
 ```
 
-2-pass の目的: ロック保持時間の最小化。Pass 2 の `OpenProcess` / `ApplyOptimization` はカーネル呼び出しを含むため、ロック外で実行する。
+**2-pass の設計意図**:
+- Pass 1 ではカーネル呼び出し (`QueryInformationJobObject`) とメモリ操作のみで、`OpenProcess` や `ApplyOptimization` のような重い処理を避ける
+- Pass 2 でロックを解放してから `OpenProcess` / `ApplyOptimization` を実行することで、他のスレッド (ETW コールバック等) のロック待機時間を最小化する
+- ロック順序 (`jobCs_` → `trackedCs_`) をプロジェクト全体で統一し、デッドロックを防止する
 
 ### 16.3 クリーンアップ
 
@@ -1476,6 +1940,9 @@ IsValidProcessName(name)
 | `DEGRADED_SCAN_INTERVAL` | 30,000 | 縮退スキャン間隔 |
 | `CONFIG_DEBOUNCE_MS` | 2,000 | 設定変更デバウンス |
 | `ERROR_LOG_SUPPRESS_MS` | 60,000 | エラーログ抑制ウィンドウ |
+| `ETW_STABLE_RATE_LIMIT` | 200 | STABLE ETW レートリミット |
+| `ECOQOS_CACHE_DURATION` | 100 | EcoQoS マイクロキャッシュ TTL |
+| `LIVENESS_CHECK_INTERVAL` | 60,000 | ゾンビプロセス検出間隔 |
 
 ### A.8 レジストリ定数 (registry_manager.h)
 
@@ -1586,7 +2053,7 @@ IsValidProcessName(name)
 |---------|-----|------|----------------|---------------|
 | ADD_TARGET | 1 | ADMIN | UTF-8 プロセス名 | `{"success": true}` |
 | REMOVE_TARGET | 2 | ADMIN | UTF-8 プロセス名 | `{"success": true}` |
-| GET_STATUS | 3 | PUBLIC | なし | `{"running": true, "version": "2.00"}` |
+| GET_STATUS | 3 | PUBLIC | なし | `{"running": true, "version": "1.00"}` |
 | STOP_SERVICE | 4 | SYSTEM_ONLY | なし | `{"result": "stopping"}` |
 | GET_CONFIG | 5 | PUBLIC | なし | (ハンドラ依存) |
 | SET_INTERVAL | 6 | ADMIN | uint32_t (4 bytes) | (ハンドラ依存) |
@@ -1617,12 +2084,15 @@ IsValidProcessName(name)
 
 ```json
 {
+  "schema_version": 1,
   "status": "healthy|degraded|unhealthy",
   "uptime_seconds": 3600,
   "engine": {
     "running": true,
     "mode": "NORMAL",
-    "active_processes": 5,
+    "active_processes": [
+      {"pid": 1234, "name": "chrome.exe", "phase": "STABLE", "violations": 0, "is_child": false}
+    ],
     "total_violations": 12,
     "phases": { "aggressive": 1, "stable": 3, "persistent": 1 }
   },
@@ -1631,7 +2101,13 @@ IsValidProcessName(name)
     "config_change": 2, "safety_net": 360,
     "enforcement_request": 150, "process_exit": 10
   },
-  "enforcement": { "persistent_applied": 5, "persistent_skipped": 200 },
+  "enforcement": {
+    "persistent_applied": 5, "persistent_skipped": 200,
+    "total": 500, "success": 495, "fail": 5,
+    "avg_latency_us": 120, "max_latency_us": 5000,
+    "etw_thread_deduped": 42,
+    "last_enforce_time_ms": 1740000000000
+  },
   "errors": { "access_denied": 0, "invalid_parameter": 3, "shutdown_warnings": 0 },
   "config": { "changes_detected": 2, "reloads": 1 },
   "ipc": { "healthy": true }

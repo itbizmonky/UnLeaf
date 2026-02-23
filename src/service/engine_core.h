@@ -10,11 +10,14 @@
 #include <tlhelp32.h>
 #include <map>
 #include <set>
+#include <vector>
 #include <atomic>
 #include <thread>
 #include <queue>
 #include <memory>
 #include <utility>
+#include <chrono>
+#include <string>
 
 // Linker-level guard against accidental timeBeginPeriod usage
 #pragma detect_mismatch("UnLeaf_NoHighResTimer", "enforced")
@@ -68,6 +71,15 @@ enum class OperationMode {
     DEGRADED_CONFIG // Config load failed (limited functionality)
 };
 
+// Active process detail for structured JSON output
+struct ActiveProcessDetail {
+    DWORD pid;
+    std::wstring name;
+    std::string phase;       // "AGGRESSIVE", "STABLE", "PERSISTENT"
+    uint32_t violations;
+    bool isChild;
+};
+
 // Health check info structure
 struct HealthInfo {
     // Existing
@@ -94,6 +106,13 @@ struct HealthInfo {
     uint32_t persistentEnforceApplied;
     uint32_t persistentEnforceSkipped;
 
+    // Enforcement telemetry
+    uint32_t totalEnforcements;      // Total PulseEnforceV6 calls
+    uint32_t enforceSuccessCount;    // Successful enforcements
+    uint32_t enforceFailCount;       // Failed enforcements
+    uint32_t enforceLatencyAvgUs;    // Average latency (microseconds)
+    uint32_t enforceLatencyMaxUs;    // Maximum latency (microseconds)
+
     // Shutdown warnings
     uint32_t shutdownWarnings;
 
@@ -104,6 +123,15 @@ struct HealthInfo {
     // Config monitoring
     uint32_t configChangeDetected;
     uint32_t configReloadCount;
+
+    // Queue optimization
+    uint32_t etwThreadDeduped;
+
+    // Last enforcement timestamp (Unix Epoch milliseconds, system_clock based)
+    uint64_t lastEnforceTimeMs;
+
+    // Active process details (structured)
+    std::vector<ActiveProcessDetail> activeProcessDetails;
 };
 
 // Windows version information for compatibility
@@ -168,6 +196,11 @@ struct TrackedProcess {
     // ETW boost for PERSISTENT phase (rate-limited instant response)
     ULONGLONG lastEtwEnforceTime;    // Last ETW-triggered enforce time (for rate limiting)
 
+    // EcoQoS state micro-cache (reduces NtQueryInformationProcess calls during burst)
+    bool ecoQosCached;               // Cache valid flag
+    bool ecoQosCachedValue;          // Cached EcoQoS state
+    ULONGLONG ecoQosCacheTime;       // Cache timestamp
+
     // Timer handles for deferred verification and persistent enforcement
     HANDLE deferredTimer;            // AGGRESSIVE phase deferred verification timer
     HANDLE persistentTimer;          // PERSISTENT phase periodic enforcement timer
@@ -182,6 +215,7 @@ struct TrackedProcess {
         , rootTargetPid(0), inJobObject(false), jobAssignmentFailed(false)
         , lastViolationTime(0)
         , lastEtwEnforceTime(0)
+        , ecoQosCached(false), ecoQosCachedValue(false), ecoQosCacheTime(0)
         , deferredTimer(nullptr), persistentTimer(nullptr)
         , persistentTimerContext(nullptr)
         , deferredTimerContext(nullptr) {}
@@ -320,6 +354,9 @@ private:
     // Check if EcoQoS (Efficiency Mode) is currently enabled
     bool IsEcoQoSEnabled(HANDLE hProcess) const;
 
+    // Cached version: avoids repeated NtQueryInformationProcess during burst
+    bool IsEcoQoSEnabledCached(TrackedProcess& tp, ULONGLONG now);
+
     // Phase-based enforcement handler
     void ProcessPhaseEnforcement(DWORD pid, HANDLE hProcess, ProcessPhase phase, ULONGLONG now);
 
@@ -410,6 +447,9 @@ private:
     // Last safety net check time (for logging only, not timing)
     ULONGLONG lastSafetyNetTime_;
 
+    // Last process liveness check time (zombie cleanup)
+    ULONGLONG lastProcessLivenessCheck_;
+
     // Config change debounce (FindFirstChangeNotification fires for all directory writes)
     ULONGLONG lastConfigCheckTime_;
     bool configChangePending_;
@@ -455,12 +495,25 @@ private:
     std::atomic<uint32_t> persistentEnforceApplied_{0};
     std::atomic<uint32_t> persistentEnforceSkipped_{0};
 
+    // Queue deduplication counter
+    std::atomic<uint32_t> etwThreadDeduped_{0};
+
+    // Enforcement telemetry counters
+    std::atomic<uint32_t> enforceCount_{0};
+    std::atomic<uint32_t> enforceSuccessCount_{0};
+    std::atomic<uint32_t> enforceFailCount_{0};
+    std::atomic<uint64_t> enforceLatencySumUs_{0};
+    std::atomic<uint32_t> enforceLatencyMaxUs_{0};
+
     // Error counters (independent of log suppression)
     std::atomic<uint32_t> error5Count_{0};   // ERROR_ACCESS_DENIED
     std::atomic<uint32_t> error87Count_{0};  // ERROR_INVALID_PARAMETER
 
     // Error log suppression map (pid, error) -> lastLogTime
     std::map<std::pair<DWORD, DWORD>, ULONGLONG> errorLogSuppression_;
+
+    // Last enforcement timestamp (Unix Epoch ms, system_clock)
+    std::atomic<uint64_t> lastEnforceTimeMs_{0};
 
     // Config monitoring counters
     std::atomic<uint32_t> configChangeDetected_{0};
@@ -478,6 +531,8 @@ private:
     static constexpr ULONGLONG PERSISTENT_ENFORCE_INTERVAL = 5000;  // 5s enforcement interval
     static constexpr ULONGLONG PERSISTENT_CLEAN_THRESHOLD = 60000;  // 60s clean to exit PERSISTENT
     static constexpr ULONGLONG ETW_BOOST_RATE_LIMIT = 1000;         // 1s rate limit for ETW boost in PERSISTENT
+    static constexpr ULONGLONG ETW_STABLE_RATE_LIMIT = 200;          // 200ms rate limit for ETW in STABLE
+    static constexpr ULONGLONG ECOQOS_CACHE_DURATION = 100;          // 100ms EcoQoS state cache TTL
 
     // SAFETY NET: Insurance consistency check (NOT monitoring)
     // This is NOT polling - it's a last-resort check for event misses and OS quirks
@@ -493,6 +548,9 @@ private:
 
     // DEGRADED_ETW mode: Fallback scan interval
     static constexpr ULONGLONG DEGRADED_SCAN_INTERVAL = 30000;   // 30s fallback scan
+
+    // Process liveness check interval (zombie TrackedProcess cleanup)
+    static constexpr ULONGLONG LIVENESS_CHECK_INTERVAL = 60000;  // 60s
 
     // Config change debounce (directory-level notification includes log writes)
     static constexpr ULONGLONG CONFIG_DEBOUNCE_MS = 2000;        // 2s debounce

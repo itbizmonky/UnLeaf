@@ -23,7 +23,7 @@ BEGIN
     BEGIN
         BLOCK "040904B0"
         BEGIN
-            VALUE "CompanyName", "Kenbouz UnLeaf Project"
+            VALUE "CompanyName", "UnLeaf Project"
             VALUE "FileDescription", "UnLeaf EcoQoS Override Service"
             VALUE "FileVersion", "1.0.0.0"
             VALUE "InternalName", "UnLeaf"
