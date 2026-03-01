@@ -432,6 +432,8 @@ private:
     // Enforcement statistics
     std::atomic<uint32_t> totalViolations_;
     ULONGLONG lastStatsLogTime_;
+    ULONGLONG lastDiagLogTime_;   // tracks DIAG_LOG_INTERVAL_MS cadence (independent of stats)
+    LARGE_INTEGER qpcFreq_;       // QueryPerformanceFrequency cache (initialized in Start())
 
     // Job Objects (rootPid -> JobObjectInfo)
     std::map<DWORD, std::unique_ptr<JobObjectInfo>> jobObjects_;
@@ -449,6 +451,12 @@ private:
 
     // Last process liveness check time (zombie cleanup)
     ULONGLONG lastProcessLivenessCheck_;
+
+    // Last errorLogSuppression_ cleanup time
+    ULONGLONG lastSuppressionCleanup_;
+
+    // Last [MEM] memory diagnostics log time
+    ULONGLONG lastMemLogTime_;
 
     // Config change debounce (FindFirstChangeNotification fires for all directory writes)
     ULONGLONG lastConfigCheckTime_;
@@ -490,6 +498,15 @@ private:
     std::atomic<uint32_t> wakeupSafetyNet_{0};
     std::atomic<uint32_t> wakeupEnforcementRequest_{0};
     std::atomic<uint32_t> wakeupProcessExit_{0};
+
+    // Threadpool wait diagnostics (leak detection)
+    // uint64_t: 長時間稼働サービスで uint32_t のオーバーフローを防ぐ。
+    // waitDelta = reg - unreg は累計差分。実際のアクティブ待機数は watchMap + deferCtxCnt で読む。
+    // ウェイトリーク確定: delta 単調増加 AND watchMap 横ばい AND deferCtx 横ばい AND handles 比例増加 — 全条件同時。
+    std::atomic<uint64_t> waitRegisterCount_{0};      // cumulative RegisterWaitForSingleObject successes
+    std::atomic<uint64_t> waitUnregisterCount_{0};    // cumulative UnregisterWaitEx calls that returned TRUE
+    std::atomic<uint64_t> waitUnregisterFailures_{0}; // cumulative UnregisterWaitEx calls that returned FALSE
+    std::atomic<uint32_t> callbackConcurrent_{0};     // OnProcessExit 同時実行数 (RAII管理)
 
     // PERSISTENT enforce counters
     std::atomic<uint32_t> persistentEnforceApplied_{0};
@@ -543,6 +560,12 @@ private:
 
     // Periodic maintenance (piggybacks on other wakeups)
     static constexpr ULONGLONG STATS_LOG_INTERVAL = 60000;       // Stats logging
+#ifdef _DEBUG
+    static constexpr ULONGLONG DIAG_LOG_INTERVAL_MS = 30000;     // 30s in Debug builds
+#else
+    static constexpr ULONGLONG DIAG_LOG_INTERVAL_MS = 120000;    // 120s in Release builds
+#endif
+    static constexpr uint64_t CALLBACK_LATENCY_WARN_US = 1000;   // 1ms: OnProcessExit 遅延警告閾値
     static constexpr ULONGLONG JOB_QUERY_INTERVAL = 5000;        // Job Object refresh
     static constexpr ULONGLONG ETW_HEALTH_CHECK_INTERVAL = 30000; // ETW health check
 
@@ -557,6 +580,19 @@ private:
 
     // Error log suppression window (same PID × error code)
     static constexpr ULONGLONG ERROR_LOG_SUPPRESS_MS = 60000;    // 60s suppression
+
+    // errorLogSuppression_ periodic cleanup
+    static constexpr ULONGLONG SUPPRESSION_CLEANUP_INTERVAL = 60000;  // 60s cleanup cadence
+    static constexpr ULONGLONG SUPPRESSION_TTL = 300000;               // 5min TTL (> suppress window to prevent re-register churn)
+    static constexpr size_t    SUPPRESSION_MAX_SIZE = 2000;            // emergency cap (oldest-first eviction)
+
+    // policyAppliedSet_ size cap
+    static constexpr size_t    POLICY_SET_MAX_SIZE = 1000;
+
+    // [MEM] memory diagnostics log intervals
+    static constexpr ULONGLONG MEM_LOG_INTERVAL_SHORT = 10000;    // 起動後 30 分: 10 秒
+    static constexpr ULONGLONG MEM_LOG_INTERVAL_LONG  = 60000;    // 30 分経過後: 60 秒
+    static constexpr ULONGLONG MEM_LOG_WARMUP_MS      = 1800000ULL; // 30 分
     
 };
 

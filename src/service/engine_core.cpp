@@ -5,6 +5,8 @@
 #include <functional>
 #include <chrono>
 #include <cstdio>
+#include <psapi.h>
+#pragma comment(lib, "psapi.lib")
 
 namespace unleaf {
 
@@ -36,6 +38,8 @@ EngineCore::EngineCore()
     , lastJobQueryTime_(0)
     , lastSafetyNetTime_(0)
     , lastProcessLivenessCheck_(0)
+    , lastSuppressionCleanup_(0)
+    , lastMemLogTime_(0)
     , ntdllHandle_(nullptr)
     , pfnNtSetInformationProcess_(nullptr)
     , pfnNtQueryInformationProcess_(nullptr)
@@ -191,11 +195,14 @@ void EngineCore::Start() {
     totalViolations_ = 0;
     ULONGLONG now = GetTickCount64();
     lastStatsLogTime_ = now;
+    lastDiagLogTime_ = now;
+    QueryPerformanceFrequency(&qpcFreq_);
     lastEtwHealthCheck_ = now;
     lastJobQueryTime_ = now;
     lastSafetyNetTime_ = now;
     lastProcessLivenessCheck_ = now;
     lastDegradedScanTime_ = now;
+    lastMemLogTime_ = now;
     startTime_ = now;
     ResetEvent(stopEvent_);
 
@@ -323,6 +330,9 @@ void EngineCore::Stop() {
         for (HANDLE h : waitHandles) {
             if (!UnregisterWaitEx(h, INVALID_HANDLE_VALUE)) {
                 shutdownWarnings_.fetch_add(1);
+                waitUnregisterFailures_.fetch_add(1, std::memory_order_relaxed);
+            } else {
+                waitUnregisterCount_.fetch_add(1, std::memory_order_relaxed);
             }
         }
 
@@ -767,6 +777,11 @@ void EngineCore::HandleConfigChange() {
     LightweightLogger::Instance().SetLogLevel(UnLeafConfig::Instance().GetLogLevel());
     LightweightLogger::Instance().SetEnabled(UnLeafConfig::Instance().IsLogEnabled());
 
+    {
+        CSLockGuard lock(policySetCs_);
+        std::set<std::wstring>().swap(policyAppliedSet_);  // clear + release capacity
+    }
+
     RefreshTargetSet();
 
     wchar_t cfgBuf[96];
@@ -1048,6 +1063,29 @@ void EngineCore::PerformPeriodicMaintenance(ULONGLONG now) {
         lastProcessLivenessCheck_ = now;
     }
 
+    // errorLogSuppression_ TTL cleanup (every 60s)
+    if (now - lastSuppressionCleanup_ >= SUPPRESSION_CLEANUP_INTERVAL) {
+        CSLockGuard lock(trackedCs_);
+        const size_t before = errorLogSuppression_.size();
+        for (auto it = errorLogSuppression_.begin(); it != errorLogSuppression_.end(); ) {
+            if (now - it->second > SUPPRESSION_TTL) {
+                it = errorLogSuppression_.erase(it);
+            } else {
+                ++it;
+            }
+        }
+        // Emergency size cap: oldest-first eviction (clear() would cause log storm)
+        while (errorLogSuppression_.size() > SUPPRESSION_MAX_SIZE) {
+            errorLogSuppression_.erase(errorLogSuppression_.begin());
+        }
+        if (errorLogSuppression_.size() != before) {
+            wchar_t buf[80];
+            swprintf_s(buf, L"[MAINT] errSup: %zu -> %zu", before, errorLogSuppression_.size());
+            LOG_DEBUG(buf);
+        }
+        lastSuppressionCleanup_ = now;
+    }
+
     // Stats logging (every 60s)
     if (now - lastStatsLogTime_ >= STATS_LOG_INTERVAL) {
         size_t count = GetActiveProcessCount();
@@ -1109,6 +1147,83 @@ void EngineCore::PerformPeriodicMaintenance(ULONGLONG now) {
             }
         }
         lastStatsLogTime_ = now;
+    }
+
+    // --- Leak diagnostics (interval: DIAG_LOG_INTERVAL_MS — 30s Debug / 120s Release) ---
+    if (now - lastDiagLogTime_ >= DIAG_LOG_INTERVAL_MS) {
+        size_t trackedSz   = 0;
+        size_t watchMapSz  = 0;
+        size_t deferCtxCnt = 0;
+        size_t errSupSz    = 0;
+        {
+            CSLockGuard lock(trackedCs_);
+            trackedSz  = trackedProcesses_.size();
+            watchMapSz = waitContexts_.size();
+            for (const auto& [pid, tp] : trackedProcesses_) {
+                if (tp->deferredTimerContext != nullptr) ++deferCtxCnt;
+            }
+            errSupSz = errorLogSuppression_.size();
+        }
+
+        DWORD handleCount = 0;
+        if (!GetProcessHandleCount(GetCurrentProcess(), &handleCount)) {
+            handleCount = 0;
+        }
+
+        uint64_t regCnt    = waitRegisterCount_.load(std::memory_order_relaxed);
+        uint64_t unregCnt  = waitUnregisterCount_.load(std::memory_order_relaxed);
+        uint64_t unregFail = waitUnregisterFailures_.load(std::memory_order_relaxed);
+        int64_t  waitDelta = static_cast<int64_t>(regCnt) - static_cast<int64_t>(unregCnt);
+
+        wchar_t diagBuf[320];
+        swprintf_s(diagBuf,
+            L"[DIAG] wait(reg:%llu unreg:%llu fail:%llu delta:%lld) "
+            L"tracked=%zu watchMap=%zu deferCtx=%zu errSup=%zu handles=%u",
+            regCnt, unregCnt, unregFail, waitDelta,
+            trackedSz, watchMapSz, deferCtxCnt, errSupSz, handleCount);
+        LOG_DEBUG(diagBuf);
+
+        lastDiagLogTime_ = now;
+    }
+
+    // [MEM] memory diagnostics (10s warmup / 60s steady)
+    {
+        ULONGLONG memInterval = (now - startTime_ < MEM_LOG_WARMUP_MS)
+            ? MEM_LOG_INTERVAL_SHORT : MEM_LOG_INTERVAL_LONG;
+
+        if (now - lastMemLogTime_ >= memInterval) {
+            PROCESS_MEMORY_COUNTERS_EX pmc = {};
+            pmc.cb = sizeof(pmc);
+            DWORD handleCount = 0;
+            GetProcessMemoryInfo(GetCurrentProcess(),
+                reinterpret_cast<PROCESS_MEMORY_COUNTERS*>(&pmc), sizeof(pmc));
+            GetProcessHandleCount(GetCurrentProcess(), &handleCount);
+
+            // コンテナサイズ（短時間ロック）
+            size_t policySz = 0;
+            size_t errSupSz = 0;
+            {
+                CSLockGuard lock(policySetCs_);
+                policySz = policyAppliedSet_.size();
+            }
+            {
+                CSLockGuard lock(trackedCs_);
+                errSupSz = errorLogSuppression_.size();
+            }
+
+            wchar_t memBuf[256];
+            swprintf_s(memBuf,
+                L"[MEM] pid=%u priv=%zu rss=%zu commit=%zu handles=%u policy=%zu errSup=%zu",
+                GetCurrentProcessId(),
+                pmc.PrivateUsage,
+                pmc.WorkingSetSize,
+                pmc.PagefileUsage,
+                handleCount,
+                policySz,
+                errSupSz);
+            LOG_DEBUG(memBuf);
+            lastMemLogTime_ = now;
+        }
     }
 }
 
@@ -1288,6 +1403,10 @@ bool EngineCore::ApplyRegistryPolicy(const std::wstring& exePath, const std::wst
 
     if (success) {
         CSLockGuard lock(policySetCs_);
+        if (policyAppliedSet_.size() >= POLICY_SET_MAX_SIZE) {
+            std::set<std::wstring>().swap(policyAppliedSet_);  // clear + release capacity
+            LOG_DEBUG(L"[POLICY] policyAppliedSet reached cap - cleared");
+        }
         policyAppliedSet_.insert(ToLower(exeName));
         policyApplyCount_.fetch_add(1, std::memory_order_relaxed);
 
@@ -1554,6 +1673,7 @@ bool EngineCore::ReopenProcessHandle(DWORD pid) {
                 tp->waitHandle = waitHandle;
                 tp->waitProcessHandle = MakeScopedHandle(hWaitProcess);
                 waitContexts_[pid] = context;
+                waitRegisterCount_.fetch_add(1, std::memory_order_relaxed);
             } else {
                 delete context;
                 CloseHandle(hWaitProcess);
@@ -1565,6 +1685,9 @@ bool EngineCore::ReopenProcessHandle(DWORD pid) {
     if (oldWaitHandle) {
         if (!UnregisterWaitEx(oldWaitHandle, INVALID_HANDLE_VALUE)) {
             shutdownWarnings_.fetch_add(1);
+            waitUnregisterFailures_.fetch_add(1, std::memory_order_relaxed);
+        } else {
+            waitUnregisterCount_.fetch_add(1, std::memory_order_relaxed);
         }
     }
     delete oldContext;
@@ -1933,6 +2056,7 @@ bool EngineCore::ApplyOptimization(DWORD pid, const std::wstring& name, bool isC
                 WT_EXECUTEONLYONCE)) {
             tracked->waitHandle = waitHandle;
             tracked->waitProcessHandle = MakeScopedHandle(hWaitProcess);
+            waitRegisterCount_.fetch_add(1, std::memory_order_relaxed);
         } else {
             delete context;
             context = nullptr;
@@ -1960,16 +2084,49 @@ void CALLBACK EngineCore::OnProcessExit(PVOID lpParameter, BOOLEAN timerOrWaitFi
     (void)timerOrWaitFired;
     auto* context = static_cast<WaitCallbackContext*>(lpParameter);
     if (!context || !context->engine) return;
+
     EngineCore* engine = context->engine;
+    const DWORD pid = context->pid;
+
+    // RAII concurrent guard — entered = callback開始時点の並行度
+    struct ConcurrentGuard {
+        std::atomic<uint32_t>& c;
+        uint32_t entered;
+        explicit ConcurrentGuard(std::atomic<uint32_t>& c) : c(c) {
+            entered = c.fetch_add(1, std::memory_order_relaxed) + 1;
+        }
+        ~ConcurrentGuard() { c.fetch_sub(1, std::memory_order_relaxed); }
+    } guard(engine->callbackConcurrent_);
+
+    // QPC start — engine->qpcFreq_ を参照: callback内ロックゼロ
+    LARGE_INTEGER qpcStart;
+    QueryPerformanceCounter(&qpcStart);
+
+    // 本体 — 例外安全性は設計で保証 (CSLockGuard は RAII, queue::push は noexcept 相当)
     bool wasEmpty;
     {
         CSLockGuard lock(engine->pendingRemovalCs_);
         wasEmpty = engine->pendingRemovalPids_.empty();
-        engine->pendingRemovalPids_.push(context->pid);
+        engine->pendingRemovalPids_.push(pid);
     }
     if (wasEmpty && !engine->stopRequested_.load(std::memory_order_acquire)) {
         HANDLE h = engine->hWakeupEvent_;
         if (h) SetEvent(h);
+    }
+
+    // 閾値超過時のみログ — 正常パスはゼロコスト
+    if (engine->qpcFreq_.QuadPart > 0) {
+        LARGE_INTEGER qpcEnd;
+        QueryPerformanceCounter(&qpcEnd);
+        const uint64_t elapsedUs = static_cast<uint64_t>(
+            (qpcEnd.QuadPart - qpcStart.QuadPart) * 1000000LL / engine->qpcFreq_.QuadPart);
+        if (elapsedUs > CALLBACK_LATENCY_WARN_US) {
+            wchar_t buf[128];
+            swprintf_s(buf,
+                L"[CB_SLOW] pid=%lu elapsed=%lluus concurrent=%u",
+                pid, elapsedUs, guard.entered);
+            LOG_DEBUG(buf);
+        }
     }
 }
 
@@ -2025,6 +2182,9 @@ void EngineCore::RemoveTrackedProcess(DWORD pid) {
     if (waitHandleToUnregister) {
         if (!UnregisterWaitEx(waitHandleToUnregister, INVALID_HANDLE_VALUE)) {
             shutdownWarnings_.fetch_add(1);
+            waitUnregisterFailures_.fetch_add(1, std::memory_order_relaxed);
+        } else {
+            waitUnregisterCount_.fetch_add(1, std::memory_order_relaxed);
         }
     }
 
