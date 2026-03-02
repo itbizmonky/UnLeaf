@@ -3,6 +3,7 @@
 #include "ipc_server.h"
 #include "engine_core.h"
 #include "../common/logger.h"
+#include "../common/win_string_utils.h"
 #include <algorithm>
 #include <sstream>
 #include <nlohmann/json.hpp>
@@ -310,29 +311,10 @@ AuthResult IPCServer::AuthorizeClient(HANDLE pipeHandle, IPCCommand cmd) {
     return authorized ? AuthResult::AUTHORIZED : AuthResult::UNAUTHORIZED;
 }
 
-static std::wstring Utf8ToWide(const std::string& utf8) {
-    if (utf8.empty()) return L"";
-    int len = MultiByteToWideChar(CP_UTF8, 0, utf8.c_str(), -1, nullptr, 0);
-    if (len <= 0) return L"";
-    std::wstring wide(len - 1, L'\0');
-    MultiByteToWideChar(CP_UTF8, 0, utf8.c_str(), -1, &wide[0], len);
-    return wide;
-}
-
-static std::string WideToUtf8(const std::wstring& wide) {
-    if (wide.empty()) return "";
-    int len = WideCharToMultiByte(CP_UTF8, 0, wide.c_str(), -1, nullptr, 0, nullptr, nullptr);
-    if (len <= 0) return "";
-    std::string utf8(len - 1, '\0');
-    WideCharToMultiByte(CP_UTF8, 0, wide.c_str(), -1, &utf8[0], len, nullptr, nullptr);
-    return utf8;
-}
-
 static const char* GetModeString(OperationMode mode) {
     switch (mode) {
         case OperationMode::NORMAL: return "NORMAL";
         case OperationMode::DEGRADED_ETW: return "DEGRADED_ETW";
-        case OperationMode::DEGRADED_CONFIG: return "DEGRADED_CONFIG";
         default: return "UNKNOWN";
     }
 }
@@ -348,7 +330,7 @@ std::string IPCServer::ProcessCommand(IPCCommand cmd, const std::string& data) {
                 LOG_ALERT(L"IPC: Validation failed - empty process name");
                 return "{\"error\": \"Process name required\"}";
             }
-            std::wstring processName = Utf8ToWide(data);
+            std::wstring processName = unleaf::Utf8ToWide(data.c_str());
             if (!IsValidProcessName(processName)) {
                 LOG_ALERT(L"IPC: Validation failed - invalid process name '" + processName + L"'");
                 return "{\"error\": \"Invalid process name\"}";
@@ -366,7 +348,8 @@ std::string IPCServer::ProcessCommand(IPCCommand cmd, const std::string& data) {
                 LOG_ALERT(L"IPC: Validation failed - invalid interval format");
                 return R"({"error": "Invalid interval format"})";
             }
-            uint32_t interval = *reinterpret_cast<const uint32_t*>(data.data());
+            uint32_t interval = 0;
+            memcpy(&interval, data.data(), sizeof(uint32_t));
             if (interval < UNLEAF_MIN_INTERVAL_MS || interval > UNLEAF_MAX_INTERVAL_MS) {
                 LOG_ALERT(L"IPC: Validation failed - interval " + std::to_wstring(interval) +
                           L" out of range (10-60000ms)");
@@ -432,7 +415,7 @@ std::string IPCServer::ProcessCommand(IPCCommand cmd, const std::string& data) {
             for (const auto& p : health.activeProcessDetails) {
                 activeProcs.push_back({
                     {"pid", p.pid},
-                    {"name", WideToUtf8(p.name)},
+                    {"name", unleaf::WideToUtf8(p.name.c_str())},
                     {"phase", p.phase},
                     {"violations", p.violations},
                     {"is_child", p.isChild}
@@ -495,7 +478,12 @@ std::string IPCServer::ProcessCommand(IPCCommand cmd, const std::string& data) {
 
             try {
                 return j.dump();
-            } catch (const std::exception&) {
+            } catch (const std::exception& e) {
+                LOG_ERROR(std::wstring(L"[EXC] CMD_HEALTH_CHECK JSON: ") +
+                          unleaf::Utf8ToWide(e.what()));
+                return R"({"schema_version":1,"status":"error","error":"JSON serialization failed"})";
+            } catch (...) {
+                LOG_ERROR(L"[EXC] CMD_HEALTH_CHECK JSON: unknown exception");
                 return R"({"schema_version":1,"status":"error","error":"JSON serialization failed"})";
             }
         }

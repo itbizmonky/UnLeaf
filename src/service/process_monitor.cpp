@@ -232,9 +232,13 @@ bool ProcessMonitor::ParseProcessStartEvent(PEVENT_RECORD pEvent,
     // For Kernel-Process events, we need to parse the user data
     // Event structure varies by OS version, so we use TDH to parse it
 
+    static constexpr DWORD MAX_TDH_BUFFER = 512 * 1024;  // 512KB上限
     DWORD bufferSize = 0;
     TDHSTATUS status = TdhGetEventInformation(pEvent, 0, nullptr, nullptr, &bufferSize);
     if (status != ERROR_INSUFFICIENT_BUFFER) {
+        return false;
+    }
+    if (bufferSize == 0 || bufferSize > MAX_TDH_BUFFER) {
         return false;
     }
 
@@ -290,7 +294,9 @@ bool ProcessMonitor::ParseProcessStartEvent(PEVENT_RECORD pEvent,
                     int wideLen = MultiByteToWideChar(CP_ACP, 0, ansiName.c_str(), -1, nullptr, 0);
                     if (wideLen > 0) {
                         imageName.resize(wideLen - 1);
-                        MultiByteToWideChar(CP_ACP, 0, ansiName.c_str(), -1, &imageName[0], wideLen);
+                        int converted = MultiByteToWideChar(CP_ACP, 0, ansiName.c_str(), -1,
+                                                            &imageName[0], wideLen);
+                        if (converted == 0) imageName.clear();
                     }
                 } else {
                     // Try as raw string

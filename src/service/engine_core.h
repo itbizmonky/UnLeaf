@@ -67,8 +67,7 @@ struct DeferredVerifyContext;
 // Operation mode for graceful degradation
 enum class OperationMode {
     NORMAL,         // ETW + QuickRescan (full functionality)
-    DEGRADED_ETW,   // QuickRescan only (ETW failed)
-    DEGRADED_CONFIG // Config load failed (limited functionality)
+    DEGRADED_ETW    // QuickRescan only (ETW failed)
 };
 
 // Active process detail for structured JSON output

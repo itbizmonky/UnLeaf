@@ -493,7 +493,12 @@ void EngineCore::EngineControlLoop() {
                 // (including log writes). Defer actual check to reduce unnecessary file stats.
                 configChangePending_ = true;
                 if (configChangeHandle_ != INVALID_HANDLE_VALUE) {
-                    FindNextChangeNotification(configChangeHandle_);
+                    if (!FindNextChangeNotification(configChangeHandle_)) {
+                        LOG_ALERT(L"[CONFIG] FindNextChangeNotification failed - "
+                                  L"config change detection disabled");
+                        FindCloseChangeNotification(configChangeHandle_);
+                        configChangeHandle_ = INVALID_HANDLE_VALUE;
+                    }
                 }
                 break;
 

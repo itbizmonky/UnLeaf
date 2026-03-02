@@ -1,0 +1,7 @@
+@echo off
+REM UnLeaf code signing local configuration (Batch)
+REM Copy this file to sign_config.local.bat and edit the values.
+REM This file is gitignored and should NOT be committed.
+
+set "UNLEAF_SIGN_PFX=D:\path\to\certs\UnLeaf_Dev.pfx"
+set "UNLEAF_SIGN_PASSWORD=your-password-here"

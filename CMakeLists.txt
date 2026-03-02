@@ -63,6 +63,7 @@ set(COMMON_SOURCES
     src/common/logger.cpp
     src/common/config.cpp
     src/common/registry_manager.cpp
+    src/common/win_string_utils.cpp
 )
 
 set(COMMON_HEADERS
@@ -143,7 +144,6 @@ set(MANAGER_HEADERS
     src/manager/service_controller.h
     src/manager/ipc_client.h
     src/manager/resource.h
-   #  src/manager/UnLeaf.rc
 )
 
 # Resource file (includes manifest for admin privileges)
