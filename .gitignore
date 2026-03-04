@@ -4,10 +4,12 @@
 # --- Un-ignore (Allowlist) essential directories and files ---
 !*/
 !.gitignore
+!CMakeLists.txt
 !LICENSE
 !README.md
 !docs/Engine_Specification.md
 !resources/service.rc
+!src/common/**
 !src/service/**
 
 # --- Re-ignore specific subdirectories if needed (Safety Net) ---
