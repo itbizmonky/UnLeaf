@@ -1,3 +1,5 @@
+[English](README_EN.md) | [日本語](README.md)
+
 # UnLeaf
 
 **Windows 10 / 11 の「効率モード」(EcoQoS) を自動無効化するサービスユーティリティ**

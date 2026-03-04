@@ -7,6 +7,7 @@
 !CMakeLists.txt
 !LICENSE
 !README.md
+!README_EN.md
 !docs/Engine_Specification.md
 !resources/service.rc
 !src/common/**
