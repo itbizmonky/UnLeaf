@@ -1200,9 +1200,10 @@ void EngineCore::PerformPeriodicMaintenance(ULONGLONG now) {
             PROCESS_MEMORY_COUNTERS_EX pmc = {};
             pmc.cb = sizeof(pmc);
             DWORD handleCount = 0;
-            GetProcessMemoryInfo(GetCurrentProcess(),
-                reinterpret_cast<PROCESS_MEMORY_COUNTERS*>(&pmc), sizeof(pmc));
-            GetProcessHandleCount(GetCurrentProcess(), &handleCount);
+            bool pmcOk = GetProcessMemoryInfo(GetCurrentProcess(),
+                reinterpret_cast<PROCESS_MEMORY_COUNTERS*>(&pmc), sizeof(pmc)) != FALSE;
+            bool hcOk = GetProcessHandleCount(GetCurrentProcess(), &handleCount) != FALSE;
+            (void)pmcOk; (void)hcOk;
 
             // コンテナサイズ（短時間ロック）
             size_t policySz = 0;

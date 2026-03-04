@@ -113,6 +113,10 @@ bool ServiceMain::RunAsConsole() {
     // Cleanup
     EngineCore::Instance().Stop();
     LightweightLogger::Instance().Shutdown();
+    if (stopEvent_) {
+        CloseHandle(stopEvent_);
+        stopEvent_ = nullptr;
+    }
 
     std::wcout << L"Debug mode: Stopped" << std::endl;
     return true;

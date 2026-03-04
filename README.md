@@ -247,6 +247,81 @@ UnLeaf は 24/7/365 常駐サービスとして設計されており、以下の
 
 ---
 
+## Planned (v1.0.1+)
+
+以下は現バージョン (v1.0.0) には含まれない将来予定の改善項目です。
+
+| 項目 | 内容 |
+|------|------|
+| engine_core ユニットテスト | 目標カバレッジ 80%。現在は types / config / logger の 71 テストのみ |
+| DeleteTimerQueueTimer コールバック設計改善 | `trackedCs_` 取得制約を前提としない安全なコールバック設計への移行検討 |
+| DrawButton SelectObject 復元 | `WM_DRAWITEM` 描画後の `SelectObject` 復元 (現状は OS 管理 DC のため実害なし) |
+
+---
+
 ## ライセンス
 
 [MIT License](LICENSE)
+
+---
+
+## 開発者向け情報
+
+### ビルド手順
+
+**前提**: Visual Studio 2022 以降 (MSVC)、CMake 3.20+
+
+```cmd
+# 設定
+cmake -B build -G "Visual Studio 17 2022" -A x64
+
+# Release ビルド
+cmake --build build --config Release
+
+# 出力 (build\Release\)
+# UnLeaf_Service.exe  (~748 KB)
+# UnLeaf_Manager.exe  (~749 KB)
+# UnLeaf_Tests.exe    (~957 KB, UNLEAF_BUILD_TESTS=ON 時のみ)
+```
+
+> **注意**: `UnLeaf_Manager.exe` が実行中の場合、そのリンクが LNK1104 で失敗します。
+> `UnLeaf_Service.exe` と `UnLeaf_Tests.exe` のビルドは影響を受けません。
+
+### テスト手順
+
+```cmd
+# テストビルド (UNLEAF_BUILD_TESTS はデフォルト ON)
+cmake -B build -DUNLEAF_BUILD_TESTS=ON
+cmake --build build --config Release
+
+# テスト実行
+ctest --test-dir build -C Release --output-on-failure
+```
+
+**テスト結果**: 71/71 PASS (test_types.cpp / test_config.cpp / test_logger.cpp)
+
+### リリースバージョン情報
+
+| 項目 | 値 |
+|------|-----|
+| バージョン | v1.0.0 (SemVer: MAJOR.MINOR.PATCH) |
+| ビルドシステム | CMake / MSVC (Visual Studio 2022+) |
+| C++ 標準 | C++17 |
+| 外部依存 | nlohmann/json v3.11.3, GoogleTest v1.15.2 (テストのみ) |
+| 対象アーキテクチャ | x64 |
+
+> **バージョン表記について**: 本ドキュメントでは正式版表記 `v1.0.0` (SemVer) を使用します。内部実装 (`types.h`) の `VERSION = L"1.00"` は IPC レスポンス等で表示される内部識別子であり、正式版表記とは異なります。
+
+### ソースコード構成
+
+```
+src/
+├── common/     # 共通ユーティリティ (logger, config, registry_manager, win_string_utils, scoped_handle, types)
+├── service/    # Windows Service エンジン (engine_core, process_monitor, ipc_server, service_main)
+└── manager/    # GUI 管理ツール (main_window, ipc_client, service_controller)
+docs/
+├── Engine_Specification.md   # Engine 開発者仕様書
+├── Manager_Specification.md  # Manager 開発者仕様書
+└── UI_RULES.md               # UI 描画規約
+tests/          # GoogleTest ユニットテスト
+```
