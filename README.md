@@ -2,7 +2,7 @@
 
 # 🍃 UnLeaf - The Zero-Overhead EcoQoS Optimizer
 
-**UnLeaf（アンリーフ）**は、Windows 11 / 10 環境において、指定したアプリケーションの「EcoQoS（効率モード）」と「電力スロットリング」をOSの深淵から完全に無効化する、究極のバックグラウンド最適化ツールです。
+**UnLeaf**は、Windows 11 / 10 環境において、指定したアプリケーションの「EcoQoS（効率モード）」と「電力スロットリング」をOSの深淵から完全に無効化する、究極のバックグラウンド最適化ツールです。
 
 Originally created by kbn.
 
