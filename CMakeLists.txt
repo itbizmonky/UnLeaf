@@ -102,6 +102,7 @@ set(SERVICE_SOURCES
     src/service/main.cpp
     src/service/service_main.cpp
     src/service/engine_core.cpp
+    src/engine/engine_logic.cpp
     src/service/process_monitor.cpp
     src/service/ipc_server.cpp
 )
@@ -244,6 +245,9 @@ if(UNLEAF_BUILD_TESTS)
         tests/test_types.cpp
         tests/test_config.cpp
         tests/test_logger.cpp
+        tests/test_engine_logic.cpp
+        tests/test_engine_policy.cpp
+        src/engine/engine_logic.cpp
         ${COMMON_SOURCES}
         ${COMMON_HEADERS}
     )

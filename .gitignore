@@ -9,9 +9,11 @@
 !README.md
 !README_EN.md
 !docs/Engine_Specification.md
+!docs/GitHub_CI_Operation.md
 !resources/service.rc
 !src/common/**
 !src/service/**
+!.github/workflows/build.yml
 
 # --- Re-ignore specific subdirectories if needed (Safety Net) ---
 build/

@@ -286,3 +286,26 @@ UnLeaf/
     ├── common/                  # 共通ユーティリティ (高速ロガー、IPC通信、レジストリ管理)
     └── service/                 # コアエンジン本体 (ETW監視、サービス制御)
 ```
+
+---
+
+## 更新履歴 (Changelog)
+
+### v1.0.1 (2026-03-09)
+
+**バグ修正・安全性強化**
+- `DeleteTimerQueueTimer` を `trackedCs_` 取得前に移動し、ロック保持中の呼び出しを完全排除 (全5箇所)
+- `DrawButton` の GDI オブジェクト復元処理を修正 (`SelectObject` で旧フォントを明示的に復元)
+- `ToggleSubclassProc` に null チェックを追加
+
+**アーキテクチャ改善**
+- エンジン決定ロジックを `src/engine/engine_logic` に分離 (Win32 非依存の純粋 C++ モジュール)
+- `EnginePolicy` 構造体を導入し、タイミング定数を `engine_core` から分離・一元管理
+- ユニットテスト 72 件 → 104 件に拡充 (`test_engine_logic`: 32 件 + `test_engine_policy`: 2 件追加)
+
+**CI/CD**
+- GitHub Actions CI を導入 (`push` / `pull_request` 時に自動ビルド + ctest)
+
+### v1.0.0 (2026-03-06)
+
+初回リリース。

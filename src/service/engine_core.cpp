@@ -585,6 +585,12 @@ void EngineCore::ProcessEnforcementQueue() {
 
 // Dispatch a single enforcement request
 void EngineCore::DispatchEnforcementRequest(const EnforcementRequest& req) {
+    // Accumulators for timer cleanup: filled inside lock, deleted outside lock
+    // (DeleteTimerQueueTimer(INVALID_HANDLE_VALUE) must not be called while holding trackedCs_)
+    std::vector<HANDLE>               timersToDelete;
+    std::vector<DeferredVerifyContext*> ctxToDelete;
+
+    {
     CSLockGuard lock(trackedCs_);
     auto it = trackedProcesses_.find(req.pid);
     if (it == trackedProcesses_.end()) return;
@@ -611,15 +617,14 @@ void EngineCore::DispatchEnforcementRequest(const EnforcementRequest& req) {
                     totalViolations_.fetch_add(1);
                     tp.lastViolationTime = now;
 
-                    if (tp.violationCount >= VIOLATION_THRESHOLD) {
-                        tp.phase = ProcessPhase::PERSISTENT;
+                    tp.phase = engine_logic::NextPhaseOnViolation(tp.violationCount, policy_);
+                    if (tp.phase == ProcessPhase::PERSISTENT) {
                         StartPersistentTimer(req.pid);
                         wchar_t logBuf[256];
                         swprintf_s(logBuf, L"[PERSISTENT] %s (PID:%lu) via thread event (violations=%u)",
                                    tp.name.c_str(), req.pid, tp.violationCount);
                         LOG_DEBUG(logBuf);
                     } else {
-                        tp.phase = ProcessPhase::AGGRESSIVE;
                         tp.phaseStartTime = now;
                         ScheduleDeferredVerification(req.pid, 1);
                         wchar_t logBuf[256];
@@ -668,7 +673,7 @@ void EngineCore::DispatchEnforcementRequest(const EnforcementRequest& req) {
                         // Final verification passed -> transition to STABLE
                         tp.phase = ProcessPhase::STABLE;
                         tp.phaseStartTime = now;
-                        CancelProcessTimers(tp);
+                        CancelProcessTimers(tp, timersToDelete, ctxToDelete);
                         wchar_t logBuf[256];
                         swprintf_s(logBuf, L"[PHASE] %s (PID:%lu) -> STABLE", tp.name.c_str(), req.pid);
                         LOG_DEBUG(logBuf);
@@ -682,9 +687,9 @@ void EngineCore::DispatchEnforcementRequest(const EnforcementRequest& req) {
                     totalViolations_.fetch_add(1);
                     PulseEnforceV6(tp.processHandle.get(), req.pid, true);
 
-                    if (tp.violationCount >= VIOLATION_THRESHOLD) {
-                        tp.phase = ProcessPhase::PERSISTENT;
-                        CancelProcessTimers(tp);
+                    tp.phase = engine_logic::NextPhaseOnViolation(tp.violationCount, policy_);
+                    if (tp.phase == ProcessPhase::PERSISTENT) {
+                        CancelProcessTimers(tp, timersToDelete, ctxToDelete);
                         StartPersistentTimer(req.pid);
                         wchar_t logBuf[256];
                         swprintf_s(logBuf, L"[PERSISTENT] %s (PID:%lu) violations=%u",
@@ -693,7 +698,7 @@ void EngineCore::DispatchEnforcementRequest(const EnforcementRequest& req) {
                     } else {
                         // Restart AGGRESSIVE with fresh verification sequence
                         tp.phaseStartTime = now;
-                        CancelProcessTimers(tp);
+                        CancelProcessTimers(tp, timersToDelete, ctxToDelete);
                         ScheduleDeferredVerification(req.pid, 1);
                     }
                 }
@@ -720,10 +725,12 @@ void EngineCore::DispatchEnforcementRequest(const EnforcementRequest& req) {
                 if (!ecoQoSOn) {
                     ULONGLONG timeSinceLastViolation = (tp.lastViolationTime > 0) ?
                         (now - tp.lastViolationTime) : (now - tp.phaseStartTime);
-                    if (timeSinceLastViolation >= PERSISTENT_CLEAN_THRESHOLD) {
+                    if (engine_logic::ShouldExitPersistent(
+                            static_cast<uint64_t>(timeSinceLastViolation),
+                            static_cast<uint64_t>(PERSISTENT_CLEAN_THRESHOLD))) {
                         tp.phase = ProcessPhase::STABLE;
                         tp.phaseStartTime = now;
-                        CancelProcessTimers(tp);
+                        CancelProcessTimers(tp, timersToDelete, ctxToDelete);
                         wchar_t logBuf[256];
                         swprintf_s(logBuf, L"[PHASE] %s (PID:%lu) PERSISTENT -> STABLE (clean 60s)",
                                    tp.name.c_str(), req.pid);
@@ -744,11 +751,10 @@ void EngineCore::DispatchEnforcementRequest(const EnforcementRequest& req) {
                     totalViolations_.fetch_add(1);
                     tp.lastViolationTime = now;
 
-                    if (tp.violationCount >= VIOLATION_THRESHOLD) {
-                        tp.phase = ProcessPhase::PERSISTENT;
+                    tp.phase = engine_logic::NextPhaseOnViolation(tp.violationCount, policy_);
+                    if (tp.phase == ProcessPhase::PERSISTENT) {
                         StartPersistentTimer(req.pid);
                     } else {
-                        tp.phase = ProcessPhase::AGGRESSIVE;
                         tp.phaseStartTime = now;
                         ScheduleDeferredVerification(req.pid, 1);
                     }
@@ -763,6 +769,17 @@ void EngineCore::DispatchEnforcementRequest(const EnforcementRequest& req) {
 
         default:
             break;
+    }
+    }  // end CSLockGuard scope
+
+    // Delete accumulated timers outside lock: INVALID_HANDLE_VALUE blocks until
+    // any in-flight callback completes, then we free the context.
+    for (size_t i = 0; i < timersToDelete.size(); ++i) {
+        if (!DeleteTimerQueueTimer(timerQueue_, timersToDelete[i], INVALID_HANDLE_VALUE)) {
+            DWORD err = GetLastError();
+            if (err != ERROR_IO_PENDING) { shutdownWarnings_.fetch_add(1); }
+        }
+        delete ctxToDelete[i];
     }
 }
 
@@ -853,13 +870,8 @@ void EngineCore::ScheduleDeferredVerification(DWORD pid, uint8_t step) {
     if (!timerQueue_) return;
 
     // Determine delay based on step
-    DWORD delayMs;
-    switch (step) {
-        case 1: delayMs = static_cast<DWORD>(DEFERRED_VERIFY_1); break;   // 200ms
-        case 2: delayMs = static_cast<DWORD>(DEFERRED_VERIFY_2 - DEFERRED_VERIFY_1); break;  // 800ms more
-        case 3: delayMs = static_cast<DWORD>(DEFERRED_VERIFY_FINAL - DEFERRED_VERIFY_2); break;  // 2000ms more
-        default: return;
-    }
+    DWORD delayMs = static_cast<DWORD>(engine_logic::DeferredVerifyDelayMs(step, policy_));
+    if (delayMs == 0) return;  // invalid step
 
     // Get reference to tracked process and create context with shared_ptr
     {
@@ -889,34 +901,30 @@ void EngineCore::ScheduleDeferredVerification(DWORD pid, uint8_t step) {
 }
 
 // Cancel all timers for a process
-void EngineCore::CancelProcessTimers(TrackedProcess& tp) {
+// Extracts handles into caller-supplied vectors; caller deletes outside any lock.
+void EngineCore::CancelProcessTimers(TrackedProcess& tp,
+                                     std::vector<HANDLE>& timersToDelete,
+                                     std::vector<DeferredVerifyContext*>& ctxToDelete) {
     if (tp.deferredTimer && timerQueue_) {
-        if (!DeleteTimerQueueTimer(timerQueue_, tp.deferredTimer, INVALID_HANDLE_VALUE)) {
-            DWORD err = GetLastError();
-            if (err != ERROR_IO_PENDING) {
-                shutdownWarnings_.fetch_add(1);
-            }
-        }
-        delete tp.deferredTimerContext;
+        timersToDelete.push_back(tp.deferredTimer);
+        ctxToDelete.push_back(tp.deferredTimerContext);
         tp.deferredTimerContext = nullptr;
-        tp.deferredTimer = nullptr;
+        tp.deferredTimer        = nullptr;
     }
     if (tp.persistentTimer && timerQueue_) {
-        if (!DeleteTimerQueueTimer(timerQueue_, tp.persistentTimer, INVALID_HANDLE_VALUE)) {
-            DWORD err = GetLastError();
-            if (err != ERROR_IO_PENDING) {
-                shutdownWarnings_.fetch_add(1);
-            }
-        }
-        delete tp.persistentTimerContext;
+        timersToDelete.push_back(tp.persistentTimer);
+        ctxToDelete.push_back(tp.persistentTimerContext);
         tp.persistentTimerContext = nullptr;
-        tp.persistentTimer = nullptr;
+        tp.persistentTimer        = nullptr;
     }
 }
 
 // Start persistent enforcement timer (5s recurring)
 void EngineCore::StartPersistentTimer(DWORD pid) {
     if (!timerQueue_) return;
+
+    HANDLE               oldTimerToDelete = nullptr;
+    DeferredVerifyContext* oldCtxToDelete = nullptr;
 
     {
         CSLockGuard lock(trackedCs_);
@@ -925,12 +933,11 @@ void EngineCore::StartPersistentTimer(DWORD pid) {
             return;
         }
 
-        // Cancel existing persistent timer if any
+        // Cancel existing persistent timer if any (extract handle; delete outside lock)
         if (it->second->persistentTimer) {
-            // INVALID_HANDLE_VALUE: block until callback completes before freeing context
-            DeleteTimerQueueTimer(timerQueue_, it->second->persistentTimer, INVALID_HANDLE_VALUE);
-            delete it->second->persistentTimerContext;
-            it->second->persistentTimer = nullptr;
+            oldTimerToDelete = it->second->persistentTimer;
+            oldCtxToDelete   = it->second->persistentTimerContext;
+            it->second->persistentTimer        = nullptr;
             it->second->persistentTimerContext = nullptr;
         }
 
@@ -950,6 +957,12 @@ void EngineCore::StartPersistentTimer(DWORD pid) {
         } else {
             delete context;
         }
+    }
+
+    // INVALID_HANDLE_VALUE: block until callback completes before freeing context
+    if (oldTimerToDelete) {
+        DeleteTimerQueueTimer(timerQueue_, oldTimerToDelete, INVALID_HANDLE_VALUE);
+        delete oldCtxToDelete;
     }
 }
 
@@ -1382,7 +1395,10 @@ bool EngineCore::IsEcoQoSEnabled(HANDLE hProcess) const {
 
 // Cached version: avoids repeated NtQueryInformationProcess during thread burst
 bool EngineCore::IsEcoQoSEnabledCached(TrackedProcess& tp, ULONGLONG now) {
-    if (tp.ecoQosCached && (now - tp.ecoQosCacheTime < ECOQOS_CACHE_DURATION)) {
+    if (engine_logic::IsCacheValid(tp.ecoQosCached,
+            static_cast<uint64_t>(now),
+            static_cast<uint64_t>(tp.ecoQosCacheTime),
+            static_cast<uint64_t>(ECOQOS_CACHE_DURATION))) {
         return tp.ecoQosCachedValue;
     }
     bool result = IsEcoQoSEnabled(tp.processHandle.get());
@@ -2138,38 +2154,30 @@ void CALLBACK EngineCore::OnProcessExit(PVOID lpParameter, BOOLEAN timerOrWaitFi
 
 // Safely remove tracked process with proper wait handle cleanup
 void EngineCore::RemoveTrackedProcess(DWORD pid) {
-    HANDLE waitHandleToUnregister = nullptr;
-    WaitCallbackContext* contextToDelete = nullptr;
-    DeferredVerifyContext* timerCtxToDelete = nullptr;
+    HANDLE waitHandleToUnregister  = nullptr;
+    WaitCallbackContext* contextToDelete   = nullptr;
+    DeferredVerifyContext* timerCtxToDelete    = nullptr;
     DeferredVerifyContext* deferredCtxToDelete = nullptr;
+    HANDLE deferredTimerToDelete   = nullptr;
+    HANDLE persistentTimerToDelete = nullptr;
 
     {
         CSLockGuard lock(trackedCs_);
 
         auto it = trackedProcesses_.find(pid);
         if (it != trackedProcesses_.end()) {
-            // Cancel timers and recover contexts
+            // Extract timer handles for deletion outside lock
             if (it->second->deferredTimer && timerQueue_) {
-                if (!DeleteTimerQueueTimer(timerQueue_, it->second->deferredTimer, INVALID_HANDLE_VALUE)) {
-                    DWORD err = GetLastError();
-                    if (err != ERROR_IO_PENDING) {
-                        shutdownWarnings_.fetch_add(1);
-                    }
-                }
-                deferredCtxToDelete = it->second->deferredTimerContext;
+                deferredTimerToDelete            = it->second->deferredTimer;
+                deferredCtxToDelete              = it->second->deferredTimerContext;
                 it->second->deferredTimerContext = nullptr;
-                it->second->deferredTimer = nullptr;
+                it->second->deferredTimer        = nullptr;
             }
             if (it->second->persistentTimer && timerQueue_) {
-                if (!DeleteTimerQueueTimer(timerQueue_, it->second->persistentTimer, INVALID_HANDLE_VALUE)) {
-                    DWORD err = GetLastError();
-                    if (err != ERROR_IO_PENDING) {
-                        shutdownWarnings_.fetch_add(1);
-                    }
-                }
-                timerCtxToDelete = it->second->persistentTimerContext;
-                it->second->persistentTimerContext = nullptr;
-                it->second->persistentTimer = nullptr;
+                persistentTimerToDelete             = it->second->persistentTimer;
+                timerCtxToDelete                    = it->second->persistentTimerContext;
+                it->second->persistentTimerContext  = nullptr;
+                it->second->persistentTimer         = nullptr;
             }
 
             waitHandleToUnregister = it->second->waitHandle;
@@ -2181,6 +2189,21 @@ void EngineCore::RemoveTrackedProcess(DWORD pid) {
         if (ctxIt != waitContexts_.end()) {
             contextToDelete = ctxIt->second;
             waitContexts_.erase(ctxIt);
+        }
+    }
+
+    // Delete timers outside lock: INVALID_HANDLE_VALUE blocks until in-flight
+    // callback completes, then context is freed — must not hold trackedCs_ here.
+    if (deferredTimerToDelete) {
+        if (!DeleteTimerQueueTimer(timerQueue_, deferredTimerToDelete, INVALID_HANDLE_VALUE)) {
+            DWORD err = GetLastError();
+            if (err != ERROR_IO_PENDING) { shutdownWarnings_.fetch_add(1); }
+        }
+    }
+    if (persistentTimerToDelete) {
+        if (!DeleteTimerQueueTimer(timerQueue_, persistentTimerToDelete, INVALID_HANDLE_VALUE)) {
+            DWORD err = GetLastError();
+            if (err != ERROR_IO_PENDING) { shutdownWarnings_.fetch_add(1); }
         }
     }
 
@@ -2218,7 +2241,7 @@ bool EngineCore::IsTracked(DWORD pid) const {
 
 bool EngineCore::IsTargetName(const std::wstring& name) const {
     CSLockGuard lock(targetCs_);
-    return targetSet_.find(ToLower(name)) != targetSet_.end();
+    return engine_logic::IsTargetProcess(ToLower(name), targetSet_);
 }
 
 bool EngineCore::IsTrackedParent(DWORD parentPid) const {

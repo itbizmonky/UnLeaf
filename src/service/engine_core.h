@@ -7,6 +7,7 @@
 #include "../common/logger.h"
 #include "process_monitor.h"
 #include "../common/registry_manager.h"
+#include "../engine/engine_logic.h"
 #include <tlhelp32.h>
 #include <map>
 #include <set>
@@ -24,12 +25,8 @@
 
 namespace unleaf {
 
-// Process monitoring phase - Event-Driven Adaptive Phase Control
-enum class ProcessPhase {
-    AGGRESSIVE,   // Startup: One-shot SET + deferred verification (3s)
-    STABLE,       // Steady-state: Event-driven only (no active polling)
-    PERSISTENT    // Stubborn EcoQoS: SET @ 5s interval
-};
+// Process monitoring phase — imported from engine_logic (pure C++ module)
+using ProcessPhase = engine_logic::ProcessPhase;
 
 // Enforcement request type (queued from ETW callbacks and timers)
 enum class EnforcementRequestType : uint8_t {
@@ -292,7 +289,10 @@ private:
     void ScheduleDeferredVerification(DWORD pid, uint8_t step);
 
     // Cancel all timers for a process (cleanup)
-    void CancelProcessTimers(TrackedProcess& tp);
+    // timersToDelete / ctxToDelete are accumulator vectors; deletion happens outside lock
+    void CancelProcessTimers(TrackedProcess& tp,
+                             std::vector<HANDLE>& timersToDelete,
+                             std::vector<DeferredVerifyContext*>& ctxToDelete);
 
     // Start persistent enforcement timer
     void StartPersistentTimer(DWORD pid);
@@ -534,6 +534,15 @@ private:
     // Config monitoring counters
     std::atomic<uint32_t> configChangeDetected_{0};
     std::atomic<uint32_t> configReloadCount_{0};
+
+    // Engine policy (aggregates timing constants for engine_logic pure functions)
+    engine_logic::EnginePolicy policy_{
+        VIOLATION_THRESHOLD,
+        static_cast<uint64_t>(ECOQOS_CACHE_DURATION),
+        static_cast<uint32_t>(DEFERRED_VERIFY_1),
+        static_cast<uint32_t>(DEFERRED_VERIFY_2),
+        static_cast<uint32_t>(DEFERRED_VERIFY_FINAL)
+    };
 
     // === Event-Driven Timing Constants ===
 
