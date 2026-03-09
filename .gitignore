@@ -1,0 +1,33 @@
+# --- Ignore Everything by Default ---
+*
+
+# --- Un-ignore (Allowlist) essential directories and files ---
+!*/
+!.gitignore
+!CMakeLists.txt
+!LICENSE
+!README.md
+!README_EN.md
+!CHANGELOG.md
+!BUILD.md
+!docs/Engine_Specification.md
+!docs/GitHub_CI_Operation.md
+!resources/service.rc
+!resources/app_icon.ico
+!src/common/**
+!src/service/**
+!src/engine/**
+!tests/**
+!.github/workflows/build.yml
+
+# --- Re-ignore specific subdirectories if needed (Safety Net) ---
+build/
+dist/
+scripts/
+.claude/
+out/
+bin/
+obj/
+.vs/
+\#BACKUP/
+BACKUP/
