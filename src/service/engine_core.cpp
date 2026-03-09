@@ -173,9 +173,21 @@ bool EngineCore::Initialize(const std::wstring& baseDir) {
         }
 
         // Log detected version
+        wchar_t osName[16];
+        if (winVersion_.major >= 11) {
+            // Windows 12 以降で major が繰り上がった場合は major.minor をそのまま表示
+            swprintf_s(osName, L"%lu.%lu", winVersion_.major, winVersion_.minor);
+        } else if (winVersion_.isWindows11OrLater) {
+            // major=10 だが build >= 22000 → Windows 11
+            wcscpy_s(osName, L"11");
+        } else {
+            // build < 22000 → Windows 10
+            wcscpy_s(osName, L"10");
+        }
+
         wchar_t verBuf[128];
-        swprintf_s(verBuf, L"Engine: Windows %lu.%lu (Build %lu) - %s",
-                   winVersion_.major, winVersion_.minor, winVersion_.build,
+        swprintf_s(verBuf, L"Engine: Windows %s (Build %lu) - %s",
+                   osName, winVersion_.build,
                    winVersion_.isWindows11OrLater ? L"Full EcoQoS support" : L"Limited EcoQoS (Win10 compatibility mode)");
         LOG_INFO(verBuf);
     }

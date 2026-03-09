@@ -307,6 +307,7 @@ UnLeaf/
 - `DeleteTimerQueueTimer` を `trackedCs_` 取得前に移動し、ロック保持中の呼び出しを完全排除 (全5箇所)
 - `DrawButton` の GDI オブジェクト復元処理を修正 (`SelectObject` で旧フォントを明示的に復元)
 - `ToggleSubclassProc` に null チェックを追加
+- Windows バージョン表示修正: Windows 11 環境でログが `Windows 10.0` と誤表示されていた問題を修正。ビルド閾値 (Build >= 22000) で Windows 11 を正しく判定し、将来の Windows 12 (major >= 11) には major.minor をそのまま表示
 
 **アーキテクチャ改善**
 - エンジン決定ロジックを `src/engine/engine_logic` に分離 (Win32 非依存の純粋 C++ モジュール)

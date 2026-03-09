@@ -86,6 +86,7 @@ UnLeaf/
 ### v1.0.1 (2026-03-09)
 
 - Bug fixes: GDI resource restore, lock safety improvements, null check
+- Fix: Windows version log display corrected — Windows 11 now shows `Windows 11 (Build XXXXX)` instead of `Windows 10.0 (Build XXXXX)` (build threshold >= 22000; major fallback for future Windows 12+)
 - Architecture: `engine_logic` module extraction, `EnginePolicy` struct
 - Unit tests: 72 → 104 cases
 - CI/CD: GitHub Actions integration

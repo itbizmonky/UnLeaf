@@ -10,6 +10,7 @@ All notable changes to UnLeaf will be documented in this file.
 - `DeleteTimerQueueTimer` moved before `trackedCs_` acquisition to eliminate lock-held invocation (all 5 sites)
 - `DrawButton` GDI object restore fixed: old font now explicitly restored via `SelectObject`
 - `ToggleSubclassProc` null check added
+- Windows version log display corrected: Windows 11 now shows `Windows 11 (Build XXXXX)` instead of `Windows 10.0 (Build XXXXX)` — hybrid detection (build threshold `>= 22000` for major=10, major fallback for Windows 12+)
 
 ### Added
 - Engine decision logic extracted to `src/engine/engine_logic` (pure C++, no Win32 dependency)
