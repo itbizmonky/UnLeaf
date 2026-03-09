@@ -13,6 +13,7 @@
 !resources/service.rc
 !src/common/**
 !src/service/**
+!tests/**
 !.github/workflows/build.yml
 
 # --- Re-ignore specific subdirectories if needed (Safety Net) ---
