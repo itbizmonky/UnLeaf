@@ -11,6 +11,7 @@
 !docs/Engine_Specification.md
 !docs/GitHub_CI_Operation.md
 !resources/service.rc
+!resources/app_icon.ico
 !src/common/**
 !src/service/**
 !src/engine/**
