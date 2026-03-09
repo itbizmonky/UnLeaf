@@ -66,7 +66,7 @@ Windowsカーネルの **ETW (Event Tracing for Windows)** と直接連携する
 
 ソースコードをビルドする必要はありません。直感的なUIですぐに使い始めることができます。
 1. Releases ページにアクセスします。
-2. 最新の UnLeaf_v1.x.x_Final.zip をダウンロードし、任意のフォルダに解凍します。
+2. 最新の UnLeaf_v1.x.x.zip をダウンロードし、任意のフォルダに解凍します。
 3. `UnLeaf_Manager.exe` を実行します（※初回のみ、サービス登録のために管理者権限の確認ダイアログが出ます）。
 4. 最適化したいアプリ（例: discord.exe）をリストに追加し、「Start Service」を押すだけです。
 5. あとはManagerを閉じても、不可視のエンジンが永遠にあなたのPCを保護し続けます。
@@ -262,7 +262,7 @@ UnLeaf は 24/7/365 常駐サービスとして設計されており、以下の
 cmake -B build -G "Visual Studio 17 2022" -A x64
 
 # Release ビルド
-git clone [https://github.com/itbizmonky/UnLeaf.git](https://github.com/itbizmonky/UnLeaf.git)
+git clone https://github.com/itbizmonky/UnLeaf.git
 cd UnLeaf
 mkdir build
 cd build
@@ -276,17 +276,25 @@ cmake --build . --config Release
 
 ```
 UnLeaf/
+├── .github/
+│   └── workflows/
+│       └── build.yml            # GitHub Actions CI
+├── CHANGELOG.md                 # 更新履歴
 ├── CMakeLists.txt               # OSS用動的ビルドスクリプト
 ├── LICENSE                      # MITライセンス
-├── README.md                    # 本ファイル
-├── README_EN.md                 # 英語版ドキュメント
+├── README.md / README_EN.md
 ├── docs/
 │   └── Engine_Specification.md  # エンジンの詳細な技術仕様書
 ├── resources/
 │   └── service.rc               # サービス用リソースファイル
-└── src/
-    ├── common/                  # 共通ユーティリティ (高速ロガー、IPC通信、レジストリ管理)
-    └── service/                 # コアエンジン本体 (ETW監視、サービス制御)
+├── src/
+│   ├── common/                  # 共通ユーティリティ (ロガー、設定、レジストリ管理)
+│   ├── engine/                  # エンジン決定ロジック (Win32 非依存・純粋 C++)
+│   │   ├── engine_logic.*       # フェーズ遷移・EcoQoS 適用判定 (5 関数)
+│   │   └── engine_policy.h      # タイミング定数集約 (EnginePolicy 構造体)
+│   ├── service/                 # コアエンジン本体 (ETW 監視、サービス制御)
+│   └── manager/                 # Manager UI (クローズドソース・ビルド対象外)
+└── tests/                       # ユニットテスト (104 件 / 全 PASS)
 ```
 
 ---

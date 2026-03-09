@@ -24,7 +24,7 @@ Most traditional process optimization tools (like Process Lasso) rely on a **"Po
 If you just want to use the tool with its graphical interface, you **do not** need to build it from the source.
 
 1. Go to the [Releases](../../releases) page.
-2. Download the latest `UnLeaf_v1.x.x_Final.zip`.
+2. Download the latest `UnLeaf_v1.x.x.zip`.
 3. Extract the folder and run `UnLeaf_Manager.exe`. (Admin privileges required for the initial service installation).
 4. Add your favorite apps to the target list, click "Start Service", and let UnLeaf handle the rest completely in the background.
 
@@ -41,12 +41,44 @@ UnLeaf embraces an **Open Core Model**. The core engine (`UnLeaf_Service`) is co
 Clone the repository and build using standard CMake commands. The `CMakeLists.txt` is dynamically configured to build only the OSS components if the Manager UI is not present.
 
 ```powershell
-git clone [https://github.com/itbizmonky/UnLeaf.git](https://github.com/itbizmonky/UnLeaf.git)
+git clone https://github.com/itbizmonky/UnLeaf.git
 cd UnLeaf
 mkdir build
 cd build
 cmake ..
 cmake --build . --config Release
+```
+
+### Run Tests
+
+```powershell
+ctest --test-dir build -C Release --output-on-failure
+# Expected: 104/104 tests passed
+```
+
+## Source Code Structure
+
+```
+UnLeaf/
+├── .github/
+│   └── workflows/
+│       └── build.yml            # GitHub Actions CI
+├── CHANGELOG.md
+├── CMakeLists.txt               # OSS dynamic build script
+├── LICENSE                      # MIT License
+├── README.md / README_EN.md
+├── docs/
+│   └── Engine_Specification.md  # Detailed engine technical specification
+├── resources/
+│   └── service.rc               # Service resource file
+├── src/
+│   ├── common/                  # Shared utilities (logger, config, registry management)
+│   ├── engine/                  # Engine decision logic (Win32-independent, pure C++)
+│   │   ├── engine_logic.*       # Phase transitions & EcoQoS enforcement (5 functions)
+│   │   └── engine_policy.h      # Timing constants (EnginePolicy struct)
+│   ├── service/                 # Core engine (ETW monitoring, service control)
+│   └── manager/                 # Manager UI (closed-source, not built by OSS CMake)
+└── tests/                       # Unit tests (104 cases / all PASS)
 ```
 
 ## Changelog
