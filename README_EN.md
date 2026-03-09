@@ -1,5 +1,7 @@
 [English](README_EN.md) | [日本語](README.md)
 
+[![Build](https://github.com/itbizmonky/UnLeaf/actions/workflows/build.yml/badge.svg)](https://github.com/itbizmonky/UnLeaf/actions/workflows/build.yml)
+
 # 🍃 UnLeaf - The Zero-Overhead EcoQoS Optimizer
 
 **UnLeaf** is a hyper-optimized, event-driven background service for Windows 11 and 10 that surgically disables **EcoQoS (Efficiency Mode)** and Power Throttling for your specified applications. 
@@ -45,3 +47,24 @@ mkdir build
 cd build
 cmake ..
 cmake --build . --config Release
+```
+
+## v1.0.1 Updates
+
+- Added GitHub Actions CI
+- Automated Windows build using CMake
+- Automated unit test execution via CTest
+- Added CI status badge
+
+## Changelog
+
+### v1.0.1 (2026-03-09)
+
+- Bug fixes: GDI resource restore, lock safety improvements, null check
+- Architecture: `engine_logic` module extraction, `EnginePolicy` struct
+- Unit tests: 72 → 104 cases
+- CI/CD: GitHub Actions integration
+
+### v1.0.0 (2026-03-06)
+
+Initial release.

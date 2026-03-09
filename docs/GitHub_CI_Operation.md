@@ -1,7 +1,17 @@
 # UnLeaf GitHub CI 運用手順書
 
-Version: v1.00
+Version: v1.0.1
 最終更新: 2026-03-09
+
+---
+
+## CI Purpose
+
+GitHub Actions CI は以下を保証する。
+
+- **Automatic build verification**: push / pull_request のたびに Windows 環境でビルドを実行し、コンパイルエラーを即時検出する
+- **Automatic unit test execution**: ctest により 104 件のユニットテストをすべて自動実行する
+- **Prevention of broken commits**: ビルド失敗・テスト失敗のコミットが main ブランチに混入することを防ぐ
 
 ---
 

@@ -15,6 +15,14 @@ jobs:
       - name: Setup CMake
         uses: lukka/get-cmake@latest
 
+      - name: Restore build cache
+        uses: actions/cache@v4
+        with:
+          path: build/
+          key: ${{ runner.os }}-cmake-${{ hashFiles('CMakeLists.txt') }}
+          restore-keys: |
+            ${{ runner.os }}-cmake-
+
       - name: Configure
         run: cmake -S . -B build
 
@@ -22,4 +30,4 @@ jobs:
         run: cmake --build build --config Release
 
       - name: Run tests
-        run: ctest --test-dir build -C Release --output-on-failure
+        run: ctest --test-dir build -C Release --output-on-failure -j 4

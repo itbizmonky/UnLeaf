@@ -1,5 +1,7 @@
 [English](README_EN.md) | [日本語](README.md)
 
+[![Build](https://github.com/itbizmonky/UnLeaf/actions/workflows/build.yml/badge.svg)](https://github.com/itbizmonky/UnLeaf/actions/workflows/build.yml)
+
 # 🍃 UnLeaf - The Zero-Overhead EcoQoS Optimizer
 
 **UnLeaf**は、Windows 11 / 10 環境において、指定したアプリケーションの「EcoQoS（効率モード）」と「電力スロットリング」をOSの深淵から完全に無効化する、究極のバックグラウンド最適化ツールです。
@@ -309,3 +311,10 @@ UnLeaf/
 ### v1.0.0 (2026-03-06)
 
 初回リリース。
+
+## v1.0.1 Updates
+
+- Added GitHub Actions CI
+- Automated Windows build using CMake
+- Automated unit test execution via CTest
+- Added CI status badge
