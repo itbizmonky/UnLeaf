@@ -13,6 +13,7 @@
 !resources/service.rc
 !src/common/**
 !src/service/**
+!src/engine/**
 !tests/**
 !.github/workflows/build.yml
 
