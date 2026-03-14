@@ -188,6 +188,7 @@ bool UnLeafConfig::ParseIni(const std::string& contentIn) {
         targets_.clear();
         logLevel_ = LogLevel::LOG_INFO;
         logEnabled_ = true;
+        managerWindowState_ = ManagerWindowState{};
 
         std::istringstream stream(content);
         std::string line;
@@ -214,7 +215,7 @@ bool UnLeafConfig::ParseIni(const std::string& contentIn) {
                               [](unsigned char c) { return static_cast<char>(::tolower(c)); });
 
                 // Warn on unknown sections
-                if (currentSection != "targets" && currentSection != "logging") {
+                if (currentSection != "targets" && currentSection != "logging" && currentSection != "manager") {
                     // Convert section name to wide string for logging
                     std::wstring wideSection(currentSection.begin(), currentSection.end());
                     LOG_ALERT(L"Config: Unknown section ignored: [" + wideSection + L"]");
@@ -294,6 +295,20 @@ bool UnLeafConfig::ParseIni(const std::string& contentIn) {
                     LOG_DEBUG(L"Config: Unknown key in [Logging]: " + wideKey);
                 }
             }
+            else if (currentSection == "manager") {
+                try {
+                    if      (key == "WindowX")      managerWindowState_.x         = std::stoi(value);
+                    else if (key == "WindowY")      managerWindowState_.y         = std::stoi(value);
+                    else if (key == "WindowWidth")  managerWindowState_.width     = std::stoi(value);
+                    else if (key == "WindowHeight") managerWindowState_.height    = std::stoi(value);
+                    else if (key == "Maximized")    managerWindowState_.maximized = (value == "1");
+                } catch (...) { /* 破損値は無視 */ }
+                // x/y >= -32768: 極端な負値での誤復元を防ぐ
+                if (managerWindowState_.width > 0 && managerWindowState_.height > 0 &&
+                    managerWindowState_.x >= -32768 && managerWindowState_.y >= -32768) {
+                    managerWindowState_.valid = true;
+                }
+            }
         }
 
         return true;
@@ -329,6 +344,17 @@ std::string UnLeafConfig::SerializeIni() const {
     oss << "; Log output: 1=enabled, 0=disabled\n";
     oss << "LogEnabled=" << (logEnabled_ ? "1" : "0") << "\n";
     oss << "\n";
+
+    // Manager section (window position/state — written only after first save)
+    if (managerWindowState_.valid) {
+        oss << "[Manager]\n";
+        oss << "WindowX="      << managerWindowState_.x         << "\n";
+        oss << "WindowY="      << managerWindowState_.y         << "\n";
+        oss << "WindowWidth="  << managerWindowState_.width     << "\n";
+        oss << "WindowHeight=" << managerWindowState_.height    << "\n";
+        oss << "Maximized="    << (managerWindowState_.maximized ? "1" : "0") << "\n";
+        oss << "\n";
+    }
 
     // Targets section
     oss << "[Targets]\n";
@@ -494,6 +520,16 @@ void UnLeafConfig::SetChangeCallback(ConfigChangeCallback callback) {
 void UnLeafConfig::SetLogEnabled(bool enabled) {
     CSLockGuard lock(cs_);
     logEnabled_ = enabled;
+}
+
+ManagerWindowState UnLeafConfig::GetManagerWindowState() const {
+    CSLockGuard lock(cs_);
+    return managerWindowState_;
+}
+
+void UnLeafConfig::SetManagerWindowState(const ManagerWindowState& state) {
+    CSLockGuard lock(cs_);
+    managerWindowState_ = state;
 }
 
 } // namespace unleaf

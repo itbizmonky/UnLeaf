@@ -83,6 +83,12 @@ UnLeaf/
 
 ## Changelog
 
+### v1.0.2 (2026-03-13)
+
+- **ETW reliability**: Explicit buffer configuration (64KB, 4–32 buffers, real-time mode); zombie session cleanup before `StartTraceW`; lost event detection via `EVENT_TRACE_TYPE_LOST_EVENT` opcode
+- **Window state persistence**: Position and size saved to `UnLeaf.ini [Manager]` section; off-screen guard on restore
+- **Live log fix**: `GetWindowTextLengthW` replaced with `EM_GETTEXTLENGTHEX(GTL_NUMCHARS)` to fix first-line color skew caused by `\r\n` expansion
+
 ### v1.0.1 (2026-03-09)
 
 - Bug fixes: GDI resource restore, lock safety improvements, null check

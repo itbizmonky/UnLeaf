@@ -5,6 +5,11 @@
 #include <sstream>
 #include <tdh.h>
 
+// Fallback: EVENT_TRACE_TYPE_LOST_EVENT may not be defined in all SDK versions
+#ifndef EVENT_TRACE_TYPE_LOST_EVENT
+static constexpr UCHAR EVENT_TRACE_TYPE_LOST_EVENT = 0x20;
+#endif
+
 #pragma comment(lib, "tdh.lib")
 
 namespace unleaf {
@@ -31,6 +36,7 @@ ProcessMonitor::ProcessMonitor()
     , stopRequested_(false)
     , lastEventTime_(0)
     , eventCount_(0)
+    , lostEventCount_(0)
     , sessionHealthy_(false) {
 
     // Generate unique session name
@@ -63,6 +69,11 @@ bool ProcessMonitor::Start(ProcessStartCallback processCallback, ThreadStartCall
     properties->LogFileMode = EVENT_TRACE_REAL_TIME_MODE;
     properties->LoggerNameOffset = sizeof(EVENT_TRACE_PROPERTIES);
     properties->LogFileNameOffset = 0;
+    // ETW session buffer configuration (BufferSize must be a multiple of 4KB)
+    properties->BufferSize     = ETW_BUFFER_SIZE_KB;
+    properties->MinimumBuffers = ETW_MIN_BUFFERS;
+    properties->MaximumBuffers = ETW_MAX_BUFFERS;
+    properties->FlushTimer     = ETW_FLUSH_TIMER;
 
     // Stop any existing session with the same name
     ControlTraceW(0, sessionName_.c_str(), properties, EVENT_TRACE_CONTROL_STOP);
@@ -181,6 +192,14 @@ void ProcessMonitor::ConsumerThread() {
 
 void WINAPI ProcessMonitor::EventRecordCallback(PEVENT_RECORD pEvent) {
     if (!instance_ || instance_->stopRequested_.load()) {
+        return;
+    }
+
+    // Detect ETW buffer overflow: lost event notification
+    // ETW uses Opcode EVENT_TRACE_TYPE_LOST_EVENT (0x20) to signal dropped events
+    if (pEvent->EventHeader.EventDescriptor.Opcode == EVENT_TRACE_TYPE_LOST_EVENT) {
+        uint32_t count = ++instance_->lostEventCount_;
+        LOG_ALERT(L"[ETW] Lost event detected (buffer overflow). Total lost: " + std::to_wstring(count));
         return;
     }
 

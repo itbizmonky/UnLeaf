@@ -4,6 +4,19 @@ All notable changes to UnLeaf will be documented in this file.
 
 ---
 
+## [1.0.2] - 2026-03-13
+
+### Fixed
+- ETW buffer configuration made explicit: `BufferSize=64KB`, `MinimumBuffers=4`, `MaximumBuffers=32`, `FlushTimer=0` (real-time consumer mode)
+- ETW zombie session cleanup: stale sessions with the same name are stopped before `StartTraceW` to prevent `ERROR_ALREADY_EXISTS`
+- `RefreshLogDisplay`: initial `endPos` now obtained via `EM_GETTEXTLENGTHEX(GTL_NUMCHARS)` instead of `GetWindowTextLengthW` — eliminates per-line position skew caused by `\r\n` expansion
+
+### Added
+- ETW lost event detection: `EVENT_TRACE_TYPE_LOST_EVENT` opcode handled in callback; LOG_ALERT emitted with cumulative count on buffer overflow
+- Window position and size persistence: saved to `[Manager]` section of `UnLeaf.ini` on `WM_DESTROY`, restored on startup with off-screen guard (`MonitorFromPoint(MONITOR_DEFAULTTONULL)`)
+
+---
+
 ## [1.0.1] - 2026-03-09
 
 ### Fixed

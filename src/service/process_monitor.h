@@ -47,6 +47,9 @@ public:
     // Get total event count (for diagnostics)
     uint32_t GetEventCount() const { return eventCount_.load(); }
 
+    // Get lost event count (non-zero indicates ETW buffer pressure)
+    uint32_t GetLostEventCount() const { return lostEventCount_.load(); }
+
     bool IsSessionHealthy() const { return sessionHealthy_.load(); }
 
 private:
@@ -72,6 +75,7 @@ private:
 
     std::atomic<ULONGLONG> lastEventTime_;    // Last event received timestamp
     std::atomic<uint32_t> eventCount_;        // Total events received
+    std::atomic<uint32_t> lostEventCount_;    // ETW lost event count (buffer overflow indicator)
     std::atomic<bool> sessionHealthy_;        // Session health flag
 
     // Callbacks
@@ -87,6 +91,13 @@ private:
     // ETW session properties buffer
     static constexpr size_t PROPERTIES_BUFFER_SIZE =
         sizeof(EVENT_TRACE_PROPERTIES) + (256 * sizeof(wchar_t)) * 2;
+
+    // ETW session buffer configuration
+    // BufferSize must be a multiple of 4KB
+    static constexpr ULONG ETW_BUFFER_SIZE_KB = 64;   // KB per buffer
+    static constexpr ULONG ETW_MIN_BUFFERS    = 4;    // Minimum buffer count
+    static constexpr ULONG ETW_MAX_BUFFERS    = 32;   // Maximum buffer count (Microsoft: CPU*2)
+    static constexpr ULONG ETW_FLUSH_TIMER    = 0;    // 0 = disabled; real-time consumer pulls directly
 };
 
 } // namespace unleaf

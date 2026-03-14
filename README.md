@@ -301,6 +301,17 @@ UnLeaf/
 
 ## 更新履歴 (Changelog)
 
+### v1.0.2 (2026-03-13)
+
+**ETW 信頼性強化**
+- ETW バッファ設定を明示化: `BufferSize=64KB`, `MinimumBuffers=4`, `MaximumBuffers=32`, `FlushTimer=0`
+- ETW ゾンビセッション自動クリーンアップ: `StartTraceW` 前に同名の残留セッションを停止 (`ERROR_ALREADY_EXISTS` 防止)
+- ETW ロストイベント検知: `EVENT_TRACE_TYPE_LOST_EVENT` を検知して `LOG_ALERT` + 累積カウント記録
+
+**Manager 改善**
+- ウィンドウ位置・サイズ永続化: `UnLeaf.ini [Manager]` セクションに保存、オフスクリーン復元ガード付き
+- ライブログ着色バグ修正: `GetWindowTextLengthW` を `EM_GETTEXTLENGTHEX(GTL_NUMCHARS)` に置換し、RichEdit 内部位置との不一致による行頭着色漏れを解消
+
 ### v1.0.1 (2026-03-09)
 
 **バグ修正・安全性強化**

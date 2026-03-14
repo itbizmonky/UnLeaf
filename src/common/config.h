@@ -13,6 +13,15 @@ class ConfigParserTest;
 
 namespace unleaf {
 
+struct ManagerWindowState {
+    int  x         = -1;    // -1 = 未保存 (起動時に中央配置)
+    int  y         = -1;
+    int  width     = 0;
+    int  height    = 0;
+    bool maximized = false;
+    bool valid     = false; // false = 保存データなし
+};
+
 class UnLeafConfig {
 public:
     // Singleton access
@@ -26,6 +35,10 @@ public:
 
     // Save current configuration to file
     bool Save();
+
+    // Manager window state (position/size persistence)
+    ManagerWindowState GetManagerWindowState() const;
+    void SetManagerWindowState(const ManagerWindowState& state);
 
     // Getters
     const std::vector<TargetProcess>& GetTargets() const { return targets_; }
@@ -75,6 +88,7 @@ private:
     std::vector<TargetProcess> targets_;
     LogLevel logLevel_;
     bool logEnabled_;
+    ManagerWindowState managerWindowState_;
 
     mutable CriticalSection cs_;
     uint64_t lastModTime_;
