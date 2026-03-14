@@ -9,6 +9,7 @@
 #include <iomanip>
 #include <ctime>
 #include <chrono>
+#include <functional>
 
 namespace unleaf {
 
@@ -37,6 +38,9 @@ public:
 
     void SetEnabled(bool enabled);
     bool IsEnabled() const;
+
+    // Register UI callback (called after each log write; use PostMessage inside, not direct UI calls)
+    void SetUICallback(std::function<void(const std::wstring&)> cb);
 
     // Enable/disable console output (for debug builds)
     void SetConsoleOutput(bool enabled);
@@ -76,6 +80,9 @@ private:
 
     // Console handle for debug output
     HANDLE consoleHandle_;
+
+    // UI callback: called after each log write (Manager process only; nullptr in Service)
+    std::function<void(const std::wstring&)> uiCallback_;
 
     void Log(LogLevel level, const wchar_t* levelStr, const std::wstring& message);
 };

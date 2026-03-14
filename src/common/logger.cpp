@@ -103,6 +103,19 @@ void LightweightLogger::Log(LogLevel level, const wchar_t* levelStr, const std::
     std::wstring formatted = L"[" + timestamp + L"] [" + levelStr + L"] " + message;
 
     WriteMessage(formatted);
+
+    // Notify UI callback (Manager process only; copy under lock to avoid races with SetUICallback)
+    std::function<void(const std::wstring&)> cbCopy;
+    {
+        CSLockGuard lock(cs_);
+        cbCopy = uiCallback_;
+    }
+    if (cbCopy) cbCopy(formatted);
+}
+
+void LightweightLogger::SetUICallback(std::function<void(const std::wstring&)> cb) {
+    CSLockGuard lock(cs_);
+    uiCallback_ = std::move(cb);
 }
 
 void LightweightLogger::Error(const std::wstring& message) {
