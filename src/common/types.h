@@ -42,7 +42,7 @@
 namespace unleaf {
 
 // Version Information
-constexpr const wchar_t* VERSION = L"1.0.1";
+constexpr const wchar_t* VERSION = L"1.0.2";
 
 constexpr DWORD WINDOWS_11_BUILD_THRESHOLD = 22000;  // Windows 11 starts at build 22000
 

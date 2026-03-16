@@ -162,6 +162,7 @@ if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/src/manager")
         src/manager/main_window.cpp
         src/manager/service_controller.cpp
         src/manager/ipc_client.cpp
+        src/manager/log_engine.cpp
     )
 
     set(MANAGER_HEADERS

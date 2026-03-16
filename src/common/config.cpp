@@ -189,6 +189,7 @@ bool UnLeafConfig::ParseIni(const std::string& contentIn) {
         logLevel_ = LogLevel::LOG_INFO;
         logEnabled_ = true;
         managerWindowState_ = ManagerWindowState{};
+        logColumnOrder_     = LogColumnOrder{};
 
         std::istringstream stream(content);
         std::string line;
@@ -297,11 +298,14 @@ bool UnLeafConfig::ParseIni(const std::string& contentIn) {
             }
             else if (currentSection == "manager") {
                 try {
-                    if      (key == "WindowX")      managerWindowState_.x         = std::stoi(value);
-                    else if (key == "WindowY")      managerWindowState_.y         = std::stoi(value);
-                    else if (key == "WindowWidth")  managerWindowState_.width     = std::stoi(value);
-                    else if (key == "WindowHeight") managerWindowState_.height    = std::stoi(value);
-                    else if (key == "Maximized")    managerWindowState_.maximized = (value == "1");
+                    if      (key == "WindowX")          managerWindowState_.x         = std::stoi(value);
+                    else if (key == "WindowY")          managerWindowState_.y         = std::stoi(value);
+                    else if (key == "WindowWidth")      managerWindowState_.width     = std::stoi(value);
+                    else if (key == "WindowHeight")     managerWindowState_.height    = std::stoi(value);
+                    else if (key == "Maximized")        managerWindowState_.maximized = (value == "1");
+                    else if (key == "LogColumnOrder0")  logColumnOrder_.order[0]      = std::stoi(value);
+                    else if (key == "LogColumnOrder1")  logColumnOrder_.order[1]      = std::stoi(value);
+                    else if (key == "LogColumnOrder2")  logColumnOrder_.order[2]      = std::stoi(value);
                 } catch (...) { /* 破損値は無視 */ }
                 // x/y >= -32768: 極端な負値での誤復元を防ぐ
                 if (managerWindowState_.width > 0 && managerWindowState_.height > 0 &&
@@ -345,14 +349,22 @@ std::string UnLeafConfig::SerializeIni() const {
     oss << "LogEnabled=" << (logEnabled_ ? "1" : "0") << "\n";
     oss << "\n";
 
-    // Manager section (window position/state — written only after first save)
-    if (managerWindowState_.valid) {
+    // Manager section (window state + column order)
+    const bool hasColOrder  = (logColumnOrder_.order[0] >= 0 ||
+                               logColumnOrder_.order[1] >= 0 ||
+                               logColumnOrder_.order[2] >= 0);
+    if (managerWindowState_.valid || hasColOrder) {
         oss << "[Manager]\n";
-        oss << "WindowX="      << managerWindowState_.x         << "\n";
-        oss << "WindowY="      << managerWindowState_.y         << "\n";
-        oss << "WindowWidth="  << managerWindowState_.width     << "\n";
-        oss << "WindowHeight=" << managerWindowState_.height    << "\n";
-        oss << "Maximized="    << (managerWindowState_.maximized ? "1" : "0") << "\n";
+        if (managerWindowState_.valid) {
+            oss << "WindowX="      << managerWindowState_.x         << "\n";
+            oss << "WindowY="      << managerWindowState_.y         << "\n";
+            oss << "WindowWidth="  << managerWindowState_.width     << "\n";
+            oss << "WindowHeight=" << managerWindowState_.height    << "\n";
+            oss << "Maximized="    << (managerWindowState_.maximized ? "1" : "0") << "\n";
+        }
+        if (logColumnOrder_.order[0] >= 0) oss << "LogColumnOrder0=" << logColumnOrder_.order[0] << "\n";
+        if (logColumnOrder_.order[1] >= 0) oss << "LogColumnOrder1=" << logColumnOrder_.order[1] << "\n";
+        if (logColumnOrder_.order[2] >= 0) oss << "LogColumnOrder2=" << logColumnOrder_.order[2] << "\n";
         oss << "\n";
     }
 
@@ -530,6 +542,16 @@ ManagerWindowState UnLeafConfig::GetManagerWindowState() const {
 void UnLeafConfig::SetManagerWindowState(const ManagerWindowState& state) {
     CSLockGuard lock(cs_);
     managerWindowState_ = state;
+}
+
+LogColumnOrder UnLeafConfig::GetLogColumnOrder() const {
+    CSLockGuard lock(cs_);
+    return logColumnOrder_;
+}
+
+void UnLeafConfig::SetLogColumnOrder(const LogColumnOrder& order) {
+    CSLockGuard lock(cs_);
+    logColumnOrder_ = order;
 }
 
 } // namespace unleaf

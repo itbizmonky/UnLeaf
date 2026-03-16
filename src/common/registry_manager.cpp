@@ -5,7 +5,6 @@
 #include "registry_manager.h"
 #include <sstream>
 #include <fstream>
-#include <algorithm>
 
 namespace unleaf {
 
@@ -123,7 +122,7 @@ bool RegistryPolicyManager::DeleteManifest() {
 }
 
 // ====================================================================
-// Registry Operations (migrated from registry_policy.cpp)
+// Registry Operations
 // ====================================================================
 
 std::wstring RegistryPolicyManager::ExtractFileName(const std::wstring& path) {

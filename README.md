@@ -144,9 +144,21 @@ Windows 10 (1709) で Power Throttling として導入された省電力 API で
 
 ```ini
 ; UnLeaf Configuration
+; Auto-generated - Do not edit while service is running
+
 [Logging]
+; Log level: ERROR, ALERT, INFO, DEBUG
 LogLevel=INFO
+; Log output: 1=enabled, 0=disabled
 LogEnabled=1
+
+[Manager]
+; ウィンドウ位置・サイズ (Manager UI が自動保存)
+WindowX=100
+WindowY=100
+WindowWidth=800
+WindowHeight=600
+Maximized=0
 
 [Targets]
 chrome.exe=1
@@ -301,7 +313,7 @@ UnLeaf/
 
 ## 更新履歴 (Changelog)
 
-### v1.0.2 (2026-03-13)
+### v1.0.2 (2026-03-16)
 
 **ETW 信頼性強化**
 - ETW バッファ設定を明示化: `BufferSize=64KB`, `MinimumBuffers=4`, `MaximumBuffers=32`, `FlushTimer=0`
@@ -310,7 +322,9 @@ UnLeaf/
 
 **Manager 改善**
 - ウィンドウ位置・サイズ永続化: `UnLeaf.ini [Manager]` セクションに保存、オフスクリーン復元ガード付き
-- ライブログ着色バグ修正: `GetWindowTextLengthW` を `EM_GETTEXTLENGTHEX(GTL_NUMCHARS)` に置換し、RichEdit 内部位置との不一致による行頭着色漏れを解消
+- ライブログ着色バグ修正: `GetWindowTextLengthW` を `EM_GETTEXTLENGTHEX(GTL_NUMCHARS)` に置換
+- **ライブログ刷新**: RichEdit を廃止し、仮想 ListView + Owner-Draw レンダラーに置換。自動スクロール停止・空白行・二重表示の複合不具合を根本解消
+- **Manager 操作ログ永続化**: LogEngine / LogQueue 基盤 + UICallback 登録機構を追加。Manager の UI 操作 (トグル切替・エラー等) をログファイルに記録
 
 ### v1.0.1 (2026-03-09)
 

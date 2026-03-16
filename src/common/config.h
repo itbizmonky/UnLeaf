@@ -22,6 +22,10 @@ struct ManagerWindowState {
     bool valid     = false; // false = 保存データなし
 };
 
+struct LogColumnOrder {
+    int order[3] = { -1, -1, -1 };  // -1 = 未保存 (デフォルト順序を使用)
+};
+
 class UnLeafConfig {
 public:
     // Singleton access
@@ -39,6 +43,10 @@ public:
     // Manager window state (position/size persistence)
     ManagerWindowState GetManagerWindowState() const;
     void SetManagerWindowState(const ManagerWindowState& state);
+
+    // LiveLog column order persistence
+    LogColumnOrder GetLogColumnOrder() const;
+    void SetLogColumnOrder(const LogColumnOrder& order);
 
     // Getters
     const std::vector<TargetProcess>& GetTargets() const { return targets_; }
@@ -89,6 +97,7 @@ private:
     LogLevel logLevel_;
     bool logEnabled_;
     ManagerWindowState managerWindowState_;
+    LogColumnOrder     logColumnOrder_;
 
     mutable CriticalSection cs_;
     uint64_t lastModTime_;

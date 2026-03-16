@@ -4,7 +4,7 @@ All notable changes to UnLeaf will be documented in this file.
 
 ---
 
-## [1.0.2] - 2026-03-13
+## [1.0.2] - 2026-03-16
 
 ### Fixed
 - ETW buffer configuration made explicit: `BufferSize=64KB`, `MinimumBuffers=4`, `MaximumBuffers=32`, `FlushTimer=0` (real-time consumer mode)
@@ -14,6 +14,8 @@ All notable changes to UnLeaf will be documented in this file.
 ### Added
 - ETW lost event detection: `EVENT_TRACE_TYPE_LOST_EVENT` opcode handled in callback; LOG_ALERT emitted with cumulative count on buffer overflow
 - Window position and size persistence: saved to `[Manager]` section of `UnLeaf.ini` on `WM_DESTROY`, restored on startup with off-screen guard (`MonitorFromPoint(MONITOR_DEFAULTTONULL)`)
+- Virtual ListView live log display: RichEdit replaced with a custom virtual ListView + Owner-Draw renderer; eliminates auto-scroll stall and blank-line artifacts under high log volume
+- `LogEngine` / `LogQueue`: new log management infrastructure in `src/manager/`; `LogQueue` accumulates log lines with thread-safe wake-up; `LogEngine` drives the log thread and dispatches lines to both the file logger and the UI via `UICallback` registration — resolves [LIVE-2] Manager operation log persistence
 
 ---
 

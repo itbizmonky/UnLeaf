@@ -100,7 +100,7 @@ void LightweightLogger::Log(LogLevel level, const wchar_t* levelStr, const std::
     if (static_cast<uint8_t>(level) > static_cast<uint8_t>(currentLevel_)) return;
 
     std::wstring timestamp = GetTimestamp();
-    std::wstring formatted = L"[" + timestamp + L"] [" + levelStr + L"] " + message;
+    std::wstring formatted = timestamp + L" " + levelStr + L" " + message;
 
     WriteMessage(formatted);
 
@@ -119,7 +119,7 @@ void LightweightLogger::SetUICallback(std::function<void(const std::wstring&)> c
 }
 
 void LightweightLogger::Error(const std::wstring& message) {
-    Log(LogLevel::LOG_ERROR, L"ERR ", message);
+    Log(LogLevel::LOG_ERROR, L"E", message);
 }
 
 void LightweightLogger::Error(const std::string& message) {
@@ -127,7 +127,7 @@ void LightweightLogger::Error(const std::string& message) {
 }
 
 void LightweightLogger::Alert(const std::wstring& message) {
-    Log(LogLevel::LOG_ALERT, L"ALRT", message);
+    Log(LogLevel::LOG_ALERT, L"A", message);
 }
 
 void LightweightLogger::Alert(const std::string& message) {
@@ -135,7 +135,7 @@ void LightweightLogger::Alert(const std::string& message) {
 }
 
 void LightweightLogger::Info(const std::wstring& message) {
-    Log(LogLevel::LOG_INFO, L"INFO", message);
+    Log(LogLevel::LOG_INFO, L"I", message);
 }
 
 void LightweightLogger::Info(const std::string& message) {
@@ -143,7 +143,7 @@ void LightweightLogger::Info(const std::string& message) {
 }
 
 void LightweightLogger::Debug(const std::wstring& message) {
-    Log(LogLevel::LOG_DEBUG, L"DEBG", message);
+    Log(LogLevel::LOG_DEBUG, L"D", message);
 }
 
 void LightweightLogger::Debug(const std::string& message) {
@@ -178,7 +178,7 @@ void LightweightLogger::CheckRotation() {
     // Get current file size
     LARGE_INTEGER fileSize;
     if (!GetFileSizeEx(fileHandle_, &fileSize)) {
-        Log(LogLevel::LOG_DEBUG, L"DEBG", L"Logger: CheckRotation - GetFileSizeEx failed");
+        Log(LogLevel::LOG_DEBUG, L"D",L"Logger: CheckRotation - GetFileSizeEx failed");
         return;
     }
 
@@ -207,10 +207,10 @@ void LightweightLogger::CheckRotation() {
 
         if (fileHandle_ != INVALID_HANDLE_VALUE) {
             if (deleteFailed) {
-                Log(LogLevel::LOG_DEBUG, L"DEBG", L"Logger: Rotation - backup delete failed");
+                Log(LogLevel::LOG_DEBUG, L"D",L"Logger: Rotation - backup delete failed");
             }
             if (moveFailed) {
-                Log(LogLevel::LOG_DEBUG, L"DEBG", L"Logger: Rotation - log rename failed");
+                Log(LogLevel::LOG_DEBUG, L"D",L"Logger: Rotation - log rename failed");
             }
         }
     }
@@ -218,14 +218,19 @@ void LightweightLogger::CheckRotation() {
 
 std::wstring LightweightLogger::GetTimestamp() const {
     auto now = std::chrono::system_clock::now();
+    auto ms  = std::chrono::duration_cast<std::chrono::milliseconds>(
+                   now.time_since_epoch()) % 1000;
     auto time = std::chrono::system_clock::to_time_t(now);
 
     std::tm tm_buf;
     localtime_s(&tm_buf, &time);
 
     wchar_t buffer[32];
-    wcsftime(buffer, 32, L"%Y/%m/%d %H:%M:%S", &tm_buf);
-    return std::wstring(buffer);
+    wcsftime(buffer, 32, L"%Y-%m-%d %H:%M:%S", &tm_buf);
+
+    wchar_t full[40];
+    swprintf_s(full, L"%s.%03d", buffer, static_cast<int>(ms.count()));
+    return std::wstring(full);
 }
 
 std::wstring LightweightLogger::Utf8ToWide(const std::string& str) const {
