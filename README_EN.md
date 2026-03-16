@@ -306,6 +306,7 @@ UnLeaf/
 │   │   └── engine_policy.h      # Timing constants (EnginePolicy struct)
 │   ├── service/                 # Core engine (ETW monitoring, service control)
 │   └── manager/                 # Manager UI (closed-source, not built by OSS CMake)
+│       ├── log_engine.h/cpp     # LogEngine / LogQueue (virtual ListView log infrastructure)
 └── tests/                       # Unit tests (104 cases / all PASS)
 ```
 

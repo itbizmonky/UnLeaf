@@ -150,6 +150,10 @@ void LightweightLogger::Debug(const std::string& message) {
     Debug(Utf8ToWide(message));
 }
 
+void LightweightLogger::Manager(const std::wstring& message) {
+    Log(LogLevel::LOG_INFO, L"M", message);
+}
+
 void LightweightLogger::WriteMessage(const std::wstring& formattedMessage) {
     CSLockGuard lock(cs_);
 

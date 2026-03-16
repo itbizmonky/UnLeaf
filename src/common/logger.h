@@ -32,6 +32,7 @@ public:
     void Info(const std::string& message);
     void Debug(const std::wstring& message);
     void Debug(const std::string& message);
+    void Manager(const std::wstring& message);
 
     void SetLogLevel(LogLevel level);
     LogLevel GetLogLevel() const { return currentLevel_; }
@@ -90,6 +91,7 @@ private:
 #define LOG_ERROR(msg) unleaf::LightweightLogger::Instance().Error(msg)
 #define LOG_ALERT(msg) unleaf::LightweightLogger::Instance().Alert(msg)
 #define LOG_INFO(msg)  unleaf::LightweightLogger::Instance().Info(msg)
-#define LOG_DEBUG(msg) unleaf::LightweightLogger::Instance().Debug(msg)
+#define LOG_DEBUG(msg)   unleaf::LightweightLogger::Instance().Debug(msg)
+#define LOG_MANAGER(msg) unleaf::LightweightLogger::Instance().Manager(msg)
 
 } // namespace unleaf

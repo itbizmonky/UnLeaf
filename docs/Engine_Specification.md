@@ -1077,12 +1077,14 @@ chrome.exe=C:\Program Files\Google\Chrome\Application\chrome.exe
 
 ### 11.1 ログレベル
 
-| レベル | 値 | ラベル | 用途 |
-|--------|-----|--------|------|
-| ERROR | 0 | `ERR ` | 常に出力。致命的エラー |
-| ALERT | 1 | `ALRT` | 警告。異常だが回復可能 |
-| INFO | 2 | `INFO` | 通常運用メッセージ (デフォルト) |
-| DEBUG | 3 | `DEBG` | 開発詳細。フェーズ遷移、エンフォース結果 |
+| レベル | 値 | ラベル文字 | 用途 |
+|--------|-----|-----------|------|
+| ERROR | 0 | `E` | 常に出力。致命的エラー |
+| ALERT | 1 | `A` | 警告。異常だが回復可能 |
+| INFO | 2 | `I` | 通常運用メッセージ (デフォルト) |
+| DEBUG | 3 | `D` | 開発詳細。フェーズ遷移、エンフォース結果 |
+
+> **Manager 専用ラベル**: `M` — `LightweightLogger::Manager()` / `LOG_MANAGER` マクロが使用。INFO レベルで出力される。Manager プロセス側の UI 操作ログ (UICallback 経由でログビューにもシアン色で表示) に使用。Service 側では使用しない。
 
 出力判定: `static_cast<uint8_t>(level) <= static_cast<uint8_t>(currentLevel_)`
 
@@ -1108,13 +1110,17 @@ chrome.exe=C:\Program Files\Google\Chrome\Application\chrome.exe
 ### 11.4 出力フォーマット
 
 ```
-[YYYY/MM/DD HH:MM:SS] [LEVL] メッセージ
+YYYY-MM-DD HH:MM:SS.mmm L メッセージ
 ```
+
+- タイムスタンプ: `localtime_s` + ミリ秒 (`%Y-%m-%d %H:%M:%S.mmm`)
+- ラベル文字 `L`: `E` / `A` / `I` / `D` / `M` の 1 文字
+- エンコーディング: UTF-8 (CRLF 改行)
 
 例:
 ```
-[2026/02/15 14:30:00] [INFO] EngineCore started: 3 targets, NORMAL mode, Event-Driven, SafetyNet=10s
-[2026/02/15 14:30:01] [DEBG] Optimized: [TARGET] chrome.exe (PID: 1234) Child=0
+2026-02-15 14:30:00.123 I EngineCore started: 3 targets, Event-Driven, SafetyNet=10s
+2026-02-15 14:30:01.456 D [TARGET] chrome.exe (PID: 1234) optimized
 ```
 
 ### 11.5 コンソール出力 (SetConsoleOutput)

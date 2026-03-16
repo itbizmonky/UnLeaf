@@ -306,6 +306,7 @@ UnLeaf/
 │   │   └── engine_policy.h      # タイミング定数集約 (EnginePolicy 構造体)
 │   ├── service/                 # コアエンジン本体 (ETW 監視、サービス制御)
 │   └── manager/                 # Manager UI (クローズドソース・ビルド対象外)
+│       ├── log_engine.h/cpp     # LogEngine / LogQueue (仮想 ListView ログ基盤)
 └── tests/                       # ユニットテスト (104 件 / 全 PASS)
 ```
 
