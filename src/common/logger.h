@@ -10,6 +10,7 @@
 #include <ctime>
 #include <chrono>
 #include <functional>
+#include <vector>
 
 namespace unleaf {
 
@@ -40,6 +41,9 @@ public:
     void SetEnabled(bool enabled);
     bool IsEnabled() const;
 
+    // Enable log rotation (Service process only; Manager keeps default false)
+    void SetRotationEnabled(bool enabled);
+
     // Register UI callback (called after each log write; use PostMessage inside, not direct UI calls)
     void SetUICallback(std::function<void(const std::wstring&)> cb);
 
@@ -55,11 +59,28 @@ private:
     LightweightLogger(const LightweightLogger&) = delete;
     LightweightLogger& operator=(const LightweightLogger&) = delete;
 
+    // Rotation outcome returned by CheckRotation(). Never calls Log().
+    struct RotationResult {
+        bool  triggered   = false;  // true if rotation was attempted (size threshold reached)
+        bool  success     = false;  // true if rename succeeded
+        bool  mutexFailed = false;  // true if mutex acquisition failed
+        DWORD error       = 0;      // GetLastError() on failure
+    };
+
     // Write message to file with rotation check
     void WriteMessage(const std::wstring& formattedMessage);
 
-    // Check and perform log rotation
-    void CheckRotation();
+    // Check and perform log rotation (Service only; returns immediately when rotationEnabled_=false).
+    // NEVER calls Log() or SafeInternalLog(). Returns result for the caller to act on.
+    RotationResult CheckRotation();
+
+    // Detect and reopen stale file handle (Manager convergence after Service rotation)
+    void CheckStaleHandle();
+
+    // Write a pre-formatted line directly to fileHandle_ without rotation check or callback.
+    // If fileHandle_ is INVALID, temporarily opens OPEN_ALWAYS, writes, then closes.
+    // Called under cs_ lock (from WriteMessage()). Used only for rotation meta-messages.
+    void SafeInternalLog(const std::wstring& msg);
 
     // Get current timestamp string
     std::wstring GetTimestamp() const;
@@ -85,12 +106,17 @@ private:
     // UI callback: called after each log write (Manager process only; nullptr in Service)
     std::function<void(const std::wstring&)> uiCallback_;
 
+    bool     rotationEnabled_;   // true = Service only; Manager keeps false (default)
+    HANDLE   hRotationMutex_;    // inter-process rotation mutex (Global\UnLeafLogRotation)
+    HANDLE   hRotationEvent_;    // inter-process rotation signal (Global\UnLeafLogRotated)
+    uint32_t staleCheckCounter_; // periodic stale handle detection counter (Manager)
+
     void Log(LogLevel level, const wchar_t* levelStr, const std::wstring& message);
 };
 
-#define LOG_ERROR(msg) unleaf::LightweightLogger::Instance().Error(msg)
-#define LOG_ALERT(msg) unleaf::LightweightLogger::Instance().Alert(msg)
-#define LOG_INFO(msg)  unleaf::LightweightLogger::Instance().Info(msg)
+#define LOG_ERROR(msg)   unleaf::LightweightLogger::Instance().Error(msg)
+#define LOG_ALERT(msg)   unleaf::LightweightLogger::Instance().Alert(msg)
+#define LOG_INFO(msg)    unleaf::LightweightLogger::Instance().Info(msg)
 #define LOG_DEBUG(msg)   unleaf::LightweightLogger::Instance().Debug(msg)
 #define LOG_MANAGER(msg) unleaf::LightweightLogger::Instance().Manager(msg)
 

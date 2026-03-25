@@ -527,11 +527,13 @@ std::string IPCServer::GetLogsFromOffset(uint64_t clientOffset) {
         return result;
     }
 
-    // Open log file for reading
+    // Open log file for reading.
+    // FILE_SHARE_DELETE is required so that Logger rotation (MoveFileExW) is not
+    // blocked while this transient read handle is open.
     HANDLE hFile = CreateFileW(
         logPath.c_str(),
         GENERIC_READ,
-        FILE_SHARE_READ | FILE_SHARE_WRITE,
+        FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
         nullptr,
         OPEN_EXISTING,
         FILE_ATTRIBUTE_NORMAL,

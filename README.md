@@ -314,6 +314,17 @@ UnLeaf/
 
 ## 更新履歴 (Changelog)
 
+### v1.0.3 (2026-03-24)
+
+**ログローテーション完全安定化**
+- 第2回ローテーション時のサービスクラッシュを修正: `CheckRotation()` 内の `Log()` 呼び出しによる無限再帰 (スタックオーバーフロー) を、`CheckRotation()` を純粋な結果返却関数に変更することで構造的に排除
+- 第2回リネーム失敗を修正: `MoveFileExW(REPLACE_EXISTING)` を `SetFileInformationByHandle(FileRenameInfoEx, POSIX_SEMANTICS)` に置換。Manager が `UnLeaf.log.1` を開いていても原子的にリネーム可能
+- `FlushFileBuffers` 失敗時にローテーションを中断しハンドルをクローズ — 次 write サイクルで自己回復
+- `WriteFile` 失敗時にロギングを無効化 (`enabled_ = false`) — I/O エラーループを防止
+- `RotationMutexGuard` RAII 化で `ReleaseMutex` 漏れを構造的に排除
+- `ScopedHandle` による rename ハンドルの完全リーク防止
+- `GetLastError()` を API 失敗直後にローカル変数へ即時取得
+
 ### v1.0.2 (2026-03-16)
 
 **ETW 信頼性強化**

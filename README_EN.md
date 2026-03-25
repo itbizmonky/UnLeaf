@@ -314,6 +314,17 @@ UnLeaf/
 
 ## Changelog
 
+### v1.0.3 (2026-03-24)
+
+**Log Rotation Stability**
+- Fixed 2nd-cycle rotation crash: infinite recursion (`Log() → WriteMessage() → CheckRotation() → Log()` → stack overflow) caused by `Log()` calls inside `CheckRotation()`. Resolved by redesigning `CheckRotation()` as a pure result-returning function; diagnostics routed through `SafeInternalLog()` which writes directly via `WriteFile`
+- Fixed 2nd-cycle rename failure: replaced `MoveFileExW(REPLACE_EXISTING)` with `SetFileInformationByHandle(FileRenameInfoEx, POSIX_SEMANTICS)` — atomically replaces the destination directory entry even when Manager holds an open handle to `UnLeaf.log.1`
+- `FlushFileBuffers` failure now aborts rotation and closes `fileHandle_` — self-recovers on next write cycle
+- `WriteFile` failure disables logging (`enabled_ = false`) to prevent I/O error loops
+- `RotationMutexGuard` RAII eliminates `ReleaseMutex` leaks on all return paths
+- `ScopedHandle` for rename handle — leak-free on every code path
+- `GetLastError()` captured immediately into a local variable after each API failure
+
 ### v1.0.2 (2026-03-16)
 
 **ETW Reliability**

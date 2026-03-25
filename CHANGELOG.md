@@ -4,6 +4,26 @@ All notable changes to UnLeaf will be documented in this file.
 
 ---
 
+## [1.0.3] - 2026-03-25
+
+### Fixed
+- Log rotation 2nd-cycle crash: `CheckRotation()` called `Log()` internally, causing `Log() → WriteMessage() → CheckRotation() → Log()` infinite recursion → stack overflow when rotation failed. Resolved by making `CheckRotation()` a pure function returning `RotationResult`; all diagnostic output routed through `SafeInternalLog()` which writes directly via `WriteFile` without re-entering `CheckRotation()`
+- Log rotation 2nd-cycle rename failure: `MoveFileExW(REPLACE_EXISTING)` fails when Manager holds an open handle to `UnLeaf.log.1` — Windows NTFS marks the destination for deletion but keeps the directory entry occupied until all handles close. Replaced with `SetFileInformationByHandle(FileRenameInfoEx, FILE_RENAME_FLAG_REPLACE_IF_EXISTS | FILE_RENAME_FLAG_POSIX_SEMANTICS)` for atomic directory-entry replacement regardless of open handles
+- `FlushFileBuffers` failure now aborts rotation and closes `fileHandle_` — prevents infinite retry spin on the next write cycle
+- `WriteFile` failure in `WriteMessage()` now disables further logging (`enabled_ = false`) to prevent I/O error loops
+- Log sequence reversal after rotation: Manager's stale handle check ran **after** `WriteFile`, so the first write post-rotation landed in the already-renamed `UnLeaf.log.1`, making its timestamp newer than the first line of `UnLeaf.log`. Fixed by moving the stale check to **before** `WriteFile` in `WriteMessage()`; added `Global\UnLeafLogRotated` named event (auto-reset) so Service signals Manager immediately on successful rotation rather than waiting up to 100 writes for the counter fallback
+
+### Added
+- `RotationResult` struct: `CheckRotation()` returns `{ triggered, success, mutexFailed, error }` — no logging inside; caller decides action
+- `SafeInternalLog()`: writes rotation meta-messages directly to `fileHandle_` without rotation check or callback; acquires `cs_` internally; falls back to `OPEN_ALWAYS` if handle is `INVALID`
+- `RotationMutexGuard` RAII: acquires `Global\UnLeafLogRotation` on construction, releases on destruction — eliminates manual `ReleaseMutex` on all return paths
+- `ScopedHandle` for rename handle: `hRename` is `ScopedHandle` via `MakeScopedHandle()` — handle leak impossible on any return path
+- `GetLastError()` captured immediately after each API failure into a local variable — prevents value corruption by intervening calls
+- On rename failure, `fileHandle_` restored immediately in `CheckRotation()` to avoid `OPEN_ALWAYS` churn on every subsequent write
+- `hRotationEvent_` (`Global\UnLeafLogRotated`, auto-reset): Service sets on successful rotation; Manager polls with `WaitForSingleObject(..., 0)` before each write to detect stale handles immediately
+
+---
+
 ## [1.0.2] - 2026-03-16
 
 ### Fixed
@@ -11,7 +31,7 @@ All notable changes to UnLeaf will be documented in this file.
 - ETW zombie session cleanup: stale sessions with the same name are stopped before `StartTraceW` to prevent `ERROR_ALREADY_EXISTS`
 - `RefreshLogDisplay`: initial `endPos` now obtained via `EM_GETTEXTLENGTHEX(GTL_NUMCHARS)` instead of `GetWindowTextLengthW` — eliminates per-line position skew caused by `\r\n` expansion
 
-### Added
+### Added (2026-03-16)
 - ETW lost event detection: `EVENT_TRACE_TYPE_LOST_EVENT` opcode handled in callback; LOG_ALERT emitted with cumulative count on buffer overflow
 - Window position and size persistence: saved to `[Manager]` section of `UnLeaf.ini` on `WM_DESTROY`, restored on startup with off-screen guard (`MonitorFromPoint(MONITOR_DEFAULTTONULL)`)
 - Virtual ListView live log display: RichEdit replaced with a custom virtual ListView + Owner-Draw renderer; eliminates auto-scroll stall and blank-line artifacts under high log volume

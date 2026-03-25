@@ -1,7 +1,7 @@
 # UnLeaf GitHub CI 運用手順書
 
-Version: v1.0.2
-最終更新: 2026-03-16
+Version: v1.0.3
+最終更新: 2026-03-24
 
 ---
 

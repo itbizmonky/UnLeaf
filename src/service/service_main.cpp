@@ -80,6 +80,7 @@ bool ServiceMain::RunAsConsole() {
     // Initialize logger with console output
     LightweightLogger::Instance().Initialize(baseDir_);
     LightweightLogger::Instance().SetConsoleOutput(true);
+    LightweightLogger::Instance().SetRotationEnabled(true);
 
     // Initialize config
     UnLeafConfig::Instance().Initialize(baseDir_);
@@ -171,6 +172,7 @@ void WINAPI ServiceMain::ServiceMainFunc(DWORD argc, LPWSTR* argv) {
         service.ReportStatus(SERVICE_STOPPED, 1);
         return;
     }
+    LightweightLogger::Instance().SetRotationEnabled(true);
 
     if (!UnLeafConfig::Instance().Initialize(service.baseDir_)) {
         service.ReportStatus(SERVICE_STOPPED, 2);

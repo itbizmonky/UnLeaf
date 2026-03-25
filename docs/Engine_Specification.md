@@ -1,7 +1,7 @@
 # UnLeaf Engine 開発者仕様書
 
-> **対象バージョン**: v1.0.2 (C++ Native)
-> **最終更新**: 2026-03-16
+> **対象バージョン**: v1.0.3 (C++ Native)
+> **最終更新**: 2026-03-24
 > **対象読者**: 本プロジェクトの保守・拡張を行う開発者
 > **CI**: GitHub Actions による自動ビルド・ユニットテスト検証を push / pull_request 毎に実施。
 
@@ -1095,11 +1095,24 @@ chrome.exe=C:\Program Files\Google\Chrome\Application\chrome.exe
 | ファイル名 | `UnLeaf.log` |
 | バックアップ名 | `UnLeaf.log.1` |
 | 最大サイズ | 100 KB (`MAX_LOG_SIZE = 102400`) |
-| ローテーション方式 | 閉じて → バックアップ削除 → リネーム → 新規作成 |
-| ファイルオープンモード | `FILE_APPEND_DATA \| FILE_SHARE_READ \| FILE_SHARE_WRITE` |
+| ローテーション方式 | Flush → CloseHandle → `MoveFileExW(REPLACE_EXISTING\|WRITE_THROUGH)` → 次 write で OPEN_ALWAYS 再オープン |
+| ローテーション担当 | **Service プロセスのみ** (`SetRotationEnabled(true)` が必要; Manager はデフォルト `false`) |
+| プロセス間排他 | Named Mutex `Global\UnLeafLogRotation` (INFINITE 待機; WAIT_ABANDONED も取得扱い) |
+| ファイルオープンモード | `FILE_APPEND_DATA \| FILE_SHARE_READ \| FILE_SHARE_WRITE \| FILE_SHARE_DELETE` |
+| FlushFileBuffers | ローテーション直前 (CloseHandle 前) のみ実施 |
 | エンコーディング | UTF-8 |
 
-ローテーションは `WriteMessage()` 内で `CheckRotation()` を呼び、書き込み前にファイルサイズを確認する。
+`FILE_SHARE_DELETE` は複数プロセスがファイルを保持した状態で `MoveFileExW` (rename) を成功させるために必須。欠如すると `ERROR_SHARING_VIOLATION` が発生し、以前の実装ではバックアップ未作成のまま `CREATE_ALWAYS` でログが消失していた。
+
+Move 失敗時は `CREATE_ALWAYS` を使用しない。`fileHandle_` を `INVALID_HANDLE_VALUE` のまま残し、次の `WriteMessage()` 呼び出しで `OPEN_ALWAYS` 再オープンすることでデータを保全する。
+
+#### RotationGuard (RAII)
+
+`rotating_` フラグを RAII で管理する内部クラス。コンストラクタで `true` にセット、デストラクタで `false` にリセットするため、いかなる return / 失敗経路でもフラグが確実に戻る。`Log()` 呼び出しはすべて mutex + RotationGuard スコープの外で実行されるため、`rotating_` への依存なしに再入安全性を保証する。
+
+#### Manager のログ収束 (CheckStaleHandle)
+
+Manager プロセスは 100 write ごとに `CheckStaleHandle()` を呼び出す。`GetFileInformationByHandle` で現在のハンドルと `logPath_` のファイル ID (ボリュームシリアル + インデックス) を比較し、不一致 (Service がローテーションして rename した状態) を検知すると `CloseHandle` + `OPEN_ALWAYS` で新しい `UnLeaf.log` に収束する。
 
 ### 11.3 動的制御
 
@@ -1631,10 +1644,18 @@ std::map<DWORD, std::shared_ptr<TrackedProcess>> trackedProcesses_;
 | `policySetCs_` | EngineCore | `policyAppliedSet_` |
 | `handlerCs_` | IPCServer | `handlers_` |
 | `cs_` | UnLeafConfig | `targets_`, `configPath_`, `logLevel_` 等 |
-| `cs_` | LightweightLogger | `fileHandle_`, `initialized_` 等 |
+| `cs_` | LightweightLogger | `fileHandle_`, `initialized_`, `rotationEnabled_`, `rotating_` 等 |
 | `policyCs_` | RegistryPolicyManager | `appliedPolicies_`, `manifestPath_` |
 
-### 14.2 ロック順序
+### 14.2 プロセス間 Mutex
+
+| 名前 | 用途 | 取得箇所 |
+|------|------|---------|
+| `Global\UnLeafLogRotation` | ログローテーション排他 | `LightweightLogger::CheckRotation()` (Service のみ) |
+
+INFINITE 待機。`WAIT_ABANDONED` (前回保持プロセスが異常終了) の場合も取得とみなしてローテーションを継続する。Mutex ハンドルは `Initialize()` で `CreateMutexW` により確保し、`Shutdown()` で `CloseHandle`。
+
+### 14.3 ロック順序 (プロセス内)
 
 デッドロックを回避するため、複数のロックを取得する場合は以下の順序を守る:
 
@@ -1644,7 +1665,7 @@ jobCs_ → trackedCs_ (RefreshJobObjectPids で使用)
 
 その他のロックは同時取得されないか、単独で使用される。
 
-### 14.3 atomic パターン
+### 14.4 atomic パターン
 
 | 変数 | 型 | 用途 |
 |------|-----|------|
@@ -2234,7 +2255,7 @@ IsValidProcessName(name)
 
 - ログローテーション検知: `clientOffset > currentSize` → offset をリセット
 - 差分読み取り: 毎回 `UNLEAF_MAX_LOG_READ_SIZE` (8KB) まで返却
-- ファイル共有: `FILE_SHARE_READ | FILE_SHARE_WRITE` で Logger と競合しない
+- ファイル共有: `FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE` で Logger ローテーション (MoveFileExW) を妨げない
 
 ### HEALTH_CHECK レスポンス構造
 
