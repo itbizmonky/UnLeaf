@@ -601,7 +601,18 @@ private:
     static constexpr ULONGLONG MEM_LOG_INTERVAL_SHORT = 10000;    // 起動後 30 分: 10 秒
     static constexpr ULONGLONG MEM_LOG_INTERVAL_LONG  = 60000;    // 30 分経過後: 60 秒
     static constexpr ULONGLONG MEM_LOG_WARMUP_MS      = 1800000ULL; // 30 分
-    
+
+    // trackedProcesses_ hard cap (§9.00 Eviction)
+    static constexpr size_t MAX_TRACKED_PROCESSES = 2000;
+
+    // pendingRemovalPids_ saturation guard (§9.01)
+    static constexpr size_t MAX_PENDING_REMOVALS = 4096;
+
+    // Select eviction candidate from trackedProcesses_ (call while holding trackedCs_)
+    // Priority: 1) invalid handle (zombie), 2) oldest phaseStartTime
+    // Returns PID of victim, or 0 if map is empty.
+    DWORD SelectEvictionCandidate() const;
+
 };
 
 } // namespace unleaf

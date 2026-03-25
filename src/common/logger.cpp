@@ -290,14 +290,36 @@ void LightweightLogger::WriteMessage(const std::wstring& formattedMessage) {
     }
 
     // Write the caller's message (no FlushFileBuffers — rotation handles its own flush).
-    std::string utf8Msg = WideToUtf8(formattedMessage);
-    utf8Msg += "\r\n";
+    // §9.00/§9.01: Stack buffer first — avoids heap allocation for typical log lines (<2045 bytes).
+    // WideCharToMultiByte with -1 returns byte count including NUL terminator (= UTF-8 length + 1).
+    // We write stackBuf[0..len] where stackBuf[len-1]='\r', stackBuf[len]='\n' (len+1 bytes total).
+    // Buffer sized to 2048: -3 gives room for NUL→'\r', '\n', and a safety NUL.
+    char stackBuf[2048];
+    int len = WideCharToMultiByte(
+        CP_UTF8, 0,
+        formattedMessage.c_str(), -1,
+        stackBuf, static_cast<int>(sizeof(stackBuf) - 3),
+        nullptr, nullptr);
+
     DWORD bytesWritten = 0;
-    if (!WriteFile(fileHandle_, utf8Msg.c_str(),
-                   static_cast<DWORD>(utf8Msg.size()), &bytesWritten, nullptr)) {
-        // FAIL-SAFE: disable further logging to prevent I/O error loops.
-        // Service remains running; rotation and other operations are unaffected.
-        enabled_.store(false, std::memory_order_release);
+    if (len > 0 && len < static_cast<int>(sizeof(stackBuf) - 2)) {
+        // len includes NUL; overwrite it with \r\n
+        stackBuf[len - 1] = '\r';
+        stackBuf[len]     = '\n';
+        stackBuf[len + 1] = '\0';  // safety NUL (not written to file)
+        if (!WriteFile(fileHandle_, stackBuf, static_cast<DWORD>(len + 1),
+                       &bytesWritten, nullptr)) {
+            // FAIL-SAFE: disable further logging to prevent I/O error loops.
+            enabled_.store(false, std::memory_order_release);
+        }
+    } else {
+        // Fallback: message exceeds stack buffer (rare — line > ~2045 bytes)
+        std::string utf8Msg = WideToUtf8(formattedMessage);
+        utf8Msg += "\r\n";
+        if (!WriteFile(fileHandle_, utf8Msg.c_str(),
+                       static_cast<DWORD>(utf8Msg.size()), &bytesWritten, nullptr)) {
+            enabled_.store(false, std::memory_order_release);
+        }
     }
 
     // Report rotation outcome only when rotation was actually attempted.

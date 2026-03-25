@@ -4,6 +4,25 @@ All notable changes to UnLeaf will be documented in this file.
 
 ---
 
+## [1.1.0] - 2026-03-26
+
+### Changed (§9.00〜§9.09 メモリ安定化・長期稼働品質改善)
+- `trackedProcesses_` ハード上限 (`MAX_TRACKED_PROCESSES=2000`) 到達時に `SelectEvictionCandidate()` で zombie 優先・最古優先の退避候補を選出し `pendingRemovalPids_` 経由で `RemoveTrackedProcess()` に委任 — Timer/WaitContext リークを防止 (§9.00)
+- eviction 内の `trackedProcesses_.erase` / `waitContexts_.erase` を削除 — `RemoveTrackedProcess()` 一元管理に統一、TrackedCs_ 保持中の erase 禁止 (§9.02)
+- `evictionCounter` 無条件インクリメント + `forceEvict` (size ≥ MAX+32 で全 excess を一括退避)、burst drain は `SelectEvictionCandidates()` で N 件を1パス収集 (§9.03/§9.07/§9.08)
+- `pendingRemovalPids_` saturation 時の `pop()` を廃止 — `LOG_ALERT` のみ出力し push を継続（eviction 作業ドロップ禁止）(§9.06/§9.09)
+- `ProcessPendingRemovals()` に `MAX_DRAIN_PER_TICK=256` 制限を追加 — tick 毎の処理量を平準化、残留時は `SetEvent` で次 tick を自動スケジュール、backlog > 8192 で `LOG_ALERT` (§9.09)
+- `ProcessEnforcementQueue()` / `HandleSafetyNetCheck()` の PMR arena を `#ifdef _DEBUG` ガードから常時有効化 — Release でも PMR fallback を `LOG_INFO` で検出 (§9.01/§9.05)
+- `SelectEvictionCandidates()` 内部一時変数 (`picked`・`aged`) を PMR arena (16KB stack buffer) に移行、`partial_sort` 最適化、safety cap 追加 (§9.08/§9.09)
+- `Logger::WriteMessage()` をスタックバッファ (2048 bytes) で書き込み — 通常パスのヒープ割当ゼロ (§9.00)
+
+### Added (§9.00〜§9.09)
+- `CountingResource` / `IsCSHeldByCurrent` / `SelectEvictionCandidates` を anonymous namespace に一元定義 — ODR 違反なし、ヘッダ変更不要 (§9.05/§9.07)
+- `SelectEvictionCandidate()` 先頭に DEBUG ASSERT (`IsCSHeldByCurrent`) 追加 — `trackedCs_` 保持義務を実行時検証 (§9.07)
+- `pendingRemovalPids_` backlog の3段階ログ: 50% → `LOG_INFO`、75% → `LOG_ALERT`、overflow → `LOG_ALERT` (§9.04/§9.09)
+
+---
+
 ## [1.0.3] - 2026-03-25
 
 ### Fixed

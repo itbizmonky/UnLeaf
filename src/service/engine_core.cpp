@@ -5,6 +5,9 @@
 #include <functional>
 #include <chrono>
 #include <cstdio>
+#include <cassert>
+#include <memory_resource>
+#include <unordered_set>
 #include <psapi.h>
 #pragma comment(lib, "psapi.lib")
 
@@ -16,6 +19,117 @@ struct WaitCallbackContext {
     DWORD pid;
     std::shared_ptr<TrackedProcess> process;  // prevent premature destruction
 };
+
+namespace {
+
+// §9.05: CountingResource — single definition to avoid ODR issues.
+// Used in ProcessEnforcementQueue() and HandleSafetyNetCheck() PMR arenas.
+class CountingResource : public std::pmr::memory_resource {
+public:
+    explicit CountingResource(std::pmr::memory_resource* up) : upstream_(up) {}
+    size_t count() const { return count_; }
+protected:
+    void* do_allocate(size_t b, size_t a) override {
+        count_++; return upstream_->allocate(b, a);
+    }
+    void do_deallocate(void* p, size_t b, size_t a) override {
+        upstream_->deallocate(p, b, a);
+    }
+    bool do_is_equal(const std::pmr::memory_resource& o) const noexcept override {
+        return this == &o;
+    }
+private:
+    std::pmr::memory_resource* upstream_;
+    size_t count_ = 0;
+};
+
+#ifdef _DEBUG
+// §9.07 修正②: DEBUG-only helper to verify trackedCs_ ownership.
+// CriticalSection wraps CRITICAL_SECTION as its sole member — reinterpret_cast is safe on MSVC.
+// CRITICAL_SECTION::OwningThread stores the owning TID cast to HANDLE.
+static bool IsCSHeldByCurrent(const CriticalSection& cs) noexcept {
+    const CRITICAL_SECTION* native = reinterpret_cast<const CRITICAL_SECTION*>(&cs);
+    return (DWORD)(ULONG_PTR)native->OwningThread == GetCurrentThreadId();
+}
+#endif
+
+// §9.07 修正③ + §9.09 修正②③: Multi-candidate eviction — selects up to `count` distinct PIDs.
+// Same priority order as SelectEvictionCandidate(): zombies first, then oldest phaseStartTime.
+// PRECONDITION: trackedCs_ must be held by caller.
+static std::vector<DWORD> SelectEvictionCandidates(
+    const std::map<DWORD, std::shared_ptr<TrackedProcess>>& processes,
+    size_t count)
+{
+    // §9.09 修正③: safety cap — prevent requesting more than exists
+    count = std::min(count, processes.size());
+    if (count == 0) return {};
+
+    // §9.09 修正②: PMR arena for internal temporaries (picked, aged).
+    // 16KB handles ~2000-entry aged vector (12 bytes/entry) without fallback under typical load.
+    // result uses std::vector (standard allocator) — std::pmr::vector → std::vector 暗黙変換不可.
+    CountingResource pmrCountingRes(std::pmr::get_default_resource());
+    std::byte buf[16384];
+    std::pmr::monotonic_buffer_resource arena(buf, sizeof(buf), &pmrCountingRes);
+
+    std::vector<DWORD> result;
+    result.reserve(count);
+    // Use pmr::vector instead of unordered_set: monotonic_buffer cannot release rehash memory.
+    // picked is typically 0-10 entries (zombie count), so O(N) linear search is acceptable.
+    std::pmr::vector<DWORD> picked(&arena);
+
+    // Priority 1: zombies (invalid handle)
+    for (const auto& [p, tp] : processes) {
+        if (result.size() >= count) break;
+        if (!tp->processHandle.get()) {
+            result.push_back(p);
+            picked.push_back(p);
+        }
+    }
+
+    // Priority 2: oldest phaseStartTime among non-picked
+    if (result.size() < count) {
+        std::pmr::vector<std::pair<DWORD, ULONGLONG>> aged(&arena);
+        aged.reserve(processes.size());  // §9.08 修正③
+        for (const auto& [p, tp] : processes) {
+            bool inPicked = false;
+            for (DWORD pk : picked) { if (pk == p) { inPicked = true; break; } }
+            if (!inPicked) aged.push_back({p, tp->phaseStartTime});
+        }
+        // §9.08 修正②: partial_sort when we need fewer than all entries (O(N log K) vs O(N log N))
+        size_t remain = count - result.size();
+        if (aged.size() > remain) {
+            std::partial_sort(
+                aged.begin(),
+                aged.begin() + static_cast<ptrdiff_t>(remain),
+                aged.end(),
+                [](const auto& a, const auto& b) { return a.second < b.second; });
+        } else {
+            std::sort(aged.begin(), aged.end(),
+                [](const auto& a, const auto& b) { return a.second < b.second; });
+        }
+        for (const auto& [p, _] : aged) {
+            if (result.size() >= count) break;
+            result.push_back(p);
+        }
+    }
+
+    if (pmrCountingRes.count() > 0) {
+#ifdef _DEBUG
+        wchar_t dbgBuf[128];
+        swprintf_s(dbgBuf, L"[PMR] SelectEvictionCandidates fallback count=%zu", pmrCountingRes.count());
+        LOG_DEBUG(dbgBuf);
+#else
+        static std::atomic<int> pmrWarnCount{0};
+        if (pmrWarnCount.fetch_add(1, std::memory_order_relaxed) < 10) {
+            LOG_INFO(L"[PMR] SelectEvictionCandidates fallback detected");
+        }
+#endif
+    }
+
+    return result;
+}
+
+} // anonymous namespace
 
 EngineCore& EngineCore::Instance() {
     static EngineCore instance;
@@ -544,8 +658,19 @@ void EngineCore::EngineControlLoop() {
         PerformPeriodicMaintenance(now);
     }
 
-    // Final drain: process any remaining removals before loop exit
-    ProcessPendingRemovals();
+    // Final drain: process ALL remaining before loop exit (no cap — service stopping)
+    for (;;) {
+        std::queue<DWORD> pending;
+        {
+            CSLockGuard lock(pendingRemovalCs_);
+            if (pendingRemovalPids_.empty()) break;
+            std::swap(pending, pendingRemovalPids_);
+        }
+        while (!pending.empty()) {
+            RemoveTrackedProcess(pending.front());
+            pending.pop();
+        }
+    }
 
     LOG_INFO(L"Engine: Event-driven control loop ended");
 }
@@ -574,8 +699,15 @@ void EngineCore::ProcessEnforcementQueue() {
 
     // Deduplicate: merge same-PID ETW_THREAD_START requests to prevent
     // O(N^2) CreateToolhelp32Snapshot storms during thread burst
-    std::vector<EnforcementRequest> deduped;
-    std::set<DWORD> seenEtwPids;
+    //
+    // §9.00: Local PMR arena — temporary containers allocated from stack buffer.
+    // §9.05: CountingResource defined in anonymous namespace; fallback visible in Debug and Release.
+    CountingResource counting(std::pmr::get_default_resource());
+    std::byte arenaBuf[8 * 1024];
+    std::pmr::monotonic_buffer_resource arena(arenaBuf, sizeof(arenaBuf), &counting);
+
+    std::pmr::vector<EnforcementRequest> deduped(&arena);
+    std::pmr::set<DWORD> seenEtwPids(&arena);
     while (!pending.empty()) {
         EnforcementRequest req = pending.front();
         pending.pop();
@@ -592,6 +724,19 @@ void EngineCore::ProcessEnforcementQueue() {
     for (const auto& req : deduped) {
         if (stopRequested_.load()) break;
         DispatchEnforcementRequest(req);
+    }
+
+    if (counting.count() > 0) {
+#ifdef _DEBUG
+        wchar_t dbgBuf[128];
+        swprintf_s(dbgBuf, L"[PMR] ProcessEnforcementQueue arena fallback count=%zu", counting.count());
+        LOG_DEBUG(dbgBuf);
+#else
+        static std::atomic<int> pmrWarnCount{0};
+        if (pmrWarnCount.fetch_add(1, std::memory_order_relaxed) < 10) {
+            LOG_INFO(L"[PMR] ProcessEnforcementQueue fallback detected");
+        }
+#endif
     }
 }
 
@@ -838,7 +983,13 @@ void EngineCore::HandleSafetyNetCheck() {
     // SAFETY NET: Insurance consistency check - NOT monitoring
     // Checks only tracked processes for EcoQoS re-enablement
 
-    std::vector<DWORD> pidsToCheck;
+    // §9.00: Local PMR arena for temporary PID snapshot.
+    // §9.05: CountingResource defined in anonymous namespace; fallback visible in Debug and Release.
+    CountingResource counting(std::pmr::get_default_resource());
+    std::byte arenaBuf[4 * 1024];
+    std::pmr::monotonic_buffer_resource arena(arenaBuf, sizeof(arenaBuf), &counting);
+
+    std::pmr::vector<DWORD> pidsToCheck(&arena);
     {
         CSLockGuard lock(trackedCs_);
         for (const auto& [pid, tp] : trackedProcesses_) {
@@ -858,22 +1009,56 @@ void EngineCore::HandleSafetyNetCheck() {
 
     // Process the queue immediately (we're already in the control loop)
     ProcessEnforcementQueue();
+
+    if (counting.count() > 0) {
+#ifdef _DEBUG
+        wchar_t dbgBuf[128];
+        swprintf_s(dbgBuf, L"[PMR] HandleSafetyNetCheck arena fallback count=%zu", counting.count());
+        LOG_DEBUG(dbgBuf);
+#else
+        static std::atomic<int> pmrWarnCount{0};
+        if (pmrWarnCount.fetch_add(1, std::memory_order_relaxed) < 10) {
+            LOG_INFO(L"[PMR] HandleSafetyNetCheck fallback detected");
+        }
+#endif
+    }
 }
 
 // Drain pending process removal queue (called from EngineControlLoop thread only)
 void EngineCore::ProcessPendingRemovals() {
-    for (;;) {
-        std::queue<DWORD> pending;
-        {
-            CSLockGuard lock(pendingRemovalCs_);
-            if (pendingRemovalPids_.empty())
-                break;
-            std::swap(pending, pendingRemovalPids_);
+    constexpr size_t MAX_DRAIN_PER_TICK = 256;
+
+    std::queue<DWORD> pending;
+    {
+        CSLockGuard lock(pendingRemovalCs_);
+
+        // §9.09 修正④: Backlog runaway detection
+        size_t backlogSize = pendingRemovalPids_.size();
+        if (backlogSize > 8192) {
+            static std::atomic<int> runawayWarn{0};
+            if (runawayWarn.fetch_add(1, std::memory_order_relaxed) < 20) {
+                LOG_ALERT(L"[EVICT] pendingRemoval runaway growth");
+            }
         }
-        while (!pending.empty()) {
-            RemoveTrackedProcess(pending.front());
-            pending.pop();
+
+        // Take up to MAX_DRAIN_PER_TICK items per tick (§9.09 修正④: load leveling)
+        size_t toTake = std::min(backlogSize, MAX_DRAIN_PER_TICK);
+        for (size_t i = 0; i < toTake; ++i) {
+            pending.push(pendingRemovalPids_.front());
+            pendingRemovalPids_.pop();
         }
+
+        // §9.09 最終修正⑤: Always signal to prevent lost wakeup.
+        // NOTE: New entries may be enqueued immediately after drain loop,
+        // making empty-check-based signaling racy (check → push race).
+        // Unconditional SetEvent guarantees forward progress at the cost of
+        // one extra wakeup cycle when queue is truly empty.
+        SetEvent(hWakeupEvent_);
+    }
+
+    while (!pending.empty()) {
+        RemoveTrackedProcess(pending.front());
+        pending.pop();
     }
 }
 
@@ -2100,18 +2285,116 @@ bool EngineCore::ApplyOptimization(DWORD pid, const std::wstring& name, bool isC
     // If SYNCHRONIZE fails, process exit will be detected by handle invalidation
 
     // Add to tracked map
+    // §9.02: Candidate selection only; all cleanup delegated to RemoveTrackedProcess().
+    // §8.38 compliance: no timer deletion inside lock. No erase of trackedProcesses_ or waitContexts_.
+    std::vector<DWORD> evictList;
     {
         CSLockGuard lock(trackedCs_);
+
+        // §9.03: Counter advances unconditionally to avoid period skew.
+        static uint32_t evictionCounter = 0;
+        // NOTE: evictionCounter is intentionally non-atomic.
+        // MUST only be accessed under trackedCs_ lock.
+        // Do NOT move or reuse outside this critical section.
+        evictionCounter++;
+
+        size_t currentSize = trackedProcesses_.size();
+        if (currentSize >= MAX_TRACKED_PROCESSES) {
+            bool forceEvict = (currentSize >= MAX_TRACKED_PROCESSES + 32);
+            if (forceEvict) {
+                // §9.07 修正③: Burst drain — select ALL excess candidates in one pass.
+                // Naive while-loop calling SelectEvictionCandidate() repeatedly returns the same PID
+                // (no erase inside lock per §9.02). SelectEvictionCandidates() handles N distinct PIDs.
+                // §9.08 修正①: +1 accounts for the process being inserted in this same call.
+                size_t needed = (currentSize + 1) - MAX_TRACKED_PROCESSES;
+                evictList = SelectEvictionCandidates(trackedProcesses_, needed);
+            } else if ((evictionCounter & 0xF) == 0) {
+                // PRECONDITION: trackedCs_ must be held when calling SelectEvictionCandidate().
+                DWORD c = SelectEvictionCandidate();
+                // §9.02: No erase here — RemoveTrackedProcess() handles all resource cleanup
+                if (c != 0) evictList.push_back(c);
+            }
+        }
+
         trackedProcesses_[pid] = std::move(tracked);
         if (context) {
             waitContexts_[pid] = context;
         }
     }
 
+    // Queue evicted PIDs for full cleanup via RemoveTrackedProcess() (outside trackedCs_ — §8.38)
+    if (!evictList.empty()) {
+        // §9.03: Throttle log to avoid spam under sustained eviction pressure
+        static std::atomic<int> evictLogCount{0};
+        for (DWORD evictPid : evictList) {
+            if (evictLogCount.fetch_add(1, std::memory_order_relaxed) < 50) {
+                wchar_t logBuf[128];
+                swprintf_s(logBuf, L"[EVICT] cap reached, evicting PID:%lu", evictPid);
+                LOG_DEBUG(logBuf);
+            }
+        }
+
+        {
+            CSLockGuard lock(pendingRemovalCs_);
+            for (DWORD evictPid : evictList) {
+                size_t pendingSize = pendingRemovalPids_.size();
+                if (pendingSize >= MAX_PENDING_REMOVALS) {
+                    // §9.09 修正①: Drop 禁止 — eviction 作業を絶対に失わない
+                    static std::atomic<int> dropWarnCount{0};
+                    if (dropWarnCount.fetch_add(1, std::memory_order_relaxed) < 20) {
+                        LOG_ALERT(L"[EVICT] pendingRemoval overflow (no drop)");
+                    }
+                } else if (pendingSize >= (MAX_PENDING_REMOVALS * 3 / 4)) {
+                    // §9.04: Critical backlog — warn only (still push to ensure RemoveTrackedProcess runs)
+                    static std::atomic<int> criticalWarnCount{0};
+                    if (criticalWarnCount.fetch_add(1, std::memory_order_relaxed) < 20) {
+                        LOG_ALERT(L"[EVICT] backlog critical");
+                    }
+                } else if (pendingSize >= (MAX_PENDING_REMOVALS / 2)) {
+                    static std::atomic<int> backlogWarnCount{0};
+                    if (backlogWarnCount.fetch_add(1, std::memory_order_relaxed) < 20) {
+                        LOG_INFO(L"[EVICT] pendingRemoval backlog high");
+                    }
+                }
+                // §9.06追加: Always push unconditionally — dedup removed (O(N) lock contention risk).
+                // RemoveTrackedProcess() is idempotent; duplicate calls are safe.
+                pendingRemovalPids_.push(evictPid);
+            }
+        }
+        SetEvent(hWakeupEvent_);
+    }
+
     // Schedule deferred verification
     ScheduleDeferredVerification(pid, 1);
 
     return success;
+}
+
+// §9.00: Select eviction candidate from trackedProcesses_.
+// Must be called while holding trackedCs_.
+// Priority 1: invalid processHandle (zombie/terminated).
+// Priority 2: oldest phaseStartTime (longest-resident process).
+DWORD EngineCore::SelectEvictionCandidate() const {
+#ifdef _DEBUG
+    assert(IsCSHeldByCurrent(trackedCs_) &&
+           "SelectEvictionCandidate() must be called with trackedCs_ held");
+#endif
+    if (trackedProcesses_.empty()) return 0;
+
+    // Priority 1: zombie (handle already closed)
+    for (const auto& [pid, tp] : trackedProcesses_) {
+        if (!tp->processHandle.get()) return pid;
+    }
+
+    // Priority 2: oldest phaseStartTime
+    auto it = std::min_element(
+        trackedProcesses_.begin(),
+        trackedProcesses_.end(),
+        [](const auto& a, const auto& b) {
+            return a.second->phaseStartTime < b.second->phaseStartTime;
+        });
+
+    return (it != trackedProcesses_.end()) ? it->first : 0;
 }
 
 void CALLBACK EngineCore::OnProcessExit(PVOID lpParameter, BOOLEAN timerOrWaitFired) {
