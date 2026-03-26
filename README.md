@@ -314,6 +314,16 @@ UnLeaf/
 
 ## 更新履歴 (Changelog)
 
+### v1.1.0 (2026-03-26)
+
+**メモリ安定化・長期稼働品質改善**
+- `trackedProcesses_` ハード上限 (MAX=2000) 到達時に zombie 優先・最古優先で退避候補を選出し `RemoveTrackedProcess()` に委任。Timer/WaitContext リークをゼロに抑制
+- eviction バースト対応: `SelectEvictionCandidates()` で超過分を1パス一括選出。`partial_sort` O(N log K) + PMR arena (16KB スタックバッファ) でヒープ割当を最小化
+- `pendingRemovalPids_` overflow 時の `pop()` を廃止 — 常に push し `LOG_ALERT` のみ出力。eviction 作業のドロップ禁止モデルへ移行
+- `ProcessPendingRemovals()` を最大 256 件/tick に制限。処理スパイクを排除し、残留時は自動再スケジュール (SetEvent)。runaway backlog (> 8192) を `LOG_ALERT` で検知
+- `Logger::WriteMessage()` をスタックバッファ (2048 bytes) に移行。通常パスのヒープ割当ゼロを達成
+- `CountingResource` を anonymous namespace に一元定義し ODR 違反を排除。PMR fallback を Release でも `LOG_INFO` で最大10回通知
+
 ### v1.0.3 (2026-03-24)
 
 **ログローテーション完全安定化**

@@ -314,6 +314,16 @@ UnLeaf/
 
 ## Changelog
 
+### v1.1.0 (2026-03-26)
+
+**Memory Stability & Long-Run Hardening**
+- `trackedProcesses_` hard cap (MAX=2,000): eviction candidates selected zombie-first → oldest phaseStartTime, delegated to `RemoveTrackedProcess()` — zero Timer/WaitContext leaks
+- Burst eviction: `SelectEvictionCandidates()` selects all excess PIDs in one pass with `partial_sort` O(N log K) + PMR arena (16 KB stack buffer) to minimize heap allocation
+- `pendingRemovalPids_` overflow no longer drops (`pop()` removed) — always push, emit `LOG_ALERT` only. Guarantees no eviction work is lost
+- `ProcessPendingRemovals()` capped at 256 items/tick — eliminates processing spikes; remaining items auto-rescheduled via `SetEvent`; runaway backlog (> 8,192) detected with `LOG_ALERT`
+- `Logger::WriteMessage()` migrated to stack buffer (2,048 bytes) — zero heap allocation on normal path
+- `CountingResource` centralized in anonymous namespace to eliminate ODR violations; PMR fallback visible in Release builds via `LOG_INFO` (max 10 notifications)
+
 ### v1.0.3 (2026-03-24)
 
 **Log Rotation Stability**
