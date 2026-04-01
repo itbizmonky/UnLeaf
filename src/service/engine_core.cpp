@@ -166,7 +166,8 @@ EngineCore::EngineCore()
     , lastDegradedScanTime_(0)
     , startTime_(0)
     , lastConfigCheckTime_(0)
-    , configChangePending_(false) {
+    , configChangePending_(false)
+    , hasPathTargets_(false) {
 }
 
 EngineCore::~EngineCore() {
@@ -334,8 +335,9 @@ void EngineCore::Start() {
 
     // Start ETW with both process and thread callbacks
     bool etwStarted = processMonitor_.Start(
-        [this](DWORD pid, DWORD parentPid, const std::wstring& imageName) {
-            this->OnProcessStart(pid, parentPid, imageName);
+        [this](DWORD pid, DWORD parentPid, const std::wstring& imageName,
+               const std::wstring& imagePath) {
+            this->OnProcessStart(pid, parentPid, imageName, imagePath);
         },
         [this](DWORD threadId, DWORD ownerPid) {
             this->OnThreadStart(threadId, ownerPid);
@@ -349,6 +351,9 @@ void EngineCore::Start() {
         operationMode_ = OperationMode::DEGRADED_ETW;
         LOG_ALERT(L"ETW: Monitor failed to start - using DEGRADED mode");
     }
+
+    // Proactive: apply registry policies from config BEFORE process detection
+    ApplyProactivePolicies();
 
     InitialScan();
 
@@ -364,8 +369,8 @@ void EngineCore::Start() {
     engineControlThread_ = std::thread(&EngineCore::EngineControlLoop, this);
 
     wchar_t startBuf[128];
-    swprintf_s(startBuf, L"EngineCore started: %zu targets, %s mode, Event-Driven, SafetyNet=10s",
-               targetSet_.size(),
+    swprintf_s(startBuf, L"EngineCore started: %zu name + %zu path targets, %s mode, Event-Driven, SafetyNet=10s",
+               targetNameSet_.size(), targetPathSet_.size(),
                (operationMode_ == OperationMode::NORMAL ? L"NORMAL" : L"DEGRADED_ETW"));
     LOG_DEBUG(startBuf);
 }
@@ -482,7 +487,8 @@ void EngineCore::Stop() {
     RegistryPolicyManager::Instance().CleanupAllPolicies();
     {
         CSLockGuard lock(policySetCs_);
-        policyAppliedSet_.clear();
+        policyCacheLru_.clear();
+        policyCacheMap_.clear();
     }
     LOG_DEBUG(L"[STOP] Step 8: Registry policies cleaned up");
 
@@ -534,7 +540,8 @@ void EngineCore::CleanupHandles() {
 
 // === ETW Callbacks ===
 
-void EngineCore::OnProcessStart(DWORD pid, DWORD parentPid, const std::wstring& imageName) {
+void EngineCore::OnProcessStart(DWORD pid, DWORD parentPid,
+                                 const std::wstring& imageName, const std::wstring& imagePath) {
     if (stopRequested_.load()) return;
 
     // Skip critical processes
@@ -544,13 +551,19 @@ void EngineCore::OnProcessStart(DWORD pid, DWORD parentPid, const std::wstring& 
 
     // Case 1: Parent is already tracked -> this is a child process
     if (IsTrackedParent(parentPid)) {
-        ApplyOptimization(pid, imageName, true, parentPid);
+        ApplyOptimization(pid, imageName, true, parentPid, imagePath);
         return;
     }
 
-    // Case 2: This process name is a target
+    // Case 2: This process name is a name-only target
     if (IsTargetName(imageName)) {
-        ApplyOptimization(pid, imageName, false, 0);
+        ApplyOptimization(pid, imageName, false, 0, imagePath);
+        return;
+    }
+
+    // Case 3: Path-based target check (only when path targets are configured)
+    if (HasPathTargets()) {
+        TryApplyByPath(pid, imageName);
     }
 }
 
@@ -596,6 +609,9 @@ void EngineCore::EngineControlLoop() {
     waitHandles[WAIT_ENFORCEMENT_REQUEST] = enforcementRequestEvent_;
     waitHandles[WAIT_PROCESS_EXIT] = hWakeupEvent_;
 
+    // Spin detection: last line of defense against event misfire or future bugs
+    static thread_local uint32_t spinCount = 0;
+
     while (!stopRequested_.load()) {
         DWORD waitResult = WaitForMultipleObjects(WAIT_COUNT, waitHandles, FALSE, INFINITE);
 
@@ -610,6 +626,17 @@ void EngineCore::EngineControlLoop() {
         }
 
         ULONGLONG now = GetTickCount64();
+
+        // Spin detection on hWakeupEvent_ consecutive fires
+        if (waitResult == WAIT_OBJECT_0 + WAIT_PROCESS_EXIT) {
+            if (++spinCount > 10000) {
+                LOG_ALERT(L"[SPIN DETECTED] excessive wakeups");
+                std::this_thread::sleep_for(std::chrono::milliseconds(1));
+                spinCount = 0;
+            }
+        } else {
+            spinCount = 0;
+        }
 
         switch (waitResult) {
             case WAIT_OBJECT_0 + WAIT_CONFIG_CHANGE:
@@ -958,13 +985,18 @@ void EngineCore::HandleConfigChange() {
 
     {
         CSLockGuard lock(policySetCs_);
-        std::set<std::wstring>().swap(policyAppliedSet_);  // clear + release capacity
+        policyCacheLru_.clear();
+        policyCacheMap_.clear();
     }
 
     RefreshTargetSet();
 
+    // Proactive: sync registry policies with updated config
+    ApplyProactivePolicies();
+
     wchar_t cfgBuf[96];
-    swprintf_s(cfgBuf, L"[CONFIG] Reloaded: %zu targets", targetSet_.size());
+    swprintf_s(cfgBuf, L"[CONFIG] Reloaded: %zu name + %zu path targets",
+               targetNameSet_.size(), targetPathSet_.size());
     LOG_DEBUG(cfgBuf);
 
     // Remove tracked processes that are no longer targets
@@ -986,7 +1018,7 @@ void EngineCore::HandleSafetyNetCheck() {
     // §9.00: Local PMR arena for temporary PID snapshot.
     // §9.05: CountingResource defined in anonymous namespace; fallback visible in Debug and Release.
     CountingResource counting(std::pmr::get_default_resource());
-    std::byte arenaBuf[4 * 1024];
+    std::byte arenaBuf[8 * 1024];
     std::pmr::monotonic_buffer_resource arena(arenaBuf, sizeof(arenaBuf), &counting);
 
     std::pmr::vector<DWORD> pidsToCheck(&arena);
@@ -999,7 +1031,49 @@ void EngineCore::HandleSafetyNetCheck() {
         }
     }
 
-    if (pidsToCheck.empty()) return;
+    // §9.14: Policy recovery — retry path resolution for tracked processes with empty fullPath
+    struct PolicyRetryInfo {
+        DWORD pid;
+        HANDLE hProcess;     // borrowed (owned by TrackedProcess::processHandle)
+        std::wstring name;
+    };
+    std::pmr::vector<PolicyRetryInfo> policyRetries(&arena);
+
+    {
+        CSLockGuard lock(trackedCs_);
+        for (const auto& [pid, tp] : trackedProcesses_) {
+            if (tp->needsPolicyRetry && tp->processHandle.get()) {
+                policyRetries.push_back({pid, tp->processHandle.get(), tp->name});
+            }
+        }
+    }
+
+    for (auto& info : policyRetries) {
+        if (stopRequested_.load()) break;
+
+        std::wstring resolved = ResolveProcessPath(info.hProcess);
+        if (!resolved.empty()) {
+            resolved = CanonicalizePath(resolved);
+        }
+        if (resolved.empty()) continue;  // retry on next SafetyNet cycle (10s)
+
+        if (!RegistryPolicyManager::Instance().HasPolicy(resolved)) {
+            std::wstring lowerName = ToLower(info.name);
+            RegistryPolicyManager::Instance().ApplyPolicy(lowerName, resolved);
+            LOG_INFO(L"[REGISTRY] SafetyNet policy recovery: " + lowerName + L" path=" + resolved);
+        }
+
+        {
+            CSLockGuard lock(trackedCs_);
+            auto it = trackedProcesses_.find(info.pid);
+            if (it != trackedProcesses_.end()) {
+                it->second->fullPath = resolved;
+                it->second->needsPolicyRetry = false;
+            }
+        }
+    }
+
+    if (pidsToCheck.empty() && policyRetries.empty()) return;
 
     // Queue safety net checks for each tracked process
     for (DWORD pid : pidsToCheck) {
@@ -1022,6 +1096,19 @@ void EngineCore::HandleSafetyNetCheck() {
         }
 #endif
     }
+
+    // Registry policy integrity verification (30min interval)
+    {
+        constexpr ULONGLONG POLICY_VERIFY_INTERVAL_MS = 30ULL * 60 * 1000;
+        ULONGLONG now = GetTickCount64();
+        if (now - lastPolicyVerifyTime_ >= POLICY_VERIFY_INTERVAL_MS) {
+            if (verifyRunning_.exchange(1, std::memory_order_acquire) == 0) {
+                lastPolicyVerifyTime_ = now;
+                RegistryPolicyManager::Instance().VerifyAndRepair();
+                verifyRunning_.store(0, std::memory_order_release);
+            }
+        }
+    }
 }
 
 // Drain pending process removal queue (called from EngineControlLoop thread only)
@@ -1029,6 +1116,7 @@ void EngineCore::ProcessPendingRemovals() {
     constexpr size_t MAX_DRAIN_PER_TICK = 256;
 
     std::queue<DWORD> pending;
+    bool hasRemaining = false;
     {
         CSLockGuard lock(pendingRemovalCs_);
 
@@ -1041,18 +1129,24 @@ void EngineCore::ProcessPendingRemovals() {
             }
         }
 
-        // Take up to MAX_DRAIN_PER_TICK items per tick (§9.09 修正④: load leveling)
+        // Take up to MAX_DRAIN_PER_TICK items per tick (load leveling)
         size_t toTake = std::min(backlogSize, MAX_DRAIN_PER_TICK);
         for (size_t i = 0; i < toTake; ++i) {
             pending.push(pendingRemovalPids_.front());
             pendingRemovalPids_.pop();
         }
 
-        // §9.09 最終修正⑤: Always signal to prevent lost wakeup.
-        // NOTE: New entries may be enqueued immediately after drain loop,
-        // making empty-check-based signaling racy (check → push race).
-        // Unconditional SetEvent guarantees forward progress at the cost of
-        // one extra wakeup cycle when queue is truly empty.
+        // Snapshot remaining-items flag under lock.
+        // Design: auto-reset event does NOT stay signaled — hasRemaining
+        // ensures the next drain is scheduled when items remain after partial drain.
+        // Push side (P1/P2/P3) guarantees SetEvent on empty→non-empty
+        // transition under the same lock, so no item can be stranded.
+        hasRemaining = !pendingRemovalPids_.empty();
+    }
+
+    // Signal OUTSIDE lock — minimizes lock hold time for push-side contention.
+    // This guarantees: while items remain, the next drain is always scheduled.
+    if (hasRemaining) {
         SetEvent(hWakeupEvent_);
     }
 
@@ -1194,8 +1288,9 @@ void EngineCore::PerformPeriodicMaintenance(ULONGLONG now) {
             processMonitor_.Stop();
 
             bool restarted = processMonitor_.Start(
-                [this](DWORD pid, DWORD parentPid, const std::wstring& imageName) {
-                    this->OnProcessStart(pid, parentPid, imageName);
+                [this](DWORD pid, DWORD parentPid, const std::wstring& imageName,
+                       const std::wstring& imagePath) {
+                    this->OnProcessStart(pid, parentPid, imageName, imagePath);
                 },
                 [this](DWORD threadId, DWORD ownerPid) {
                     this->OnThreadStart(threadId, ownerPid);
@@ -1262,13 +1357,17 @@ void EngineCore::PerformPeriodicMaintenance(ULONGLONG now) {
 
         if (!zombiePids.empty()) {
             // Use pendingRemovalPids_ to safely remove via the normal path
+            bool wasEmpty;
             {
                 CSLockGuard lock(pendingRemovalCs_);
+                wasEmpty = pendingRemovalPids_.empty();
                 for (DWORD pid : zombiePids) {
                     pendingRemovalPids_.push(pid);
                 }
             }
-            SetEvent(hWakeupEvent_);
+            if (wasEmpty) {
+                SetEvent(hWakeupEvent_);
+            }
 
             wchar_t logBuf[128];
             swprintf_s(logBuf, L"[LIVENESS] Detected %zu zombie entries - queued for removal",
@@ -1420,7 +1519,7 @@ void EngineCore::PerformPeriodicMaintenance(ULONGLONG now) {
             size_t errSupSz = 0;
             {
                 CSLockGuard lock(policySetCs_);
-                policySz = policyAppliedSet_.size();
+                policySz = policyCacheMap_.size();
             }
             {
                 CSLockGuard lock(trackedCs_);
@@ -1608,25 +1707,36 @@ bool EngineCore::IsEcoQoSEnabledCached(TrackedProcess& tp, ULONGLONG now) {
 // === Registry Policy Application ===
 
 bool EngineCore::ApplyRegistryPolicy(const std::wstring& exePath, const std::wstring& exeName) {
-    // Check if already applied
+    UNLEAF_ASSERT_CANONICAL(exePath);
+
+    // LRU cache check with registry validation
     {
         CSLockGuard lock(policySetCs_);
-        std::wstring lowerName = ToLower(exeName);
-        if (policyAppliedSet_.find(lowerName) != policyAppliedSet_.end()) {
-            return true;  // Already applied
+        auto it = policyCacheMap_.find(exePath);
+        if (it != policyCacheMap_.end()) {
+            if (RegistryPolicyManager::Instance().IsPolicyValid(exePath)) {
+                policyCacheLru_.splice(policyCacheLru_.begin(), policyCacheLru_, it->second);
+                return true;
+            } else {
+                policyCacheLru_.erase(it->second);
+                policyCacheMap_.erase(it);
+                LOG_DEBUG(L"[POLICY] LRU invalidated due to external drift: " + exePath);
+            }
         }
     }
 
-    // Apply full registry exclusion
     bool success = RegistryPolicyManager::Instance().ApplyPolicy(exeName, exePath);
 
     if (success) {
         CSLockGuard lock(policySetCs_);
-        if (policyAppliedSet_.size() >= POLICY_SET_MAX_SIZE) {
-            std::set<std::wstring>().swap(policyAppliedSet_);  // clear + release capacity
-            LOG_DEBUG(L"[POLICY] policyAppliedSet reached cap - cleared");
+        // Evict LRU if at capacity
+        if (policyCacheMap_.size() >= POLICY_CACHE_MAX_SIZE) {
+            auto& oldest = policyCacheLru_.back();
+            policyCacheMap_.erase(oldest);
+            policyCacheLru_.pop_back();
         }
-        policyAppliedSet_.insert(ToLower(exeName));
+        policyCacheLru_.push_front(exePath);
+        policyCacheMap_[exePath] = policyCacheLru_.begin();
         policyApplyCount_.fetch_add(1, std::memory_order_relaxed);
 
         wchar_t logBuf[256];
@@ -2079,10 +2189,16 @@ void EngineCore::InitialScanForDegradedMode() {
 
     ScopedSnapshot scopedSnapshot = MakeScopedSnapshot(snapshot);
 
-    std::set<std::wstring> localTargets;
+    std::set<std::wstring> localNameTargets;
+    std::set<std::wstring> localPathTargets;
+    std::set<std::wstring> localPathFileNames;
+    bool pathTargetsActive = false;
     {
         CSLockGuard lock(targetCs_);
-        localTargets = targetSet_;
+        localNameTargets   = targetNameSet_;
+        localPathTargets   = targetPathSet_;
+        localPathFileNames = pathTargetFileNames_;
+        pathTargetsActive  = !localPathTargets.empty();
     }
 
     PROCESSENTRY32W pe32;
@@ -2091,18 +2207,33 @@ void EngineCore::InitialScanForDegradedMode() {
     if (Process32FirstW(scopedSnapshot.get(), &pe32)) {
         do {
             DWORD pid = pe32.th32ProcessID;
-            const std::wstring& name = pe32.szExeFile;
+            const std::wstring name(pe32.szExeFile);
             DWORD parentPid = pe32.th32ParentProcessID;
 
             if (IsTracked(pid)) continue;
             if (IsCriticalProcess(name)) continue;
 
             std::wstring lowerName = ToLower(name);
-            bool isTarget = (localTargets.count(lowerName) > 0);
+            bool isNameTarget = (localNameTargets.count(lowerName) > 0);
             bool isChild = IsTrackedParent(parentPid);
 
-            if (isTarget || isChild) {
+            if (isNameTarget || isChild) {
                 ApplyOptimization(pid, name, isChild, parentPid);
+                continue;
+            }
+
+            // Path-based check
+            if (pathTargetsActive && localPathFileNames.count(lowerName) > 0) {
+                DWORD access = PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_SET_INFORMATION;
+                HANDLE hProc = OpenProcess(access, FALSE, pid);
+                if (hProc) {
+                    ScopedHandle scoped = MakeScopedHandle(hProc);
+                    std::wstring fullPath = ResolveProcessPath(scoped.get());
+                    if (!fullPath.empty() && localPathTargets.count(fullPath) > 0) {
+                        ApplyOptimizationWithHandle(pid, name, false, 0,
+                                                     std::move(scoped), fullPath);
+                    }
+                }
             }
         } while (Process32NextW(scopedSnapshot.get(), &pe32));
     }
@@ -2143,16 +2274,23 @@ void EngineCore::InitialScan() {
     };
 
     // Find and optimize target processes
-    std::set<std::wstring> localTargets;
+    std::set<std::wstring> localNameTargets;
+    std::set<std::wstring> localPathTargets;
+    std::set<std::wstring> localPathFileNames;
+    bool pathTargetsActive = false;
     {
         CSLockGuard lock(targetCs_);
-        localTargets = targetSet_;
+        localNameTargets   = targetNameSet_;
+        localPathTargets   = targetPathSet_;
+        localPathFileNames = pathTargetFileNames_;
+        pathTargetsActive  = !localPathTargets.empty();
     }
 
+    // Phase A: name-based scan (unchanged behavior)
     for (const auto& [pid, info] : processMap) {
         std::wstring lowerName = ToLower(info.name);
 
-        if (localTargets.find(lowerName) != localTargets.end()) {
+        if (localNameTargets.find(lowerName) != localNameTargets.end()) {
             if (!IsCriticalProcess(info.name) && !IsTracked(pid)) {
                 ApplyOptimization(pid, info.name, false, 0);
             }
@@ -2168,9 +2306,46 @@ void EngineCore::InitialScan() {
             }
         }
     }
+
+    // Phase B: path-based scan (only when path targets configured)
+    if (pathTargetsActive) {
+        for (const auto& [pid, info] : processMap) {
+            if (IsTracked(pid)) continue;
+            if (IsCriticalProcess(info.name)) continue;
+            // Skip processes already matched by name
+            if (localNameTargets.count(ToLower(info.name))) continue;
+            // Pre-filter: skip if exe name not in any path target
+            if (localPathFileNames.count(ToLower(info.name)) == 0) continue;
+
+            // Open with full permissions needed for optimization
+            DWORD access = PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_SET_INFORMATION;
+            HANDLE hProc = OpenProcess(access, FALSE, pid);
+            if (!hProc) continue;
+            ScopedHandle scoped = MakeScopedHandle(hProc);
+
+            std::wstring fullPath = ResolveProcessPath(scoped.get());
+            if (fullPath.empty()) continue;
+
+            if (localPathTargets.count(fullPath) > 0) {
+                // Hand off handle — no second OpenProcess
+                ApplyOptimizationWithHandle(pid, info.name, false, 0,
+                                             std::move(scoped), fullPath);
+
+                // Collect and optimize descendants
+                std::vector<std::pair<DWORD, std::wstring>> descendants;
+                collectDescendants(pid, descendants);
+                for (const auto& [childPid, childName] : descendants) {
+                    if (!IsTracked(childPid)) {
+                        ApplyOptimization(childPid, childName, true, pid);
+                    }
+                }
+            }
+        }
+    }
 }
 
-bool EngineCore::ApplyOptimization(DWORD pid, const std::wstring& name, bool isChild, DWORD parentPid) {
+bool EngineCore::ApplyOptimization(DWORD pid, const std::wstring& name, bool isChild,
+                                    DWORD parentPid, const std::wstring& preResolvedPath) {
     // Skip if already tracked
     if (IsTracked(pid)) {
         return false;
@@ -2185,7 +2360,6 @@ bool EngineCore::ApplyOptimization(DWORD pid, const std::wstring& name, bool isC
     DWORD access = PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_SET_INFORMATION;
     HANDLE hProcess = OpenProcess(access, FALSE, pid);
     if (!hProcess) {
-        // Log failure for observability
         wchar_t logBuf[256];
         swprintf_s(logBuf, L"[SKIP] %s (PID:%lu) OpenProcess failed (error=%lu)",
                    name.c_str(), pid, GetLastError());
@@ -2194,25 +2368,97 @@ bool EngineCore::ApplyOptimization(DWORD pid, const std::wstring& name, bool isC
     }
 
     ScopedHandle scopedHandle = MakeScopedHandle(hProcess);
+
+    // Resolve full path: detect NT device paths from ETW and route appropriately
+    auto isNtDevicePath = [](const std::wstring& p) {
+        return p.size() > 8 &&
+               (p.rfind(L"\\Device\\", 0) == 0 ||
+                p.rfind(L"\\??\\", 0) == 0);
+    };
+
+    std::wstring resolvedPath;
+
+    if (!preResolvedPath.empty() && !isNtDevicePath(preResolvedPath)) {
+        // Safe Win32 path — CanonicalizePath で正規化
+        resolvedPath = CanonicalizePath(preResolvedPath);
+    } else {
+        // NT デバイスパスまたは preResolvedPath 空 → ハンドルベース解決
+        resolvedPath = ResolveProcessPath(scopedHandle.get());
+        if (!resolvedPath.empty()) {
+            resolvedPath = CanonicalizePath(resolvedPath);
+        }
+
+        if (resolvedPath.empty()) {
+            wchar_t diagBuf[512];
+            swprintf_s(diagBuf,
+                L"[DIAG] ApplyOptimization: path resolution failed for %s (PID:%lu) hint=%s",
+                name.c_str(), pid,
+                preResolvedPath.empty() ? L"(empty)" : L"(NT device path)");
+            LOG_DEBUG(diagBuf);
+        }
+    }
+
+    return ApplyOptimizationWithHandle(pid, name, isChild, parentPid,
+                                        std::move(scopedHandle), resolvedPath);
+}
+
+bool EngineCore::ApplyOptimizationWithHandle(DWORD pid, const std::wstring& name,
+                                              bool isChild, DWORD parentPid,
+                                              ScopedHandle&& scopedHandle,
+                                              const std::wstring& resolvedPath) {
+    // Guard: skip if already tracked or critical (may be called directly from TryApplyByPath)
+    if (IsTracked(pid)) return false;
+    if (IsCriticalProcess(name)) return false;
+
     ULONGLONG now = GetTickCount64();
 
-    // Apply registry policy for root target processes (once per executable)
-    if (!isChild) {
-        // Get full path for registry policy
-        wchar_t pathBuffer[MAX_PATH];
-        DWORD pathSize = MAX_PATH;
-        if (QueryFullProcessImageNameW(scopedHandle.get(), 0, pathBuffer, &pathSize)) {
-            std::wstring fullPath(pathBuffer);
-            ApplyRegistryPolicy(fullPath, name);
+    // DESIGN CONTRACT:
+    // EngineCore guarantees canonicalized paths via CanonicalizePath().
+    // RegistryPolicyManager assumes canonical input.
+    // NormalizePath is defensive only and must not be relied upon for primary normalization.
+    //
+    // DO NOT:
+    // - Rely on NormalizePath as primary normalization
+    // - Pass raw/unresolved paths into RegistryPolicyManager
+    //
+    // Registry policy application strategy (§9.14):
+    // - name-only target: proactive applied IFEO only (no path); PowerThrottle must be applied
+    //   unconditionally on first detection — HasPolicy would always be false but we make intent explicit.
+    // - path-based target: proactive applied full policy when file existed; fallback via HasPolicy check.
+    {
+        std::wstring lowerName = ToLower(name);
+        bool isNameOnlyTarget = false;
+        {
+            CSLockGuard lock(targetCs_);
+            isNameOnlyTarget = (targetNameSet_.count(lowerName) > 0);
+        }
+
+        if (!resolvedPath.empty()) {
+            if (isNameOnlyTarget) {
+                // name-only: proactive had no path, apply full policy now (IFEO idempotent + PT new)
+                RegistryPolicyManager::Instance().ApplyPolicy(lowerName, resolvedPath);
+                LOG_DEBUG(L"[REGISTRY] Name-only policy applied: " + lowerName);
+            } else if (!RegistryPolicyManager::Instance().HasPolicy(resolvedPath)) {
+                // path-based fallback: file didn't exist at startup, apply now
+                RegistryPolicyManager::Instance().ApplyPolicy(lowerName, resolvedPath);
+                LOG_DEBUG(L"[REGISTRY] Path-based fallback policy applied: " + lowerName);
+            }
+        } else {
+            wchar_t diagBuf[256];
+            swprintf_s(diagBuf,
+                L"[DIAG] ApplyOptimizationWithHandle: empty path, policy deferred for %s (PID:%lu)",
+                name.c_str(), pid);
+            LOG_DEBUG(diagBuf);
         }
     }
 
     bool success = PulseEnforceV6(scopedHandle.get(), pid, true);
 
-    // Log the optimization
-    wchar_t optBuf[256];
-    swprintf_s(optBuf, L"Optimized: %s %s (PID: %lu) Child=%d",
-               isChild ? L"[CHILD]" : L"[TARGET]", name.c_str(), pid, isChild ? 1 : 0);
+    // Log the optimization with path
+    wchar_t optBuf[512];
+    swprintf_s(optBuf, L"[TRACK] %s %s (PID: %lu) Child=%d path=%s",
+               isChild ? L"[CHILD]" : L"[TARGET]", name.c_str(), pid, isChild ? 1 : 0,
+               resolvedPath.empty() ? L"(unresolved)" : resolvedPath.c_str());
     LOG_DEBUG(optBuf);
 
     // Job Object assignment for root target processes
@@ -2241,6 +2487,8 @@ bool EngineCore::ApplyOptimization(DWORD pid, const std::wstring& name, bool isC
     tracked->pid = pid;
     tracked->parentPid = parentPid;
     tracked->name = name;
+    tracked->fullPath = resolvedPath;  // cached path (empty if unresolved)
+    tracked->needsPolicyRetry = resolvedPath.empty();
     tracked->processHandle = std::move(scopedHandle);
     tracked->isChild = isChild;
     tracked->phase = ProcessPhase::AGGRESSIVE;
@@ -2334,8 +2582,10 @@ bool EngineCore::ApplyOptimization(DWORD pid, const std::wstring& name, bool isC
             }
         }
 
+        bool wasEmpty;
         {
             CSLockGuard lock(pendingRemovalCs_);
+            wasEmpty = pendingRemovalPids_.empty();
             for (DWORD evictPid : evictList) {
                 size_t pendingSize = pendingRemovalPids_.size();
                 if (pendingSize >= MAX_PENDING_REMOVALS) {
@@ -2361,7 +2611,9 @@ bool EngineCore::ApplyOptimization(DWORD pid, const std::wstring& name, bool isC
                 pendingRemovalPids_.push(evictPid);
             }
         }
-        SetEvent(hWakeupEvent_);
+        if (wasEmpty) {
+            SetEvent(hWakeupEvent_);
+        }
     }
 
     // Schedule deferred verification
@@ -2536,7 +2788,126 @@ bool EngineCore::IsTracked(DWORD pid) const {
 
 bool EngineCore::IsTargetName(const std::wstring& name) const {
     CSLockGuard lock(targetCs_);
-    return engine_logic::IsTargetProcess(ToLower(name), targetSet_);
+    return engine_logic::IsTargetProcess(ToLower(name), targetNameSet_);
+}
+
+bool EngineCore::IsTargetPath(const std::wstring& fullPathLower) const {
+    CSLockGuard lock(targetCs_);
+    return engine_logic::IsTargetByPath(fullPathLower, targetPathSet_, targetNameSet_);
+}
+
+bool EngineCore::HasPathTargets() const {
+    return hasPathTargets_.load(std::memory_order_acquire);
+}
+
+// static — delegates to unleaf::CanonicalizePath (types.h)
+std::wstring EngineCore::CanonicalizePath(const std::wstring& rawPath) {
+    return unleaf::CanonicalizePath(rawPath);
+}
+
+// static
+bool EngineCore::FileExistsW(const std::wstring& path) {
+    DWORD attrs = GetFileAttributesW(path.c_str());
+    return (attrs != INVALID_FILE_ATTRIBUTES);
+}
+
+std::wstring EngineCore::ResolveProcessPath(HANDLE hProcess) const {
+    wchar_t rawBuf[MAX_PATH + 1] = {};
+    DWORD rawSize = MAX_PATH;
+    if (!QueryFullProcessImageNameW(hProcess, 0, rawBuf, &rawSize)) {
+        LOG_DEBUG(L"[DIAG] ResolveProcessPath: QueryFullProcessImageNameW failed, error="
+                  + std::to_wstring(GetLastError()));
+        return L"";
+    }
+
+    std::wstring rawPath(rawBuf, rawSize);
+
+    // For running processes, use GetFinalPathNameByHandleW for symlink resolution
+    HANDLE hFile = CreateFileW(
+        rawPath.c_str(), 0,
+        FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+        nullptr, OPEN_EXISTING,
+        FILE_FLAG_BACKUP_SEMANTICS, nullptr);
+
+    if (hFile == INVALID_HANDLE_VALUE) {
+        // Process file inaccessible — fall back to CanonicalizePath
+        return CanonicalizePath(rawPath);
+    }
+
+    wchar_t buf[MAX_PATH + 4] = {};
+    DWORD len = GetFinalPathNameByHandleW(
+        hFile, buf, MAX_PATH + 4,
+        FILE_NAME_NORMALIZED | VOLUME_NAME_DOS);
+    CloseHandle(hFile);
+
+    if (len == 0 || len > MAX_PATH) {
+        return CanonicalizePath(rawPath);
+    }
+
+    std::wstring result(buf, len);
+
+    // \\?\UNC\server\share -> \\server\share
+    if (result.size() >= 8 &&
+        result[0] == L'\\' && result[1] == L'\\' &&
+        result[2] == L'?'  && result[3] == L'\\' &&
+        (result[4] == L'U' || result[4] == L'u') &&
+        (result[5] == L'N' || result[5] == L'n') &&
+        (result[6] == L'C' || result[6] == L'c') &&
+        result[7] == L'\\') {
+        result = L"\\\\" + result.substr(8);
+    }
+    // \\?\ -> remove prefix
+    else if (result.size() >= 4 &&
+             result[0] == L'\\' && result[1] == L'\\' &&
+             result[2] == L'?'  && result[3] == L'\\') {
+        result = result.substr(4);
+    }
+
+    // Lowercase
+    for (auto& ch : result) ch = towlower(ch);
+
+    return result;
+}
+
+void EngineCore::TryApplyByPath(DWORD pid, const std::wstring& name) {
+    if (IsTracked(pid)) return;
+    if (IsCriticalProcess(name)) return;
+
+    DWORD access = PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_SET_INFORMATION;
+    HANDLE hProc = OpenProcess(access, FALSE, pid);
+    if (!hProc) {
+        LOG_DEBUG(L"[PATH] TryApplyByPath: OpenProcess failed for " + name);
+        return;
+    }
+    ScopedHandle scoped = MakeScopedHandle(hProc);
+
+    std::wstring resolvedPath = ResolveProcessPath(scoped.get());
+    if (!resolvedPath.empty()) {
+        resolvedPath = CanonicalizePath(resolvedPath);
+    }
+    if (resolvedPath.empty()) {
+        LOG_DEBUG(L"[PATH] TryApplyByPath: path resolution failed for " + name);
+        return;
+    }
+
+    if (!IsTargetPath(resolvedPath)) {
+        // Symlink/junction で CanonicalizePath と GetFinalPathNameByHandleW が
+        // 異なるパスを返す場合のフォールバック。
+        // ファイル名が pathTargetFileNames_ に含まれていれば続行。
+        // HasPolicy fallback in ApplyOptimizationWithHandle が正しいパスで PT を作成する。
+        std::wstring lowerName = ToLower(name);
+        bool fileNameMatch = false;
+        {
+            CSLockGuard lock(targetCs_);
+            fileNameMatch = (pathTargetFileNames_.count(lowerName) > 0);
+        }
+        if (!fileNameMatch) return;
+        LOG_DEBUG(L"[PATH] TryApplyByPath: exact path mismatch, filename fallback: " + resolvedPath);
+    }
+
+    // Delegate with the already-open handle (no second OpenProcess)
+    ApplyOptimizationWithHandle(pid, name, false, 0,
+                                 std::move(scoped), resolvedPath);
 }
 
 bool EngineCore::IsTrackedParent(DWORD parentPid) const {
@@ -2546,43 +2917,126 @@ bool EngineCore::IsTrackedParent(DWORD parentPid) const {
 }
 
 void EngineCore::RefreshTargetSet() {
-    CSLockGuard lock(targetCs_);
-    targetSet_.clear();
+    // Collect path targets outside the lock
+    struct ResolvedEntry {
+        std::wstring normalized;
+        std::wstring fileName;
+    };
+    std::vector<ResolvedEntry> pathEntries;
+    std::vector<std::wstring> nameEntries;
 
-    const auto& targets = UnLeafConfig::Instance().GetTargets();
-    for (const auto& target : targets) {
-        if (target.enabled) {
-            targetSet_.insert(ToLower(target.name));
+    {
+        const auto& targets = UnLeafConfig::Instance().GetTargets();
+        for (const auto& target : targets) {
+            if (!target.enabled) continue;
+            if (IsPathEntry(target.name)) {
+                std::wstring norm = CanonicalizePath(target.name);
+                if (norm.empty()) {
+                    wchar_t logBuf[512];
+                    swprintf_s(logBuf,
+                               L"[REGISTRY] Target path canonicalization failed, skipping: %s",
+                               target.name.c_str());
+                    LOG_ALERT(logBuf);
+                } else {
+                    ResolvedEntry e;
+                    e.normalized = norm;
+                    e.fileName   = ExtractFileName(norm);
+                    pathEntries.push_back(std::move(e));
+                }
+            } else {
+                nameEntries.push_back(ToLower(target.name));
+            }
         }
     }
+
+    // Update sets under lock
+    CSLockGuard lock(targetCs_);
+    targetNameSet_.clear();
+    targetPathSet_.clear();
+    pathTargetFileNames_.clear();
+
+    for (auto& name : nameEntries) {
+        targetNameSet_.insert(std::move(name));
+    }
+    for (auto& e : pathEntries) {
+        targetPathSet_.insert(e.normalized);
+        pathTargetFileNames_.insert(e.fileName);
+    }
+
+    hasPathTargets_.store(!targetPathSet_.empty(), std::memory_order_release);
+}
+
+void EngineCore::ApplyProactivePolicies() {
+    const auto& targets = UnLeafConfig::Instance().GetTargets();
+
+    std::set<std::wstring> desiredNames;
+    std::set<std::wstring> desiredPaths;
+
+    for (const auto& target : targets) {
+        if (!target.enabled) continue;
+
+        if (IsPathEntry(target.name)) {
+            // Path target: canonicalize path (no file handle needed)
+            std::wstring resolved = CanonicalizePath(target.name);
+            if (resolved.empty()) {
+                LOG_ALERT(L"[REGISTRY] Proactive: path canonicalization failed, skipping: " + target.name);
+                continue;
+            }
+
+            std::wstring exeName = ExtractFileName(resolved);
+            std::wstring lowerName = ToLower(exeName);
+
+            if (FileExistsW(resolved)) {
+                // File exists: apply full policy (IFEO + PowerThrottle)
+                // NOTE: IFEO is exe-name-based and applies globally to ALL instances of this exe name,
+                // not just the specific path. This is by design — IFEO operates at the OS level
+                // per executable name. Path-specific differentiation is handled by PowerThrottle only.
+                RegistryPolicyManager::Instance().ApplyPolicy(lowerName, resolved);
+                desiredPaths.insert(resolved);
+            } else {
+                // File does not exist (not yet installed, portable app not plugged in, etc.)
+                // Apply IFEO only — PowerThrottle requires a valid path in registry.
+                // Full policy will be applied via ETW fallback (修正③) when the process starts.
+                RegistryPolicyManager::Instance().ApplyIFEOOnly(lowerName);
+                LOG_ALERT(L"[REGISTRY] Proactive: file not found, IFEO only: " + resolved);
+            }
+            desiredNames.insert(lowerName);
+        } else {
+            // Name-only target: apply IFEO only (no path for PowerThrottle)
+            std::wstring lowerName = ToLower(target.name);
+            RegistryPolicyManager::Instance().ApplyIFEOOnly(lowerName);
+            desiredNames.insert(lowerName);
+        }
+    }
+
+    // Reconcile: remove policies no longer in config
+    RegistryPolicyManager::Instance().ReconcileWithConfig(desiredNames, desiredPaths);
+
+    wchar_t buf[128];
+    swprintf_s(buf, L"[REGISTRY] Proactive policies applied: %zu names + %zu paths",
+               desiredNames.size(), desiredPaths.size());
+    LOG_INFO(buf);
 }
 
 void EngineCore::CleanupRemovedTargets() {
     // Get current valid targets
-    std::set<std::wstring> localTargets;
+    std::set<std::wstring> localNameTargets;
+    std::set<std::wstring> localPathTargets;
+    bool pathTargetsActive = false;
     {
         CSLockGuard lock(targetCs_);
-        localTargets = targetSet_;
+        localNameTargets  = targetNameSet_;
+        localPathTargets  = targetPathSet_;
+        pathTargetsActive = !localPathTargets.empty();
     }
 
     // Collect PIDs of root targets that are no longer in the target list
     std::vector<DWORD> toRemove;
-    std::set<DWORD> validRootPids;
 
     {
         CSLockGuard lock(trackedCs_);
 
-        // First pass: identify valid root processes
-        for (const auto& [pid, tp] : trackedProcesses_) {
-            if (!tp->isChild) {
-                std::wstring lowerName = ToLower(tp->name);
-                if (localTargets.find(lowerName) != localTargets.end()) {
-                    validRootPids.insert(pid);
-                }
-            }
-        }
-
-        // Second pass: collect processes to remove
+        // Collect processes to remove
         for (const auto& [pid, tp] : trackedProcesses_) {
             bool shouldRemove = false;
 
@@ -2596,10 +3050,17 @@ void EngineCore::CleanupRemovedTargets() {
                     shouldRemove = true;
                 }
             } else {
-                // Root process: remove if not in target list
-                std::wstring lowerName = ToLower(tp->name);
-                if (localTargets.find(lowerName) == localTargets.end()) {
-                    shouldRemove = true;
+                // Root process validity check
+                if (!tp->fullPath.empty() && pathTargetsActive) {
+                    // Path-resolved process: path match is the sole criterion (path-absolute priority)
+                    bool pathMatch = (localPathTargets.count(tp->fullPath) > 0);
+                    if (!pathMatch) shouldRemove = true;
+                } else {
+                    // No resolved path or no path targets: fall back to name match
+                    std::wstring lowerName = ToLower(tp->name);
+                    if (localNameTargets.find(lowerName) == localNameTargets.end()) {
+                        shouldRemove = true;
+                    }
                 }
             }
 

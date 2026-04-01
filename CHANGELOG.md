@@ -4,7 +4,7 @@ All notable changes to UnLeaf will be documented in this file.
 
 ---
 
-## [1.1.0] - 2026-03-26
+## [1.1.0] - 2026-03-30
 
 ### Changed (§9.00〜§9.09 メモリ安定化・長期稼働品質改善)
 - `trackedProcesses_` ハード上限 (`MAX_TRACKED_PROCESSES=2000`) 到達時に `SelectEvictionCandidate()` で zombie 優先・最古優先の退避候補を選出し `pendingRemovalPids_` 経由で `RemoveTrackedProcess()` に委任 — Timer/WaitContext リークを防止 (§9.00)
@@ -20,6 +20,40 @@ All notable changes to UnLeaf will be documented in this file.
 - `CountingResource` / `IsCSHeldByCurrent` / `SelectEvictionCandidates` を anonymous namespace に一元定義 — ODR 違反なし、ヘッダ変更不要 (§9.05/§9.07)
 - `SelectEvictionCandidate()` 先頭に DEBUG ASSERT (`IsCSHeldByCurrent`) 追加 — `trackedCs_` 保持義務を実行時検証 (§9.07)
 - `pendingRemovalPids_` backlog の3段階ログ: 50% → `LOG_INFO`、75% → `LOG_ALERT`、overflow → `LOG_ALERT` (§9.04/§9.09)
+
+### Changed (§9.10 RegistryPolicyManager v5)
+- RegistryPolicyManager を全面再設計: IFEO (exe 名単位) と PowerThrottle (パス単位) を分離管理。per-entry state machine (APPLYING→COMMITTED)、lock-free Treiber stack、`policyCs_` ZERO I/O、`ifeoRefCount_` 参照カウント
+- マニフェスト形式を v5 に更新: `[IFEOPolicies]` + `[PowerThrottlePolicies]` の2セクション構成
+- `SaveManifestAtomic()`: temp file + `FlushFileBuffers` + `MoveFileExW(REPLACE_EXISTING | WRITE_THROUGH)` で原子的更新。`stateVersion_` による snapshot 整合性チェック付き
+- `VerifyAndRepair()` (30分間隔): registry/memory 不整合を自動修復
+- `IsCanonicalPathImpl` + `UNLEAF_ASSERT_CANONICAL` マクロで正規化済みパスを実行時検証
+- LRU キャッシュ (list + unordered_map) で EngineCore 側の重複 ApplyPolicy を排除
+
+### Fixed (§9.11 CPU 暴走対策)
+- `ProcessPendingRemovals` の無条件 `SetEvent(hWakeupEvent_)` による CPU 96.9% 暴走を修正。`hasRemaining` フラグを lock 内で取得し、SetEvent を lock 外で条件付き実行
+- 全 push サイト (P1: OnProcessStop, P2: Zombie detection, P3: Eviction) を `wasEmpty` パターンに統一
+- EngineControlLoop にスピン検知を追加 (連続 10,000 wakeup 超で `[SPIN DETECTED]` ログ + 1ms sleep)
+
+### Added (§9.12 プロアクティブポリシー生成)
+- `ApplyProactivePolicies()`: Initialize / HandleConfigChange 時に config 全エントリへポリシー適用。リアクティブ→プロアクティブへアーキテクチャ移行
+- `ApplyIFEOOnly()`: name-only target の IFEO プロアクティブ適用
+- `ReconcileWithConfig()`: config から除外されたエントリの自動削除。`stateVersion_` CAS による race condition 防止
+- `HasPolicy()` + ETW フォールバック: `ApplyOptimizationWithHandle` でプロアクティブ適用失敗時に `ApplyPolicy` をリカバリ呼び出し
+- `FileExistsW()`: パス存在確認。存在時は IFEO + PowerThrottle、不在時は IFEO のみ適用
+
+### Fixed (§9.14 name-only ターゲット PowerThrottle 遅延適用バグ)
+- `ApplyOptimizationWithHandle` に name-only / path-based 分岐を追加: `targetNameSet_` に登録された name-only ターゲット (例: `chrome.exe=1`) は `HasPolicy()` ゲートをバイパスし、resolvedPath が取得できた時点で即座に `ApplyPolicy()` を呼び出す。これによりサービス起動後に起動したプロセスに PowerThrottle レジストリポリシーが適用されない問題を解消
+- `TrackedProcess` に `needsPolicyRetry` フラグを追加: ETW コールバック時点で `QueryFullProcessImageNameW` が失敗 (イメージマッピング未完了) した場合に `true` を設定
+- SafetyNet (10s) にポリシー回復ロジックを追加: `needsPolicyRetry = true` のプロセスに対し ResolveProcessPath を再試行し、パス取得成功時に `ApplyPolicy` を呼び出して `fullPath` と `needsPolicyRetry` を更新
+- SafetyNet PMR arena を 4 KB → 8 KB に拡張 (PolicyRetryInfo ベクタ分を確保)
+- 診断ログ追加: `ResolveProcessPath` 失敗時 / `ApplyOptimization` パス解決失敗時 / `ApplyOptimizationWithHandle` 空パス遅延ログ (`[DIAG]` タグ)
+
+### Changed (§9.13 CanonicalizePath 正規化統一)
+- `ResolvePathByHandle` を完全廃止し `CanonicalizePath` (`GetFullPathNameW` ベース、ファイル存在不要) に置換
+- `CanonicalizePath` を `types.h` に free function として配置 (EngineCore・RegistryPolicyManager 双方から利用)
+- `GetFullPathNameW` 2段階呼び出し (動的バッファ) で MAX_PATH 制限を撤廃
+- `policyMap_` の全キー生成・検索を `CanonicalizePath` に統一。`NormalizePath` はフォールバック/ログ用途に限定
+- 設計契約コメント (DESIGN CONTRACT / DO NOT) を `engine_core.cpp`, `registry_manager.cpp`, `registry_manager.h` に追加
 
 ---
 

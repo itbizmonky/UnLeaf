@@ -331,7 +331,7 @@ std::string IPCServer::ProcessCommand(IPCCommand cmd, const std::string& data) {
                 return "{\"error\": \"Process name required\"}";
             }
             std::wstring processName = unleaf::Utf8ToWide(data.c_str());
-            if (!IsValidProcessName(processName)) {
+            if (!IsValidTargetEntry(processName)) {
                 LOG_ALERT(L"IPC: Validation failed - invalid process name '" + processName + L"'");
                 return "{\"error\": \"Invalid process name\"}";
             }

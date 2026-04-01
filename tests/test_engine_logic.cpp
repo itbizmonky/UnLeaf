@@ -178,3 +178,57 @@ TEST(DeferredVerifyDelayMsTest, V2EqualsVFinalStep3YieldsZero) {
 TEST(DeferredVerifyDelayMsTest, V1ZeroStep1) {
     EXPECT_EQ(DeferredVerifyDelayMs(1, EnginePolicy{3, 200,   0, 1000, 3000}), 0u);  // v1=0
 }
+
+// ============================================================
+// IsTargetByPath
+// ============================================================
+
+using engine_logic::IsTargetByPath;
+
+TEST(IsTargetByPathTest, ExactPathMatch) {
+    std::set<std::wstring> paths = {L"c:\\program files\\google\\chrome\\application\\chrome.exe"};
+    std::set<std::wstring> names;
+    EXPECT_TRUE(IsTargetByPath(
+        L"c:\\program files\\google\\chrome\\application\\chrome.exe", paths, names));
+}
+
+TEST(IsTargetByPathTest, ExactPathNoMatch) {
+    std::set<std::wstring> paths = {L"c:\\program files\\google\\chrome\\application\\chrome.exe"};
+    std::set<std::wstring> names;
+    EXPECT_FALSE(IsTargetByPath(
+        L"c:\\users\\kenbo\\appdata\\local\\google\\chrome sxs\\application\\chrome.exe", paths, names));
+}
+
+TEST(IsTargetByPathTest, NameFallbackMatch) {
+    std::set<std::wstring> paths;
+    std::set<std::wstring> names = {L"chrome.exe"};
+    EXPECT_TRUE(IsTargetByPath(
+        L"c:\\program files\\google\\chrome\\application\\chrome.exe", paths, names));
+}
+
+TEST(IsTargetByPathTest, NameFallbackNoMatch) {
+    std::set<std::wstring> paths;
+    std::set<std::wstring> names = {L"firefox.exe"};
+    EXPECT_FALSE(IsTargetByPath(
+        L"c:\\program files\\google\\chrome\\application\\chrome.exe", paths, names));
+}
+
+TEST(IsTargetByPathTest, BothEmptySets) {
+    std::set<std::wstring> paths;
+    std::set<std::wstring> names;
+    EXPECT_FALSE(IsTargetByPath(L"c:\\foo\\bar.exe", paths, names));
+}
+
+TEST(IsTargetByPathTest, PathMatchTakesPriorityOverName) {
+    // Path matches → true, even if names set is also non-empty
+    std::set<std::wstring> paths = {L"c:\\foo\\bar.exe"};
+    std::set<std::wstring> names = {L"other.exe"};
+    EXPECT_TRUE(IsTargetByPath(L"c:\\foo\\bar.exe", paths, names));
+}
+
+TEST(IsTargetByPathTest, FilenameOnlyInput) {
+    // Input with no separator — treated as filename
+    std::set<std::wstring> paths;
+    std::set<std::wstring> names = {L"bar.exe"};
+    EXPECT_TRUE(IsTargetByPath(L"bar.exe", paths, names));
+}

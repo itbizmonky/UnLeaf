@@ -218,10 +218,11 @@ void WINAPI ProcessMonitor::EventRecordCallback(PEVENT_RECORD pEvent) {
         DWORD pid = 0;
         DWORD parentPid = 0;
         std::wstring imageName;
+        std::wstring imagePath;
 
-        if (ParseProcessStartEvent(pEvent, pid, parentPid, imageName)) {
+        if (ParseProcessStartEvent(pEvent, pid, parentPid, imageName, imagePath)) {
             if (instance_->processCallback_) {
-                instance_->processCallback_(pid, parentPid, imageName);
+                instance_->processCallback_(pid, parentPid, imageName, imagePath);
             }
         }
         return;
@@ -244,7 +245,8 @@ void WINAPI ProcessMonitor::EventRecordCallback(PEVENT_RECORD pEvent) {
 
 bool ProcessMonitor::ParseProcessStartEvent(PEVENT_RECORD pEvent,
                                              DWORD& pid, DWORD& parentPid,
-                                             std::wstring& imageName) {
+                                             std::wstring& imageName,
+                                             std::wstring& imagePath) {
     // The process ID is in the event header
     pid = pEvent->EventHeader.ProcessId;
 
@@ -322,11 +324,13 @@ bool ProcessMonitor::ParseProcessStartEvent(PEVENT_RECORD pEvent,
                     imageName = reinterpret_cast<LPCWSTR>(propData.data());
                 }
 
-                // Extract just the filename from path
+                // Preserve full path before extracting filename
                 size_t lastSlash = imageName.find_last_of(L"\\/");
                 if (lastSlash != std::wstring::npos) {
+                    imagePath = imageName;  // full path hint (may be 8.3/device format)
                     imageName = imageName.substr(lastSlash + 1);
                 }
+                // If no separator found, imagePath stays empty (filename only from ETW)
             }
         }
     }

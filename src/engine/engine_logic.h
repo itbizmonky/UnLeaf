@@ -21,6 +21,15 @@ enum class ProcessPhase {
 bool IsTargetProcess(const std::wstring& processNameLower,
                      const std::set<std::wstring>& targetNames);
 
+// Full-path-based target lookup.
+// fullPathLower: normalized lowercase absolute path (from GetFinalPathNameByHandleW)
+// targetPaths: set of normalized lowercase full paths
+// targetNames: set of lowercase exe names (name-only fallback)
+// Priority: 1) exact path match in targetPaths, 2) filename match in targetNames
+bool IsTargetByPath(const std::wstring& fullPathLower,
+                    const std::set<std::wstring>& targetPaths,
+                    const std::set<std::wstring>& targetNames);
+
 // EcoQoS cache validity check.
 // Returns true if the cached value is still valid (cache hit).
 bool IsCacheValid(bool cached, uint64_t now,

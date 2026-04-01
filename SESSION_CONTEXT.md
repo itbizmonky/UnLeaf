@@ -1,7 +1,7 @@
 # UnLeaf v1.1.0 Project Context
 
-> **最終更新**: 2026-03-26
-> **ステータス**: **v1.1.0 リリース完了** — §9.00〜§9.09 メモリ安定化適用済み。ビルド警告ゼロ・104/104 PASS 確認済み。
+> **最終更新**: 2026-03-30
+> **ステータス**: **v1.1.0 開発中** — プロアクティブポリシー生成 + CanonicalizePath 正規化統一 + 設計契約コメント追加 完了。ビルド警告ゼロ・151/151 PASS 確認済み。
 
 ---
 
@@ -24,9 +24,13 @@
 
 | 検証項目 | 結果 |
 |---------|------|
-| ビルド (Service / Manager / Tests) | ✅ 警告ゼロ Release+Debug (2026-03-26) |
-| ユニットテスト | ✅ 104/104 PASS (2026-03-26) |
+| ビルド (Service / Manager / Tests) | ✅ 警告ゼロ Release (2026-03-30) |
+| ユニットテスト | ✅ 151/151 PASS (2026-03-30) |
 | v1.1.0 リリース (§9.00〜§9.09 メモリ安定化) | ✅ 完了 (2026-03-26) |
+| RegistryPolicyManager v5 (IFEO/PT split) | ✅ 実装完了 (2026-03-29) |
+| CPU 暴走対策 (SetEvent 責務分離 + スピン検知) | ✅ 実装完了 (2026-03-29) |
+| プロアクティブポリシー生成 (§9.12) | ✅ 実装完了 (2026-03-30) |
+| CanonicalizePath 正規化統一 + 長パス対応 (§9.13) | ✅ 実装完了 (2026-03-30) |
 | ログローテーション完全安定化 (§8.59 + §8.60) | ✅ 完了 (2026-03-24) |
 | ログシーケンス逆転バグ修正 (§8.61) | ✅ 完了 (2026-03-25) |
 | リリース前ソースコード整理 (§8.56) | ✅ 完了 (2026-03-16) |
@@ -35,17 +39,17 @@
 
 > **WDAC 注記 (解消)**: §8.42 で ctest による全 104 件の PASS を確認。WDAC によるブロックは現環境では発生せず。
 
-### ドキュメント状態 (2026-03-24 更新)
+### ドキュメント状態 (2026-03-30 更新)
 
 | ファイル | 状態 |
 |---------|------|
-| `docs/Engine_Specification.md` | ✅ 最新 (v1.0.3・最終更新 2026-03-24) |
+| `docs/Engine_Specification.md` | ⚠️ 要更新 (v1.0.3 のまま — RegistryPolicyManager v5 未反映) |
 | `docs/Manager_Specification.md` | ✅ 最新 (v1.0.3・最終更新 2026-03-24) |
 | `docs/UI_RULES.md` | ✅ 最新 (v1.0.3・最終更新 2026-03-24) |
 | `docs/GitHub_CI_Operation.md` | ✅ 最新 (v1.0.3・最終更新 2026-03-24) |
-| `README.md` | ✅ 最新 (v1.0.3 エントリ追加, 最終更新 2026-03-24) |
-| `README_EN.md` | ✅ 最新 (README.md と同期, 最終更新 2026-03-24) |
-| `CHANGELOG.md` | ✅ 最新 ([1.0.3] §8.61 追記, 最終更新 2026-03-25) |
+| `README.md` | ⚠️ 要更新 (v1.0.3 のまま) |
+| `README_EN.md` | ⚠️ 要更新 (v1.0.3 のまま) |
+| `CHANGELOG.md` | ⚠️ 要更新 (v1.0.3 のまま — v5 改修未記載) |
 
 ---
 
@@ -83,10 +87,10 @@ IPC レート制御: WM_TIMER (1s) → 3 秒ゲート → `PostMessage(WM_IPC_RE
 ```
 src/
 ├── common/
-│   ├── types.h              VERSION 定数, ServiceState enum, CriticalSection
+│   ├── types.h              VERSION 定数, ServiceState enum, CriticalSection, CanonicalizePath, NormalizePath
 │   ├── logger.h/cpp         LightweightLogger (100KB ローテーション)
 │   ├── config.h/cpp         UnLeafConfig (INI パーサ, FindFirstChangeNotification)
-│   ├── registry_manager.h/cpp RegistryPolicyManager (マニフェスト永続化)
+│   ├── registry_manager.h/cpp RegistryPolicyManager v5 (IFEO/PT split, per-entry state machine, lock-free pending queue, proactive reconciliation)
 │   ├── scoped_handle.h      ScopedHandle / ScopedSCMHandle / WaitHandle RAII
 │   └── win_string_utils.h/cpp unleaf::Utf8ToWide / WideToUtf8
 ├── engine/
@@ -94,7 +98,7 @@ src/
 │   ├── engine_logic.h       純粋 C++ 決定ロジック (Win32 依存なし)
 │   └── engine_logic.cpp     IsTargetProcess / IsCacheValid / ShouldExitPersistent 等
 ├── service/
-│   ├── engine_core.h/cpp    EngineCore (WFMO ループ, 3フェーズ制御)
+│   ├── engine_core.h/cpp    EngineCore (WFMO ループ, 3フェーズ制御, SetEvent責務分離, スピン検知, CanonicalizePath, プロアクティブポリシー)
 │   ├── process_monitor.h/cpp ETW セッション管理
 │   ├── ipc_server.h/cpp     Named Pipe サーバー (DACL: SYSTEM + Admins)
 │   └── service_main.cpp     SCM エントリーポイント
@@ -118,7 +122,8 @@ src/
 | `SUPPRESSION_CLEANUP_INTERVAL` | 60,000 ms | errorLogSuppression_ TTL クリーンアップ |
 | `SUPPRESSION_TTL` | 300,000 ms | エラーログ抑制エントリ生存時間 |
 | `SUPPRESSION_MAX_SIZE` | 2,000 | errorLogSuppression_ 緊急キャップ |
-| `POLICY_SET_MAX_SIZE` | 1,000 | policyAppliedSet_ 緊急キャップ |
+| `POLICY_CACHE_MAX_SIZE` | 1,024 | policyCacheMap_ LRU キャッシュ上限 |
+| `POLICY_VERIFY_INTERVAL_MS` | 1,800,000 ms | VerifyAndRepair 実行間隔 (30分) |
 | `MEM_LOG_INTERVAL_SHORT` | 10,000 ms | [MEM] ログ間隔 (起動後 30 分以内) |
 | `MEM_LOG_INTERVAL_LONG` | 60,000 ms | [MEM] ログ間隔 (起動後 30 分以降) |
 | `MEM_LOG_WARMUP_MS` | 1,800,000 ms | [MEM] ウォームアップ期間 (30 分) |
@@ -198,6 +203,10 @@ ctest --test-dir build -C Release --output-on-failure
 | §8.58 | **Phase 4: Virtual ListView ライブログ表示** (`src/manager/main_window.cpp` 他): RichEdit を廃止し、カスタム仮想 ListView + Owner-Draw レンダラーに置換。自動スクロール停止・空白行・二重表示の複合不具合を根本排除。[LIVE-3]/[LIVE-4] は RichEdit 廃止により不要化。ビルド警告ゼロ・104/104 PASS 確認済み | 2026/03/16 |
 | §8.59 | **ログローテーション完全再設計** (`logger.h/cpp`, `service_main.cpp`, `ipc_server.cpp`): 7日間稼働テストで `UnLeaf.log.1` 未生成の重大不具合を確認・修正。① `FILE_SHARE_DELETE` 追加 (logger + ipc_server の全 CreateFileW) — MoveFileExW が ERROR_SHARING_VIOLATION で失敗する根本原因を解消。② `MoveFileW` → `MoveFileExW(REPLACE_EXISTING\|WRITE_THROUGH)` に変更。③ Move 失敗時の `CREATE_ALWAYS` 禁止 — OPEN_ALWAYS でデータ保全、次 write サイクルでリトライ。④ ローテーション責務を Service のみに限定 — `SetRotationEnabled(true)` を service_main.cpp の 2 箇所に追加、Manager はデフォルト `false`。⑤ プロセス間排他 `Global\UnLeafLogRotation` Named Mutex 導入 (INFINITE 待機)。⑥ `RotationGuard` RAII — rotating_ フラグを例外安全に管理。⑦ `CheckStaleHandle()` — Manager が 100 write ごとに NTFS ファイル ID 比較でローテーション後の新 UnLeaf.log に自動収束。⑧ WriteFile ごとの FlushFileBuffers 廃止、rotation 直前のみに限定。⑨ Log() 呼び出しを mutex+RotationGuard スコープ外に移動し、rotating_ に依存しない再入安全設計を確立。104/104 PASS 確認済み | 2026/03/20 |
 | §8.60 | **ログローテーション完全安定化** (`logger.h/cpp`): 第2回ローテーション時サービス停止の根本解決。① `CheckRotation()` を純粋な `RotationResult` 返却関数に変更 — `Log()` 呼び出しを構造的に禁止し、無限再帰 (スタックオーバーフロー) を根絶。② `SafeInternalLog()` 新設 — `WriteFile` 直接書き込みのみ、再帰不可能。③ `MoveFileExW` → `SetFileInformationByHandle(FileRenameInfoEx, POSIX_SEMANTICS)` に置換 — Manager が宛先ハンドルを保持していても原子的リネーム成功。④ `RotationMutexGuard` RAII 化 — `ReleaseMutex` 漏れを構造的に排除。⑤ `ScopedHandle` で rename ハンドルを管理 — リーク完全防止。⑥ `FlushFileBuffers` 失敗時にハンドルクローズ + INVALID 化 — 無限リトライスピン防止。⑦ `WriteFile` 失敗時に `enabled_ = false` — I/O エラーループ防止。⑧ `GetLastError()` を API 失敗直後にローカル変数へ即時取得。104/104 PASS 確認済み | 2026/03/24 |
+| §9.10 | **RegistryPolicyManager v5 全面再設計** (`registry_manager.h/cpp`, `engine_core.h/cpp`, `types.h`, `test_types.cpp`): IFEO (exe 名単位) と PowerThrottle (パス単位) を分離し、同一 exe 名の複数パス (Chrome Stable + Canary 等) を独立管理可能に。① per-entry state machine (APPLYING → COMMITTED) で同一パスの並行 Apply を排他。② lock-free Treiber stack (atomic CAS) による pending removal queue。③ policyCs_ 保持中の I/O をゼロに（DC-2 準拠）。④ registry 書き込み後の IFEOKeyExists / PowerThrottleValueExists による実体検証 (REQ-5)。⑤ ifeoRefCount_ 参照カウントで IFEO キーの共有管理。⑥ LRU キャッシュ (list + unordered_map) で EngineCore 側の重複 Apply を排除。⑦ VerifyAndRepair (30 分間隔) で registry/memory 不整合を自動修復。⑧ SaveManifestAtomic (temp + FlushFileBuffers + MoveFileExW) で manifest クラッシュ安全性確保。⑨ IsCanonicalPathImpl + UNLEAF_ASSERT_CANONICAL マクロ追加。⑩ IsPolicyValid API による LRU キャッシュ実体乖離検出。151/151 PASS 確認済み | 2026/03/29 |
+| §9.11 | **CPU 暴走対策 — SetEvent 責務分離 + スピン検知** (`engine_core.cpp`): 2 時間稼働で CPU 96.9% に達する重大バグを修正。根本原因: `ProcessPendingRemovals` 内の無条件 `SetEvent(hWakeupEvent_)` がキュー空でも EngineControlLoop を即座に再起床させる無限 wakeup ループ。① D1: ProcessPendingRemovals — `hasRemaining` フラグを lock 内で取得、SetEvent を lock 外で条件付き実行。② P2: Zombie detection — `wasEmpty` パターン統一。③ P3: Eviction — `wasEmpty` パターン統一。④ EngineControlLoop にスピン検知 (static thread_local `spinCount`、連続 10,000 回超で `[SPIN DETECTED]` ログ + 1ms sleep) を最終防衛線として追加。⑤ 設計コメント修正 (auto-reset event は signal 非保持 — 「次の drain がスケジュールされる」が正しい表現)。不変条件: push 側は empty→non-empty 遷移時のみ SetEvent、drain 側は残件ありの場合のみ SetEvent、wasEmpty 判定は `pendingRemovalCs_` ロック内。P1 (OnProcessStop) は既に正しい `wasEmpty` パターン実装済みで変更不要。151/151 PASS 確認済み | 2026/03/29 |
+| §9.12 | **プロアクティブポリシー生成** (`engine_core.h/cpp`, `registry_manager.h/cpp`): リアクティブ（ETW 検出時のみ）からプロアクティブ（config 起点）へアーキテクチャ変更。① `ApplyProactivePolicies()` 新設 — Initialize/HandleConfigChange 時に全 config エントリへポリシー適用。② `ApplyIFEOOnly()` 新設 — name-only ターゲットの IFEO プロアクティブ適用。③ `ReconcileWithConfig()` 新設 — config から除外されたエントリの自動クリーンアップ（stateVersion_ CAS による race condition 防止）。④ `ResolvePathByHandle` 完全廃止 → `CanonicalizePath`（GetFullPathNameW ベース、ファイル存在不要）に置換。⑤ `HasPolicy()` 新設 + `ApplyOptimizationWithHandle` にフォールバック ApplyPolicy 復活（proactive 失敗時のリカバリ）。⑥ `FileExistsW()` 新設（GetFileAttributesW）— パス存在時は IFEO+PT、不在時は IFEO のみ適用。⑦ IFEO グローバルスコープの設計契約をコメント明記。151/151 PASS 確認済み | 2026/03/30 |
+| §9.13 | **CanonicalizePath 正規化統一 + 長パス対応** (`types.h`, `engine_core.cpp`, `registry_manager.cpp`): ① `CanonicalizePath` を `types.h` に free function として配置（EngineCore・RegistryPolicyManager 双方から利用可能）。② GetFullPathNameW 2段階呼び出し（動的バッファ）で MAX_PATH 制限撤廃。③ `resultLen` による明示的文字列長指定（バッファ読み過ぎ防止）。④ policyMap_ の全キー生成・検索を `CanonicalizePath` に統一（`NormalizePath` はフォールバック/ログ用途に限定）。⑤ 設計契約コメント（DESIGN CONTRACT / DO NOT）を engine_core.cpp, registry_manager.cpp, registry_manager.h の3ファイルに追加。151/151 PASS 確認済み | 2026/03/30 |
 | §8.61 | **ログシーケンス逆転バグ修正** (`logger.h/cpp`): ローテーション後 `UnLeaf.log` 先頭レコードの日時が `UnLeaf.log.1` 末尾より古くなる現象を修正。根本原因: Manager の stale check が `WriteFile` の**後**にあったため、最低 1 Write が旧ファイル (リネーム済み `.log.1`) に書かれていた。① `hRotationEvent_` (`Global\UnLeafLogRotated`, auto-reset named event) を追加 — Service はローテーション成功直後に `SetEvent`、Manager は `WriteFile` **前**に `WaitForSingleObject(..., 0)` でゼロ待機ポーリング。② stale check ブロックを `WriteFile` の後から前へ移動 — `rotationSignaled` で即時検知、counter フォールバック (100 write) も保持。③ stale reopen 失敗時の early return ガードを追加。これにより stale Write がゼロになりシーケンス逆転が解消。104/104 PASS 確認済み | 2026/03/25 |
 
 ---
@@ -261,7 +270,20 @@ ctest --test-dir build -C Release --output-on-failure
 
 ---
 
-## 9. 次期バックログ (v1.1+)
+## 9. v1.1.0 開発状況 + バックログ
+
+### 9-0. v1.1.0 実装済み (未リリース)
+
+| 項目 | 状態 |
+|------|------|
+| §9.00〜§9.09 メモリ安定化 | ✅ 完了 (2026-03-26) |
+| §9.10 RegistryPolicyManager v5 (IFEO/PT split) | ✅ 実装完了 (2026-03-29) |
+| §9.11 CPU 暴走対策 (SetEvent 責務分離 + スピン検知) | ✅ 実装完了 (2026-03-29) |
+| §9.12 プロアクティブポリシー生成 | ✅ 実装完了 (2026-03-30) |
+| §9.13 CanonicalizePath 正規化統一 + 長パス対応 | ✅ 実装完了 (2026-03-30) |
+| ユニットテスト | ✅ 151/151 PASS (2026-03-30) |
+| ドキュメント更新 (docs/, README, CHANGELOG) | ⚠️ 未実施 |
+| `VERSION` 定数 | `L"1.1.0"` (変更済み) |
 
 ### 9-A. 解消済み項目
 

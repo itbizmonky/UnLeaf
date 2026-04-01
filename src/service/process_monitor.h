@@ -15,8 +15,11 @@
 namespace unleaf {
 
 // Callback type for process start events
+// imageName: filename only (e.g. "chrome.exe")
+// imagePath: full image path from ETW, hint only — may be empty, 8.3, or device-format
 using ProcessStartCallback = std::function<void(DWORD pid, DWORD parentPid,
-                                                 const std::wstring& imageName)>;
+                                                 const std::wstring& imageName,
+                                                 const std::wstring& imagePath)>;
 
 // Callback type for thread start events (used to detect EcoQoS re-enablement triggers)
 using ThreadStartCallback = std::function<void(DWORD threadId, DWORD ownerPid)>;
@@ -62,7 +65,8 @@ private:
     // Parse process start event data
     static bool ParseProcessStartEvent(PEVENT_RECORD pEvent,
                                         DWORD& pid, DWORD& parentPid,
-                                        std::wstring& imageName);
+                                        std::wstring& imageName,
+                                        std::wstring& imagePath);
 
     // ETW handles
     TRACEHANDLE sessionHandle_;

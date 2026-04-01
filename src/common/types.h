@@ -292,4 +292,210 @@ inline bool IsCriticalProcess(const std::wstring& name) {
     return GetCriticalProcesses().count(ToLower(name)) > 0;
 }
 
+// Utility: Lightweight path normalization (for display/hints only — NOT for matching comparisons)
+// Removes \\?\ and \\?\UNC\ prefixes, converts / to \, strips trailing \, lowercases.
+inline std::wstring NormalizePath(const std::wstring& path) {
+    std::wstring result = path;
+
+    // \\?\UNC\ -> \\ (UNC path)
+    if (result.size() >= 8 &&
+        result[0] == L'\\' && result[1] == L'\\' &&
+        result[2] == L'?'  && result[3] == L'\\' &&
+        (result[4] == L'U' || result[4] == L'u') &&
+        (result[5] == L'N' || result[5] == L'n') &&
+        (result[6] == L'C' || result[6] == L'c') &&
+        result[7] == L'\\') {
+        result = L"\\\\" + result.substr(8);
+    }
+    // \\?\ prefix removal
+    else if (result.size() >= 4 &&
+             result[0] == L'\\' && result[1] == L'\\' &&
+             result[2] == L'?' && result[3] == L'\\') {
+        result = result.substr(4);
+    }
+    // \??\ NT device prefix removal
+    else if (result.size() >= 4 &&
+             result[0] == L'\\' && result[1] == L'?' &&
+             result[2] == L'?' && result[3] == L'\\') {
+        result = result.substr(4);
+    }
+
+    // / -> backslash
+    for (auto& ch : result) {
+        if (ch == L'/') ch = L'\\';
+    }
+
+    // Remove trailing backslash
+    if (!result.empty() && result.back() == L'\\') {
+        result.pop_back();
+    }
+
+    // Lowercase
+    for (auto& ch : result) {
+        ch = towlower(ch);
+    }
+
+    return result;
+}
+
+// POLICY KEY RULE:
+// policyMap_ keys MUST be CanonicalizePath() results.
+// NormalizePath() MUST NOT be used for key generation or lookup.
+// Reason: NormalizePath does not resolve ".." or relative paths,
+// leading to key mismatches and orphaned entries.
+inline std::wstring CanonicalizePath(const std::wstring& rawPath) {
+    if (rawPath.empty()) return L"";
+
+    // GetFullPathNameW resolves relative paths and .. components (no file handle needed)
+    // Two-phase call: first get required length, then allocate dynamically (long path safe)
+    DWORD len = GetFullPathNameW(rawPath.c_str(), 0, nullptr, nullptr);
+    if (len == 0) {
+        return NormalizePath(rawPath);
+    }
+
+    std::wstring buffer(len, L'\0');
+    DWORD resultLen = GetFullPathNameW(rawPath.c_str(), len, buffer.data(), nullptr);
+    if (resultLen == 0 || resultLen >= len) {
+        return NormalizePath(rawPath);
+    }
+
+    std::wstring result(buffer.data(), resultLen);
+
+    // Strip \\?\UNC\ -> \\ (UNC path)
+    if (result.size() >= 8 &&
+        result[0] == L'\\' && result[1] == L'\\' &&
+        result[2] == L'?'  && result[3] == L'\\' &&
+        (result[4] == L'U' || result[4] == L'u') &&
+        (result[5] == L'N' || result[5] == L'n') &&
+        (result[6] == L'C' || result[6] == L'c') &&
+        result[7] == L'\\') {
+        result = L"\\\\" + result.substr(8);
+    }
+    // Strip \\?\ prefix
+    else if (result.size() >= 4 &&
+             result[0] == L'\\' && result[1] == L'\\' &&
+             result[2] == L'?'  && result[3] == L'\\') {
+        result = result.substr(4);
+    }
+    // Strip \??\ NT device prefix
+    else if (result.size() >= 4 &&
+             result[0] == L'\\' && result[1] == L'?' &&
+             result[2] == L'?' && result[3] == L'\\') {
+        result = result.substr(4);
+    }
+
+    // Forward slash -> backslash
+    for (auto& ch : result) {
+        if (ch == L'/') ch = L'\\';
+    }
+
+    // Remove trailing backslash
+    if (!result.empty() && result.back() == L'\\') {
+        result.pop_back();
+    }
+
+    // Lowercase
+    for (auto& ch : result) ch = towlower(ch);
+
+    return result;
+}
+
+/// CanonicalizePath() / ResolveProcessPath() が返す canonical 形式かを厳密チェック。
+/// canonical = lowercase, no \\?\ prefix, no .., uses backslash, absolute drive or UNC.
+inline bool IsCanonicalPathImpl(const std::wstring& path) {
+    if (path.empty()) return false;
+
+    // NG: \\?\ or \??\ prefix
+    if (path.size() >= 4 && path[0] == L'\\' &&
+        ((path[1] == L'\\' && path[2] == L'?') ||
+         (path[1] == L'?'  && path[2] == L'?')) &&
+        path[3] == L'\\')
+        return false;
+
+    // NG: forward slash
+    if (path.find(L'/') != std::wstring::npos) return false;
+
+    // NG: ".." traversal
+    if (path.find(L"..") != std::wstring::npos) return false;
+
+    // NG: uppercase
+    for (wchar_t ch : path) {
+        if (ch >= L'A' && ch <= L'Z') return false;
+    }
+
+    // drive letter: c:\...
+    if (path.size() >= 3 && path[1] == L':' && path[2] == L'\\')
+        return true;
+
+    // UNC: \\server\share (minimum \\s\s)
+    if (path.size() >= 5 && path[0] == L'\\' && path[1] == L'\\' && path[2] != L'\\') {
+        size_t serverEnd = path.find(L'\\', 2);
+        if (serverEnd == std::wstring::npos || serverEnd == 2) return false;
+        if (serverEnd + 1 >= path.size()) return false;
+        if (path[serverEnd + 1] == L'\\') return false;
+        return true;
+    }
+
+    return false;
+}
+
+#ifdef NDEBUG
+#define UNLEAF_ASSERT_CANONICAL(path) ((void)0)
+#else
+#include <cassert>
+#define UNLEAF_ASSERT_CANONICAL(path) \
+    do { if (!unleaf::IsCanonicalPathImpl(path)) { \
+        assert(false && "Non-canonical path passed to registry policy"); \
+    } } while(0)
+#endif
+
+// Utility: Determine if entry looks like a path (contains \ or /)
+// Classification only — validity is checked by IsValidTargetEntry.
+inline bool IsPathEntry(const std::wstring& entry) {
+    return entry.find(L'\\') != std::wstring::npos ||
+           entry.find(L'/')  != std::wstring::npos;
+}
+
+// Utility: Extract filename portion from a path
+// Returns substring after last \ or /; returns input unchanged if no separator found.
+inline std::wstring ExtractFileName(const std::wstring& path) {
+    size_t pos = path.find_last_of(L"\\/");
+    if (pos == std::wstring::npos) return path;
+    return path.substr(pos + 1);
+}
+
+// Validate a target entry that may be either a bare process name or an absolute path.
+// Name rules: same as IsValidProcessName (alphanumeric, _, ., - ; must end in .exe)
+// Path rules: must be absolute (drive letter X:\ or UNC \\), no .., ends in .exe, <= MAX_PATH
+inline bool IsValidTargetEntry(const std::wstring& entry) {
+    if (!IsPathEntry(entry)) {
+        return IsValidProcessName(entry);
+    }
+
+    // It contains \ or / — must be an absolute path
+    if (entry.empty() || entry.length() > MAX_PATH) return false;
+
+    bool isDrive = (entry.size() >= 3 &&
+                    ((entry[0] >= L'A' && entry[0] <= L'Z') ||
+                     (entry[0] >= L'a' && entry[0] <= L'z')) &&
+                    entry[1] == L':' &&
+                    entry[2] == L'\\');
+    bool isUNC   = (entry.size() >= 2 &&
+                    entry[0] == L'\\' && entry[1] == L'\\');
+
+    if (!isDrive && !isUNC) {
+        // Relative path — explicitly rejected
+        return false;
+    }
+
+    // Forbid .. traversal
+    if (entry.find(L"..") != std::wstring::npos) return false;
+
+    // Must end with .exe (case-insensitive)
+    if (entry.length() < 4) return false;
+    std::wstring ext = entry.substr(entry.length() - 4);
+    for (auto& ch : ext) ch = towlower(ch);
+    return ext == L".exe";
+}
+
 } // namespace unleaf

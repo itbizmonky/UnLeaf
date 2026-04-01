@@ -11,6 +11,8 @@
 #include <tlhelp32.h>
 #include <map>
 #include <set>
+#include <list>
+#include <unordered_map>
 #include <vector>
 #include <atomic>
 #include <thread>
@@ -165,6 +167,7 @@ struct TrackedProcess {
     DWORD pid;
     DWORD parentPid;
     std::wstring name;
+    std::wstring fullPath;            // Normalized absolute path (GetFinalPathNameByHandleW); empty if unresolved
     ScopedHandle processHandle;       // Control handle (0x1200)
     ScopedHandle waitProcessHandle;   // Exit detection handle (SYNCHRONIZE)
     HANDLE waitHandle;                // RegisterWaitForSingleObject handle
@@ -203,8 +206,10 @@ struct TrackedProcess {
     DeferredVerifyContext* persistentTimerContext;  // Recurring timer context (owned pointer)
     DeferredVerifyContext* deferredTimerContext;    // One-shot timer context (owned pointer)
 
+    bool needsPolicyRetry;               // true = fullPath unresolved at tracking time, SafetyNet will retry
+
     TrackedProcess()
-        : pid(0), parentPid(0), waitHandle(nullptr), isChild(false)
+        : pid(0), parentPid(0), fullPath(), waitHandle(nullptr), isChild(false)
         , phase(ProcessPhase::AGGRESSIVE), phaseStartTime(0)
         , lastCheckTime(0), lastPriorityCheck(0), violationCount(0)
         , consecutiveFailures(0), lastErrorCode(0), nextRetryTime(0)
@@ -214,7 +219,8 @@ struct TrackedProcess {
         , ecoQosCached(false), ecoQosCachedValue(false), ecoQosCacheTime(0)
         , deferredTimer(nullptr), persistentTimer(nullptr)
         , persistentTimerContext(nullptr)
-        , deferredTimerContext(nullptr) {}
+        , deferredTimerContext(nullptr)
+        , needsPolicyRetry(false) {}
 };
 
 // Deferred verification timer context (defined after TrackedProcess for shared_ptr)
@@ -257,7 +263,9 @@ private:
     // === Event-Driven Architecture ===
 
     // ETW callback: called immediately when a process starts (~1ms)
-    void OnProcessStart(DWORD pid, DWORD parentPid, const std::wstring& imageName);
+    // imagePath: full path hint from ETW (may be empty/8.3/device-format — hint only)
+    void OnProcessStart(DWORD pid, DWORD parentPid,
+                        const std::wstring& imageName, const std::wstring& imagePath);
 
     // ETW callback for thread creation events (triggers for tracked processes)
     void OnThreadStart(DWORD threadId, DWORD ownerPid);
@@ -309,7 +317,13 @@ private:
     // === Process management ===
 
     // Apply optimization to a single process
-    bool ApplyOptimization(DWORD pid, const std::wstring& name, bool isChild, DWORD parentPid = 0);
+    bool ApplyOptimization(DWORD pid, const std::wstring& name, bool isChild,
+                           DWORD parentPid = 0, const std::wstring& preResolvedPath = L"");
+
+    // Inner implementation: receives an already-opened process handle + resolved path
+    bool ApplyOptimizationWithHandle(DWORD pid, const std::wstring& name, bool isChild,
+                                     DWORD parentPid, ScopedHandle&& scopedHandle,
+                                     const std::wstring& resolvedPath);
 
     // Update phase for a tracked process
     void UpdatePhase(DWORD pid, ULONGLONG now);
@@ -367,8 +381,29 @@ private:
     // Check if PID is being tracked
     bool IsTracked(DWORD pid) const;
 
-    // Check if this is a target process name
+    // Check if this is a target process name (name-only set)
     bool IsTargetName(const std::wstring& name) const;
+
+    // Check if fullPathLower matches any path target (with name fallback)
+    bool IsTargetPath(const std::wstring& fullPathLower) const;
+
+    // lock-free check: true when any path-based targets are configured
+    bool HasPathTargets() const;
+
+    // Resolve process image path via QueryFullProcessImageNameW + GetFinalPathNameByHandleW
+    // Returns normalized lowercase absolute path, or empty string on failure (no fallback)
+    std::wstring ResolveProcessPath(HANDLE hProcess) const;
+
+    // Normalize a file path via GetFullPathNameW (no file handle needed — works for non-existent files)
+    // Returns lowercase absolute path with prefixes stripped, or empty string on failure
+    static std::wstring CanonicalizePath(const std::wstring& rawPath);
+
+    // Check if a file exists on disk (GetFileAttributesW)
+    static bool FileExistsW(const std::wstring& path);
+
+    // Try to apply optimization by resolving and matching full path (path-target branch)
+    // Opens handle, resolves path, checks targetPathSet_, delegates to ApplyOptimizationWithHandle
+    void TryApplyByPath(DWORD pid, const std::wstring& name);
 
     // Check if parent is being tracked
     bool IsTrackedParent(DWORD parentPid) const;
@@ -380,6 +415,9 @@ private:
 
     // Build target set from config
     void RefreshTargetSet();
+
+    // Proactive policy generation from config (IFEO for name targets, IFEO+PT for path targets)
+    void ApplyProactivePolicies();
 
     // Remove tracked processes that are no longer targets
     void CleanupRemovedTargets();
@@ -424,8 +462,11 @@ private:
     // Wait callback context tracking for safe cleanup
     std::map<DWORD, WaitCallbackContext*> waitContexts_;
 
-    // Target process names (lowercase for comparison)
-    std::set<std::wstring> targetSet_;
+    // Target process sets (all protected by targetCs_)
+    std::set<std::wstring> targetNameSet_;       // lowercase exe names (name-only targets)
+    std::set<std::wstring> targetPathSet_;       // GetFinalPathNameByHandleW-normalized full paths
+    std::set<std::wstring> pathTargetFileNames_; // exe name part of each targetPathSet_ entry (pre-filter)
+    std::atomic<bool>      hasPathTargets_;      // lock-free: true when targetPathSet_ non-empty
     mutable CriticalSection targetCs_;
 
     // Enforcement statistics
@@ -480,9 +521,14 @@ private:
     // Windows version for compatibility checks
     WindowsVersionInfo winVersion_;
 
-    // Registry policy applied set (exeName -> applied)
-    std::set<std::wstring> policyAppliedSet_;
+    // Registry policy LRU cache (canonPath-based)
+    std::list<std::wstring> policyCacheLru_;
+    std::unordered_map<std::wstring, std::list<std::wstring>::iterator> policyCacheMap_;
     mutable CriticalSection policySetCs_;
+
+    // VerifyAndRepair last execution time + CAS guard
+    ULONGLONG lastPolicyVerifyTime_ = 0;
+    std::atomic<int> verifyRunning_{0};
 
     // Statistics
     std::atomic<uint32_t> ntApiSuccessCount_;
@@ -594,8 +640,8 @@ private:
     static constexpr ULONGLONG SUPPRESSION_TTL = 300000;               // 5min TTL (> suppress window to prevent re-register churn)
     static constexpr size_t    SUPPRESSION_MAX_SIZE = 2000;            // emergency cap (oldest-first eviction)
 
-    // policyAppliedSet_ size cap
-    static constexpr size_t    POLICY_SET_MAX_SIZE = 1000;
+    // policyCacheMap_ size cap
+    static constexpr size_t    POLICY_CACHE_MAX_SIZE = 1024;
 
     // [MEM] memory diagnostics log intervals
     static constexpr ULONGLONG MEM_LOG_INTERVAL_SHORT = 10000;    // 起動後 30 分: 10 秒

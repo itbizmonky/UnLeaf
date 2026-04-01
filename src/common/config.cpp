@@ -248,12 +248,14 @@ bool UnLeafConfig::ParseIni(const std::string& contentIn) {
                 MultiByteToWideChar(CP_UTF8, 0, key.c_str(),
                                    static_cast<int>(key.size()), &wideName[0], size);
 
-                // Validate process name before adding
-                if (!IsValidProcessName(wideName)) {
+                // Validate entry (name or absolute path)
+                if (!IsValidTargetEntry(wideName)) {
                     LOG_ALERT(L"Config: Invalid target ignored: " + wideName);
                     continue;
                 }
-                if (IsCriticalProcess(wideName)) {
+                // For path entries, check the filename portion against critical list
+                std::wstring checkName = IsPathEntry(wideName) ? ExtractFileName(wideName) : wideName;
+                if (IsCriticalProcess(checkName)) {
                     LOG_ALERT(L"Config: Critical process blocked: " + wideName);
                     continue;
                 }

@@ -314,7 +314,7 @@ UnLeaf/
 
 ## Changelog
 
-### v1.1.0 (2026-03-26)
+### v1.1.0 (2026-03-30)
 
 **Memory Stability & Long-Run Hardening**
 - `trackedProcesses_` hard cap (MAX=2,000): eviction candidates selected zombie-first → oldest phaseStartTime, delegated to `RemoveTrackedProcess()` — zero Timer/WaitContext leaks
@@ -322,7 +322,17 @@ UnLeaf/
 - `pendingRemovalPids_` overflow no longer drops (`pop()` removed) — always push, emit `LOG_ALERT` only. Guarantees no eviction work is lost
 - `ProcessPendingRemovals()` capped at 256 items/tick — eliminates processing spikes; remaining items auto-rescheduled via `SetEvent`; runaway backlog (> 8,192) detected with `LOG_ALERT`
 - `Logger::WriteMessage()` migrated to stack buffer (2,048 bytes) — zero heap allocation on normal path
-- `CountingResource` centralized in anonymous namespace to eliminate ODR violations; PMR fallback visible in Release builds via `LOG_INFO` (max 10 notifications)
+
+**RegistryPolicyManager v5 + CPU Spin Fix**
+- Full redesign of RegistryPolicyManager: IFEO (exe-name-based) and PowerThrottle (path-based) managed independently. Multiple paths for the same exe name (Chrome + Canary) tracked separately
+- Fixed CPU 96.9% spin: `SetEvent` responsibility separation (wasEmpty / hasRemaining pattern) + spin detection safety net
+- Proactive policy generation: policies applied to all config entries at service startup. IFEO is effective even before the process launches
+- Replaced `ResolvePathByHandle` with `CanonicalizePath` (GetFullPathNameW-based) — long path support, no file existence required
+- ETW fallback: if proactive application failed, policy is recovered when the process is detected via ETW
+
+**PowerThrottle Deferred-Apply Bug Fix**
+- Fixed PowerThrottle policy not applied to name-only targets (e.g., `chrome.exe=1`) started after service registration: `ApplyOptimizationWithHandle` now separates name-only targets (always call `ApplyPolicy` when path is available) from path-based targets (guarded by `HasPolicy`)
+- Added SafetyNet (10s) policy recovery: processes whose image path could not be resolved at ETW callback time (`QueryFullProcessImageNameW` returned before image mapping completed) are retried on the next SafetyNet cycle
 
 ### v1.0.3 (2026-03-24)
 

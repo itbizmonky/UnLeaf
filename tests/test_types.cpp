@@ -188,3 +188,183 @@ TEST(GetCriticalProcessesTest, ReturnsSameReference) {
     const auto& ref2 = GetCriticalProcesses();
     EXPECT_EQ(&ref1, &ref2);
 }
+
+// ============================================================
+// NormalizePathTest
+// ============================================================
+
+TEST(NormalizePathTest, EmptyString) {
+    EXPECT_EQ(NormalizePath(L""), L"");
+}
+
+TEST(NormalizePathTest, StripExtendedPrefix) {
+    EXPECT_EQ(NormalizePath(L"\\\\?\\C:\\foo\\bar.exe"), L"c:\\foo\\bar.exe");
+}
+
+TEST(NormalizePathTest, StripNtDevicePrefix) {
+    EXPECT_EQ(NormalizePath(L"\\??\\C:\\foo\\bar.exe"), L"c:\\foo\\bar.exe");
+}
+
+TEST(NormalizePathTest, StripUNCPrefix) {
+    EXPECT_EQ(NormalizePath(L"\\\\?\\UNC\\server\\share\\foo.exe"), L"\\\\server\\share\\foo.exe");
+}
+
+TEST(NormalizePathTest, ForwardSlashToBackslash) {
+    EXPECT_EQ(NormalizePath(L"C:/foo/bar.exe"), L"c:\\foo\\bar.exe");
+}
+
+TEST(NormalizePathTest, TrailingBackslashRemoved) {
+    EXPECT_EQ(NormalizePath(L"C:\\foo\\bar\\"), L"c:\\foo\\bar");
+}
+
+TEST(NormalizePathTest, Lowercase) {
+    EXPECT_EQ(NormalizePath(L"C:\\FOO\\BAR.EXE"), L"c:\\foo\\bar.exe");
+}
+
+TEST(NormalizePathTest, PlainPathUnchangedExceptCase) {
+    EXPECT_EQ(NormalizePath(L"C:\\Windows\\System32\\notepad.exe"), L"c:\\windows\\system32\\notepad.exe");
+}
+
+// ============================================================
+// IsPathEntryTest
+// ============================================================
+
+TEST(IsPathEntryTest, DriveAbsolutePath) {
+    EXPECT_TRUE(IsPathEntry(L"C:\\foo\\game.exe"));
+}
+
+TEST(IsPathEntryTest, UNCPath) {
+    EXPECT_TRUE(IsPathEntry(L"\\\\server\\share\\game.exe"));
+}
+
+TEST(IsPathEntryTest, RelativePathWithBackslash) {
+    EXPECT_TRUE(IsPathEntry(L"foo\\bar.exe"));
+}
+
+TEST(IsPathEntryTest, ForwardSlashPath) {
+    EXPECT_TRUE(IsPathEntry(L"foo/bar.exe"));
+}
+
+TEST(IsPathEntryTest, NameOnly) {
+    EXPECT_FALSE(IsPathEntry(L"game.exe"));
+}
+
+TEST(IsPathEntryTest, EmptyString) {
+    EXPECT_FALSE(IsPathEntry(L""));
+}
+
+// ============================================================
+// ExtractFileNameTest
+// ============================================================
+
+TEST(ExtractFileNameTest, WithBackslash) {
+    EXPECT_EQ(ExtractFileName(L"c:\\path\\to\\game.exe"), L"game.exe");
+}
+
+TEST(ExtractFileNameTest, WithForwardSlash) {
+    EXPECT_EQ(ExtractFileName(L"c:/path/to/game.exe"), L"game.exe");
+}
+
+TEST(ExtractFileNameTest, NameOnly) {
+    EXPECT_EQ(ExtractFileName(L"game.exe"), L"game.exe");
+}
+
+TEST(ExtractFileNameTest, TrailingBackslash) {
+    EXPECT_EQ(ExtractFileName(L"c:\\path\\"), L"");
+}
+
+TEST(ExtractFileNameTest, EmptyString) {
+    EXPECT_EQ(ExtractFileName(L""), L"");
+}
+
+// ============================================================
+// IsValidTargetEntryTest
+// ============================================================
+
+TEST(IsValidTargetEntryTest, ValidNameOnly) {
+    EXPECT_TRUE(IsValidTargetEntry(L"chrome.exe"));
+}
+
+TEST(IsValidTargetEntryTest, ValidNameOnlyUpperExt) {
+    EXPECT_TRUE(IsValidTargetEntry(L"chrome.EXE"));
+}
+
+TEST(IsValidTargetEntryTest, ValidAbsolutePathDrive) {
+    EXPECT_TRUE(IsValidTargetEntry(L"C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe"));
+}
+
+TEST(IsValidTargetEntryTest, ValidAbsolutePathWithSpaces) {
+    EXPECT_TRUE(IsValidTargetEntry(L"C:\\Program Files (x86)\\game\\game.exe"));
+}
+
+TEST(IsValidTargetEntryTest, RelativePathRejected) {
+    EXPECT_FALSE(IsValidTargetEntry(L"foo\\bar.exe"));
+}
+
+TEST(IsValidTargetEntryTest, RelativePathForwardSlashRejected) {
+    EXPECT_FALSE(IsValidTargetEntry(L"foo/bar.exe"));
+}
+
+TEST(IsValidTargetEntryTest, DotDotSegmentRejected) {
+    EXPECT_FALSE(IsValidTargetEntry(L"C:\\foo\\..\\bar.exe"));
+}
+
+TEST(IsValidTargetEntryTest, NoExeExtensionPath) {
+    EXPECT_FALSE(IsValidTargetEntry(L"C:\\foo\\bar.txt"));
+}
+
+TEST(IsValidTargetEntryTest, EmptyString) {
+    EXPECT_FALSE(IsValidTargetEntry(L""));
+}
+
+// ============================================================
+// IsCanonicalPathImplTest
+// ============================================================
+
+TEST(IsCanonicalPathImplTest, ValidDrivePath) {
+    EXPECT_TRUE(IsCanonicalPathImpl(L"c:\\program files\\chrome.exe"));
+}
+
+TEST(IsCanonicalPathImplTest, ValidUNCPath) {
+    EXPECT_TRUE(IsCanonicalPathImpl(L"\\\\server\\share\\app.exe"));
+}
+
+TEST(IsCanonicalPathImplTest, EmptyString) {
+    EXPECT_FALSE(IsCanonicalPathImpl(L""));
+}
+
+TEST(IsCanonicalPathImplTest, HasUppercase) {
+    EXPECT_FALSE(IsCanonicalPathImpl(L"C:\\foo\\bar.exe"));
+}
+
+TEST(IsCanonicalPathImplTest, HasForwardSlash) {
+    EXPECT_FALSE(IsCanonicalPathImpl(L"c:/foo/bar.exe"));
+}
+
+TEST(IsCanonicalPathImplTest, HasDotDot) {
+    EXPECT_FALSE(IsCanonicalPathImpl(L"c:\\foo\\..\\bar.exe"));
+}
+
+TEST(IsCanonicalPathImplTest, HasExtendedPrefix) {
+    EXPECT_FALSE(IsCanonicalPathImpl(L"\\\\?\\c:\\foo\\bar.exe"));
+}
+
+TEST(IsCanonicalPathImplTest, HasNtDevicePrefix) {
+    EXPECT_FALSE(IsCanonicalPathImpl(L"\\??\\c:\\foo\\bar.exe"));
+}
+
+TEST(IsCanonicalPathImplTest, IncompleteUNC_NoShare) {
+    EXPECT_FALSE(IsCanonicalPathImpl(L"\\\\server\\"));
+}
+
+TEST(IsCanonicalPathImplTest, IncompleteUNC_NoServer) {
+    EXPECT_FALSE(IsCanonicalPathImpl(L"\\\\\\share"));
+}
+
+TEST(IsCanonicalPathImplTest, UNC_EmptyShareName) {
+    EXPECT_FALSE(IsCanonicalPathImpl(L"\\\\server\\\\file.exe"));
+}
+
+TEST(IsCanonicalPathImplTest, RelativePath) {
+    EXPECT_FALSE(IsCanonicalPathImpl(L"foo\\bar.exe"));
+}

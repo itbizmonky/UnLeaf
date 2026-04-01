@@ -314,7 +314,7 @@ UnLeaf/
 
 ## 更新履歴 (Changelog)
 
-### v1.1.0 (2026-03-26)
+### v1.1.0 (2026-03-30)
 
 **メモリ安定化・長期稼働品質改善**
 - `trackedProcesses_` ハード上限 (MAX=2000) 到達時に zombie 優先・最古優先で退避候補を選出し `RemoveTrackedProcess()` に委任。Timer/WaitContext リークをゼロに抑制
@@ -322,7 +322,17 @@ UnLeaf/
 - `pendingRemovalPids_` overflow 時の `pop()` を廃止 — 常に push し `LOG_ALERT` のみ出力。eviction 作業のドロップ禁止モデルへ移行
 - `ProcessPendingRemovals()` を最大 256 件/tick に制限。処理スパイクを排除し、残留時は自動再スケジュール (SetEvent)。runaway backlog (> 8192) を `LOG_ALERT` で検知
 - `Logger::WriteMessage()` をスタックバッファ (2048 bytes) に移行。通常パスのヒープ割当ゼロを達成
-- `CountingResource` を anonymous namespace に一元定義し ODR 違反を排除。PMR fallback を Release でも `LOG_INFO` で最大10回通知
+
+**RegistryPolicyManager v5 + CPU 暴走対策**
+- RegistryPolicyManager を全面再設計: IFEO (exe 名単位) と PowerThrottle (パス単位) を分離管理。同一 exe 名の複数パス (Chrome + Canary 等) を独立追跡
+- CPU 96.9% 暴走を修正: `SetEvent` 責務分離 (wasEmpty / hasRemaining パターン) + スピン検知
+- プロアクティブポリシー生成: サービス起動時に config 全エントリへ事前ポリシー適用。プロセス未起動でも IFEO が有効
+- `ResolvePathByHandle` を廃止し `CanonicalizePath` (GetFullPathNameW ベース) に統一。長パス対応・ファイル存在不要
+- ETW フォールバック: プロアクティブ適用失敗時にプロセス検出時点でリカバリ適用
+
+**PowerThrottle 遅延適用バグ修正**
+- name-only ターゲット PowerThrottle 遅延適用バグを修正: `ApplyOptimizationWithHandle` に name-only / path-based 分岐を追加。サービス起動後に起動したプロセスへの PowerThrottle ポリシー適用漏れを解消
+- SafetyNet (10s) にポリシー回復ロジックを追加: 起動直後に `QueryFullProcessImageNameW` が失敗したプロセスを次回 SafetyNet サイクルでリトライし確実に適用
 
 ### v1.0.3 (2026-03-24)
 

@@ -29,6 +29,22 @@ Windows 11 / 10 向けゼロオーバーヘッド EcoQoS オプティマイザ *
 | 2 | **ロック契約の実行時検証** — `SelectEvictionCandidate()` 先頭に DEBUG ASSERT を追加。`trackedCs_` 保持義務をアサーションで検証 |
 | 3 | **pendingRemoval 3段階バックログ監視** — 50% → `LOG_INFO`、75% → `LOG_ALERT`、overflow → `LOG_ALERT` の多段警告体系 |
 
+### 🏗️ RegistryPolicyManager v5 — レジストリポリシー完全再設計
+
+| # | 改善内容 |
+|---|---------|
+| 7 | **IFEO / PowerThrottle 完全分離** — exe 名単位 (IFEO) とパス単位 (PowerThrottle) を独立管理。Chrome + Canary 等の同名複数パスを個別追跡。per-entry state machine (APPLYING → COMMITTED) で二重書き込みを排除 |
+| 8 | **CPU 96.9% 暴走を修正** — `ProcessPendingRemovals` の無条件 `SetEvent` を `hasRemaining` 条件付きに変更。全 push サイト (P1-P3) を `wasEmpty` パターンに統一。EngineControlLoop にスピン検知 (連続 10,000 wakeup 超で `[SPIN DETECTED]` ログ + 1ms sleep) を追加 |
+| 9 | **プロアクティブポリシー生成** — サービス起動時に config 全エントリへ事前ポリシー適用。プロセスが未起動の状態でも IFEO キーが有効。リアクティブ→プロアクティブへのアーキテクチャ移行 |
+| 10 | **長パス対応・正規化統一** — `ResolvePathByHandle` を廃止し `CanonicalizePath` (GetFullPathNameW 2段階呼び出し) に統一。MAX_PATH 制限を撤廃。`NormalizePath` はログ/フォールバック用途に限定 |
+
+### 🔧 name-only ターゲット PowerThrottle 遅延適用バグ修正
+
+| # | 改善内容 |
+|---|---------|
+| 11 | **ETW フォールバックパス修正** — `ApplyOptimizationWithHandle` に name-only / path-based 分岐を追加。`chrome.exe=1` 等の name-only ターゲットは `HasPolicy` ゲートをバイパスし、パスが取得できた時点で即座に PowerThrottle ポリシーを適用。サービス起動後に起動したプロセスへの適用漏れを解消 |
+| 12 | **SafetyNet ポリシー回復ループ** — プロセス起動直後に `QueryFullProcessImageNameW` が失敗した場合 (`needsPolicyRetry=true`)、10s 後の SafetyNet サイクルで自動リトライ。確実な適用を保証 |
+
 ---
 
 ## 🚀 なぜ UnLeaf なのか? (技術的優位性)
@@ -89,7 +105,7 @@ cmake --build . --config Release
 ### テスト実行
 ```powershell
 ctest --test-dir build -C Release --output-on-failure
-# Expected: 104/104 tests passed
+# Expected: 151/151 tests passed
 ```
 
 ---

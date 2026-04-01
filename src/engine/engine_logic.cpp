@@ -10,6 +10,24 @@ bool IsTargetProcess(const std::wstring& processNameLower,
     return targetNames.count(processNameLower) > 0;
 }
 
+bool IsTargetByPath(const std::wstring& fullPathLower,
+                    const std::set<std::wstring>& targetPaths,
+                    const std::set<std::wstring>& targetNames) {
+    // Priority 1: exact full-path match
+    if (targetPaths.count(fullPathLower) > 0) return true;
+
+    // Priority 2: filename fallback (for name-only targets like "chrome.exe")
+    if (!targetNames.empty()) {
+        size_t pos = fullPathLower.find_last_of(L"\\/");
+        std::wstring fileName = (pos != std::wstring::npos)
+            ? fullPathLower.substr(pos + 1)
+            : fullPathLower;
+        if (targetNames.count(fileName) > 0) return true;
+    }
+
+    return false;
+}
+
 bool IsCacheValid(bool cached, uint64_t now,
                   uint64_t cacheTime, uint64_t cacheDuration) {
     return cached && (now - cacheTime < cacheDuration);
