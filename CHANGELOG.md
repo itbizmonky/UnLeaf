@@ -55,6 +55,21 @@ All notable changes to UnLeaf will be documented in this file.
 - `policyMap_` の全キー生成・検索を `CanonicalizePath` に統一。`NormalizePath` はフォールバック/ログ用途に限定
 - 設計契約コメント (DESIGN CONTRACT / DO NOT) を `engine_core.cpp`, `registry_manager.cpp`, `registry_manager.h` に追加
 
+### Fixed/Added (§9.14 Rev.17 ServiceEngine メモリ増加対策)
+- `enforcementQueue_` (std::queue) を `criticalQueue_` + `nonCriticalQueue_` (各 std::deque) に分離。CRITICAL = ETW_THREAD_START 以外の全型; NON-CRITICAL = ETW_THREAD_START (SOFT_LIMIT=4096 でドロップ可)。TOTAL_LIMIT=8192 絶対保証を static_assert で強制
+- nonCritical 空 + TOTAL_LIMIT 到達時の CRITICAL-to-CRITICAL eviction 追加 (全喪失より最古破棄を優先)
+- `ENFORCEMENT_CRITICAL_PER_TICK=512` バースト制限: 1 tick 最大 512 件の CRITICAL 処理; 残件は次 tick へ継続
+- `ScheduleDeferredVerification` 修正: `std::exchange` + `INVALID_HANDLE_VALUE` 同期待機で旧タイマーハンドル・コンテキストリークを根絶
+- `EnqueuePendingRemoval` を CAS ベース `pendingQueueSize_` 上限ガード (MAX=512) に置換。overflow 時: `pendingOverflowFlag_` をセットしノードを delete (サイレントリークなし)
+- `DrainPendingRemovals` を RAII `NodeGuard` (インライン struct) に置換: `~NodeGuard() noexcept` がスコープ終了時に `fetch_sub + delete` を保証。re-enqueue ループを廃止 — PendingRemoval 線形増大の主因を排除
+- `ConsumePendingOverflowFlag()` + `HandleSafetyNetCheck` 内即時 `VerifyAndRepair` パスを追加 — overflow リカバリを ≤10秒で保証
+- `ScanRunningProcessesForMissedTargets(maxScan)` 追加: `std::max` 単調増加保証付き `lastScannedPid_` による2パスラウンドロビン。スナップショット順序変動による永続的な枯渇を防止
+- SafetyNet デュアルトリガー追加: CRITICAL drop 差分検出 + 30秒バックストップ (`SAFETY_SCAN_BACKSTOP_MS`) — ETW カーネルレベルのサイレントドロップにも対応
+- `ReconcileWithConfig` 先頭で `ifeoRefCount_` を `policyMap_` から完全再構築 — config リロード間の参照カウントドリフトを防止
+- `trackedProcesses_` 退避ロジック簡略化: 上限到達時は常に最大 16 件/挿入を選出して即処理 (period-skew カウンタを削除)
+- insert 直後に `errorLogSuppression_` サイズを即キャップ (SUPPRESSION_MAX_SIZE/2) — TTL クリーンアップ間のマップ増大を抑制
+- `PerformPeriodicMaintenance` に 60秒 `[DIAG] crit= nc= pending= drop= critDrop= critEvict= recovered= tracked=` 診断ログを追加
+
 ---
 
 ## [1.0.3] - 2026-03-25

@@ -334,6 +334,12 @@ UnLeaf/
 - name-only ターゲット PowerThrottle 遅延適用バグを修正: `ApplyOptimizationWithHandle` に name-only / path-based 分岐を追加。サービス起動後に起動したプロセスへの PowerThrottle ポリシー適用漏れを解消
 - SafetyNet (10s) にポリシー回復ロジックを追加: 起動直後に `QueryFullProcessImageNameW` が失敗したプロセスを次回 SafetyNet サイクルでリトライし確実に適用
 
+**ServiceEngine メモリ増加対策 (§9.14 Rev.17)**
+- enforcementQueue_ を CRITICAL / NON-CRITICAL の2キューに分離。TOTAL_LIMIT 絶対保証 + CRITICAL 512件/tick バースト制限で長期稼働時のメモリ線形増加を根絶
+- PendingRemoval: CAS ベース上限ガード (MAX=512) + RAII NodeGuard。re-enqueue ループ廃止でキュー無限増大を根絶
+- `ScheduleDeferredVerification` タイマーハンドルリーク修正 (`std::exchange` + INVALID_HANDLE_VALUE 同期)
+- SafetyNet に 2パスラウンドロビン + 30秒バックストップ追加。ETW silent drop 時も ≤30秒でリカバリ
+
 ### v1.0.3 (2026-03-24)
 
 **ログローテーション完全安定化**

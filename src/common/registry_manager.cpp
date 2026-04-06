@@ -13,6 +13,7 @@
 // - Pass raw/unresolved paths into RegistryPolicyManager
 
 #include "registry_manager.h"
+#include <cassert>
 #include <fstream>
 
 namespace unleaf {
@@ -394,12 +395,30 @@ bool RegistryPolicyManager::PowerThrottleValueExists(const std::wstring& registr
 // ====================================================================
 
 void RegistryPolicyManager::EnqueuePendingRemoval(PendingRemovalNode* node) {
-    node->next = pendingHead_.load(std::memory_order_relaxed);
-    while (!pendingHead_.compare_exchange_weak(
-        node->next, node,
-        std::memory_order_release, std::memory_order_relaxed)) {
-        // CAS retry (lock-free)
+    // §9.14-B: CAS-based size control — prevents temporary overshoot (unlike fetch_add+check).
+    // pendingQueueSize_ は近似カウンタ。CAS 成功後に stack push が完了するまでの間、
+    // size と実ノード数に瞬間的な乖離が発生しうる（Treiber stack の設計的特性）。
+    // これは意図的な設計であり、DrainPendingRemovals による収束を前提とする。
+    int32_t current = pendingQueueSize_.load(std::memory_order_relaxed);
+    while (true) {
+        if (current >= MAX_PENDING_QUEUE_SIZE) {
+            pendingOverflowFlag_.store(true, std::memory_order_relaxed);
+            LOG_ALERT(L"[PENDING] overflow — VerifyAndRepair triggered");
+            delete node;
+            return;
+        }
+        if (pendingQueueSize_.compare_exchange_weak(current, current + 1,
+            std::memory_order_acquire, std::memory_order_relaxed)) {
+            break;
+        }
+        // CAS 失敗 → current は最新値に更新済み、再試行
     }
+    // lock-free Treiber stack push
+    // Treiber ABA 非対策: 各ノードは new で生成・delete で破棄（再利用なし）のため ABA 問題は発生しない。
+    // 将来 memory pool / freelist を導入する場合は hazard pointer 等の ABA 対策が必要。
+    node->next = pendingHead_.load(std::memory_order_relaxed);
+    while (!pendingHead_.compare_exchange_weak(node->next, node,
+           std::memory_order_release, std::memory_order_relaxed)) {}
 }
 
 PendingRemovalNode* RegistryPolicyManager::StealAllPendingRemovals() {
@@ -590,6 +609,14 @@ void RegistryPolicyManager::ReconcileWithConfig(
             CSLockGuard lock(policyCs_);
             snapshotVersion = stateVersion_.load(std::memory_order_acquire);
 
+            // §9.14-D: Rebuild ifeoRefCount_ from policyMap_ to prevent drift
+            // (ReconcileWithConfig is called on config reload — O(N) rebuild is acceptable here)
+            ifeoRefCount_.clear();
+            for (const auto& [path, entry] : policyMap_) {
+                if (entry.state == PolicyState::COMMITTED || entry.state == PolicyState::APPLYING)
+                    ifeoRefCount_[entry.lowerExeName]++;
+            }
+
             // Stale IFEO: in ifeoAppliedSet_ but not in desiredNames,
             // and not referenced by any desired path entry
             for (const auto& name : ifeoAppliedSet_) {
@@ -737,36 +764,47 @@ void RegistryPolicyManager::RemoveSinglePolicyInternal(
 }
 
 void RegistryPolicyManager::DrainPendingRemovals() {
-    // REQ-3: Time-slice based drain (MAX_ROUNDS banned)
-    ULONGLONG deadline = GetTickCount64() + 5;  // 5ms budget
+    // §9.14-B: RAII NodeGuard + no re-enqueue (stale entries expire via VerifyAndRepair 30min).
+    // Re-enqueue loop was the primary linear growth source — abolished here.
+    static constexpr int MAX_PER_CALL = 128;
 
     PendingRemovalNode* batch = StealAllPendingRemovals();
     if (!batch) return;
 
     // Reverse linked list for FIFO order
-    PendingRemovalNode* reversed = nullptr;
+    PendingRemovalNode* cur = nullptr;
     while (batch) {
         PendingRemovalNode* next = batch->next;
-        batch->next = reversed;
-        reversed = batch;
+        batch->next = cur;
+        cur = batch;
         batch = next;
     }
-    batch = reversed;
 
-    // Process within time budget
-    while (batch && GetTickCount64() < deadline) {
-        PendingRemovalNode* node = batch;
-        batch = batch->next;
+    int count = 0;
+    while (cur) {
+        PendingRemovalNode* next = cur->next;
+        {
+            // 明示ブロック: NodeGuard の destructor がブロック末尾で確定的に発火。
+            // cur はこのブロック内でのみ有効。ブロック末尾で delete される。
+            // ブロック外の `cur = next` は delete 完了後に実行されるため use-after-free なし。
+            struct NodeGuard {
+                std::atomic<int32_t>& queueSize;
+                PendingRemovalNode*   node;
+                ~NodeGuard() noexcept {
+                    int32_t old = queueSize.fetch_sub(1, std::memory_order_relaxed);
+                    assert(old > 0 && "[PENDING] size underflow");
+                    if (old <= 0) queueSize.store(0, std::memory_order_relaxed);
+                    delete node;
+                }
+            } guard{pendingQueueSize_, cur};
 
-        RemoveSinglePolicyInternal(node->exeName, node->fullPath, node->reenqueueCount);
-        delete node;
-    }
-
-    // Re-enqueue remaining (time budget exhausted)
-    while (batch) {
-        PendingRemovalNode* node = batch;
-        batch = batch->next;
-        EnqueuePendingRemoval(node);
+            if (count < MAX_PER_CALL) {
+                RemoveSinglePolicyInternal(cur->exeName, cur->fullPath, cur->reenqueueCount);
+                count++;
+            }
+            // count >= MAX_PER_CALL: skip processing but NodeGuard still deletes + decrements
+        } // ← ~NodeGuard(): fetch_sub + delete がここで確定実行
+        cur = next;
     }
 }
 

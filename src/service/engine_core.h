@@ -17,6 +17,7 @@
 #include <atomic>
 #include <thread>
 #include <queue>
+#include <deque>
 #include <memory>
 #include <utility>
 #include <chrono>
@@ -405,6 +406,12 @@ private:
     // Opens handle, resolves path, checks targetPathSet_, delegates to ApplyOptimizationWithHandle
     void TryApplyByPath(DWORD pid, const std::wstring& name);
 
+    // §9.14-E: SafetyNet 2-pass round-robin scan for missed targets
+    void ScanRunningProcessesForMissedTargets(int maxScan);
+    // Try to apply optimization for a single process if it matches a target (SafetyNet recovery)
+    // Returns true if optimization was applied (new tracking started)
+    bool TryApplyIfMissedTarget(DWORD pid, const wchar_t* exeName);
+
     // Check if parent is being tracked
     bool IsTrackedParent(DWORD parentPid) const;
 
@@ -451,9 +458,15 @@ private:
     std::queue<DWORD> pendingRemovalPids_;
     mutable CriticalSection pendingRemovalCs_;
 
-    // Enforcement request queue (thread-safe)
-    std::queue<EnforcementRequest> enforcementQueue_;
+    // Enforcement request queue (thread-safe) — 2-queue CRITICAL/NON-CRITICAL split (§9.14-A)
+    // CRITICAL: ETW_PROCESS_START, DEFERRED_VERIFICATION, PERSISTENT_ENFORCE, SAFETY_NET
+    // NON-CRITICAL: ETW_THREAD_START (high-frequency, droppable at SOFT_LIMIT)
+    std::deque<EnforcementRequest> criticalQueue_;
+    std::deque<EnforcementRequest> nonCriticalQueue_;
     mutable CriticalSection queueCs_;
+    std::atomic<uint32_t> enforcementDropCount_{0};
+    std::atomic<uint32_t> criticalDropCount_{0};    // §9.14-A: HARD_LIMIT 超過によるドロップ数
+    std::atomic<uint32_t> criticalEvictCount_{0};   // §9.14-A: TOTAL_LIMIT eviction（rotation）数（drop とは区別）
 
     // Tracked processes (PID -> TrackedProcess)
     std::map<DWORD, std::shared_ptr<TrackedProcess>> trackedProcesses_;
@@ -488,6 +501,12 @@ private:
 
     // Last safety net check time (for logging only, not timing)
     ULONGLONG lastSafetyNetTime_;
+
+    // §9.14-E: SafetyNet 2-pass round-robin scan state
+    ULONGLONG lastSafetyScanTime_{0};      // last ScanRunningProcessesForMissedTargets invocation
+    DWORD     lastScannedPid_{0};          // round-robin cursor (monotonically increasing via std::max)
+    uint32_t  lastCheckedDropCount_{0};    // differential drop detection baseline
+    std::atomic<uint32_t> safetyRecoveredCount_{0};  // missed-target recovery counter
 
     // Last process liveness check time (zombie cleanup)
     ULONGLONG lastProcessLivenessCheck_;
@@ -653,6 +672,31 @@ private:
 
     // pendingRemovalPids_ saturation guard (§9.01)
     static constexpr size_t MAX_PENDING_REMOVALS = 4096;
+
+    // §9.14-A: Enforcement queue limits (2-queue CRITICAL/NON-CRITICAL)
+    // SOFT_LIMIT: NON-CRITICAL individual cap
+    // HARD_LIMIT: CRITICAL individual cap
+    // TOTAL_LIMIT: absolute combined cap — nonCritical eviction first, then oldest-CRITICAL eviction
+    // 設定上の関係: TOTAL_LIMIT <= HARD_LIMIT が推奨。
+    // TOTAL_LIMIT < HARD_LIMIT の場合、nonCritical 空でも TOTAL_LIMIT が先に踏まれ
+    // CRITICAL eviction が発生する（HARD_LIMIT は事実上機能しない設定となる）。
+    static constexpr size_t ENFORCEMENT_QUEUE_SOFT_LIMIT  = 4096;
+    static constexpr size_t ENFORCEMENT_QUEUE_HARD_LIMIT  = 8192;
+    static constexpr size_t ENFORCEMENT_QUEUE_TOTAL_LIMIT = 8192;
+    // 設計制約: TOTAL_LIMIT >= HARD_LIMIT を compile-time で強制。
+    // TOTAL_LIMIT < HARD_LIMIT 設定は HARD_LIMIT を事実上無効化し、nonCritical 空時に
+    // CRITICAL eviction が予期せず発生する（R6 バグシナリオ）。ビルドレベルで根絶する。
+    static_assert(ENFORCEMENT_QUEUE_TOTAL_LIMIT >= ENFORCEMENT_QUEUE_HARD_LIMIT,
+        "TOTAL_LIMIT must be >= HARD_LIMIT; otherwise HARD_LIMIT is bypassed by TOTAL_LIMIT eviction");
+    // MAX_CRITICAL_PER_TICK: 1 tick あたりの CRITICAL 処理上限（CPU バースト防止）
+    // HARD_LIMIT=8192 の全量を 1 tick で処理すると kernel 呼び出し連続で CPU スパイクが起きうる
+    static constexpr int    ENFORCEMENT_CRITICAL_PER_TICK = 512;
+
+    // §9.14-E: SafetyNet missed-target scan constants
+    static constexpr int    MAX_SAFETY_SCAN_PER_TICK   = 64;
+    // 30 秒 periodic バックストップ: ETW silent drop（kernel レベルのイベントロス）で
+    // hasCriticalDrop が不発の場合でも最大 30 秒以内に ScanRunningProcessesForMissedTargets を発火。
+    static constexpr ULONGLONG SAFETY_SCAN_BACKSTOP_MS = 30ULL * 1000;
 
     // Select eviction candidate from trackedProcesses_ (call while holding trackedCs_)
     // Priority: 1) invalid handle (zombie), 2) oldest phaseStartTime

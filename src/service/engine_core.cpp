@@ -703,12 +703,57 @@ void EngineCore::EngineControlLoop() {
 }
 
 // Enqueue enforcement request (called from ETW callbacks and timer callbacks)
+// §9.14-A: 2-queue CRITICAL/NON-CRITICAL split with TOTAL_LIMIT absolute guarantee.
+// ETW_THREAD_START = NON-CRITICAL (droppable at SOFT_LIMIT).
+// All other types = CRITICAL (eviction from nonCritical first, then oldest-CRITICAL rotation).
 void EngineCore::EnqueueRequest(const EnforcementRequest& req) {
+    const bool isCritical = (req.type != EnforcementRequestType::ETW_THREAD_START);
     bool wasEmpty;
     {
         CSLockGuard lock(queueCs_);
-        wasEmpty = enforcementQueue_.empty();
-        enforcementQueue_.push(req);
+        wasEmpty = criticalQueue_.empty() && nonCriticalQueue_.empty();
+
+        const size_t total = criticalQueue_.size() + nonCriticalQueue_.size();
+
+        if (!isCritical) {
+            // NON-CRITICAL: 個別 OR 合計上限でドロップ（高頻度のためログなし）
+            if (nonCriticalQueue_.size() >= ENFORCEMENT_QUEUE_SOFT_LIMIT ||
+                total >= ENFORCEMENT_QUEUE_TOTAL_LIMIT) {
+                enforcementDropCount_.fetch_add(1, std::memory_order_relaxed);
+                return;
+            }
+            nonCriticalQueue_.push_back(req);
+        } else {
+            // CRITICAL: 個別上限チェック
+            if (criticalQueue_.size() >= ENFORCEMENT_QUEUE_HARD_LIMIT) {
+                uint32_t cnt = criticalDropCount_.fetch_add(1, std::memory_order_relaxed);
+                if ((cnt & 0xFF) == 0)
+                    LOG_ALERT(L"[QUEUE] CRITICAL HARD drop=" + std::to_wstring(cnt + 1));
+                return;
+            }
+
+            // CRITICAL: 合計上限超過時の処理（TOTAL_LIMIT 絶対保証）
+            if (total >= ENFORCEMENT_QUEUE_TOTAL_LIMIT) {
+                if (!nonCriticalQueue_.empty()) {
+                    // NON-CRITICAL を追い出して空きを確保 (O(1))
+                    nonCriticalQueue_.pop_front();
+                    enforcementDropCount_.fetch_add(1, std::memory_order_relaxed);
+                } else if (!criticalQueue_.empty()) {
+                    // nonCritical 空 + TOTAL_LIMIT 到達 → 最古 CRITICAL を evict して新規を受け入れる
+                    // TOTAL_LIMIT は pop_front 1 + push_back 1 で維持（O(1)）
+                    // 完全喪失より最古イベントの破棄を優先する設計
+                    uint32_t cnt = criticalEvictCount_.fetch_add(1, std::memory_order_relaxed);
+                    if ((cnt & 0xFF) == 0)
+                        LOG_ALERT(L"[QUEUE] TOTAL-LIMIT evict oldest CRITICAL evict=" + std::to_wstring(cnt + 1));
+                    criticalQueue_.pop_front();
+                } else {
+                    // criticalQueue_ も空 = TOTAL_LIMIT=0 設定など異常構成 → 受け入れ不能
+                    criticalDropCount_.fetch_add(1, std::memory_order_relaxed);
+                    return;
+                }
+            }
+            criticalQueue_.push_back(req);
+        }
     }
     if (wasEmpty) {
         SetEvent(enforcementRequestEvent_);
@@ -716,14 +761,29 @@ void EngineCore::EnqueueRequest(const EnforcementRequest& req) {
 }
 
 // Process all queued enforcement requests
+// §9.14-A: CRITICAL を先に処理（バースト制限付き）、NON-CRITICAL は PMR dedup 適用。
 void EngineCore::ProcessEnforcementQueue() {
-    // Copy queue under lock, process outside lock
-    std::queue<EnforcementRequest> pending;
+    std::deque<EnforcementRequest> critical, nonCritical;
     {
         CSLockGuard lock(queueCs_);
-        std::swap(pending, enforcementQueue_);
+        // CRITICAL: バースト制限あり（CPU 安定化のため）
+        // 残件は criticalQueue_ に留まり次回呼び出しで処理される（re-enqueue 不要）
+        const int toDrain = std::min(static_cast<int>(criticalQueue_.size()), ENFORCEMENT_CRITICAL_PER_TICK);
+        for (int i = 0; i < toDrain; i++) {
+            critical.push_back(std::move(criticalQueue_.front()));
+            criticalQueue_.pop_front();
+        }
+        // NON-CRITICAL: 全量スワップ
+        std::swap(nonCritical, nonCriticalQueue_);
     }
 
+    // CRITICAL を先に処理（フェーズ遷移・プロセス検出を優先）
+    for (const auto& req : critical) {
+        if (stopRequested_.load()) return;
+        DispatchEnforcementRequest(req);
+    }
+
+    // NON-CRITICAL: 既存の PMR arena デデュプ処理を適用
     // Deduplicate: merge same-PID ETW_THREAD_START requests to prevent
     // O(N^2) CreateToolhelp32Snapshot storms during thread burst
     //
@@ -735,17 +795,14 @@ void EngineCore::ProcessEnforcementQueue() {
 
     std::pmr::vector<EnforcementRequest> deduped(&arena);
     std::pmr::set<DWORD> seenEtwPids(&arena);
-    while (!pending.empty()) {
-        EnforcementRequest req = pending.front();
-        pending.pop();
-        if (req.type == EnforcementRequestType::ETW_THREAD_START) {
-            if (seenEtwPids.count(req.pid)) {
-                etwThreadDeduped_.fetch_add(1, std::memory_order_relaxed);
-                continue;
-            }
-            seenEtwPids.insert(req.pid);
+    for (auto& req : nonCritical) {
+        // All items in nonCritical are ETW_THREAD_START; dedup by PID
+        if (seenEtwPids.count(req.pid)) {
+            etwThreadDeduped_.fetch_add(1, std::memory_order_relaxed);
+            continue;
         }
-        deduped.push_back(req);
+        seenEtwPids.insert(req.pid);
+        deduped.push_back(std::move(req));
     }
 
     for (const auto& req : deduped) {
@@ -1097,7 +1154,19 @@ void EngineCore::HandleSafetyNetCheck() {
 #endif
     }
 
-    // Registry policy integrity verification (30min interval)
+    // §9.14-B: PendingRemoval overflow → immediate VerifyAndRepair
+    // overflow flag は EnqueuePendingRemoval がセット → SafetyNet 10秒以内に即発火
+    if (RegistryPolicyManager::Instance().ConsumePendingOverflowFlag()) {
+        if (verifyRunning_.exchange(1, std::memory_order_acquire) == 0) {
+            ULONGLONG now = GetTickCount64();
+            lastPolicyVerifyTime_ = now;
+            LOG_INFO(L"[SAFETY] PendingRemoval overflow — VerifyAndRepair immediate");
+            RegistryPolicyManager::Instance().VerifyAndRepair();
+            verifyRunning_.store(0, std::memory_order_release);
+        }
+    }
+
+    // Registry policy integrity verification (30min periodic)
     {
         constexpr ULONGLONG POLICY_VERIFY_INTERVAL_MS = 30ULL * 60 * 1000;
         ULONGLONG now = GetTickCount64();
@@ -1109,6 +1178,101 @@ void EngineCore::HandleSafetyNetCheck() {
             }
         }
     }
+
+    // §9.14-E: SafetyNet missed-target scan trigger
+    // トリガ1: CRITICAL ドロップ差分検出
+    // トリガ2: 30 秒バックストップ（ETW silent drop 対策）
+    {
+        ULONGLONG now = GetTickCount64();
+        const uint32_t currentDrops = criticalDropCount_.load(std::memory_order_relaxed);
+        const bool hasCriticalDrop = (currentDrops != lastCheckedDropCount_);
+
+        if (hasCriticalDrop) {
+            // CRITICAL ドロップ検出 — drop count 基準値を更新してスキャン
+            lastCheckedDropCount_ = currentDrops;
+            lastSafetyScanTime_   = now;
+            ScanRunningProcessesForMissedTargets(MAX_SAFETY_SCAN_PER_TICK);
+        } else if ((now - lastSafetyScanTime_) >= SAFETY_SCAN_BACKSTOP_MS) {
+            // バックストップ（30 秒周期フェイルセーフ、ETW silent drop 対策）
+            // hasCriticalDrop=false のため lastCheckedDropCount_ は更新不要
+            lastSafetyScanTime_ = now;
+            ScanRunningProcessesForMissedTargets(MAX_SAFETY_SCAN_PER_TICK);
+        }
+    }
+}
+
+// §9.14-E: SafetyNet 2-pass round-robin scan for missed target processes.
+// Triggered by CRITICAL drop detection or 30s backstop. Budget = scan count (not apply count).
+// lastScannedPid_ is monotonically increasing (std::max) to prevent permanent starvation.
+void EngineCore::ScanRunningProcessesForMissedTargets(int maxScan) {
+    HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+    if (snap == INVALID_HANDLE_VALUE) return;
+    ScopedSnapshot scoped = MakeScopedSnapshot(snap);
+
+    PROCESSENTRY32W pe = {};
+    pe.dwSize = sizeof(pe);
+    if (!Process32FirstW(snap, &pe)) return;
+
+    int scanned = 0;
+    // lastScannedPid_ = 0 の場合は先頭からスキャン（初回 or pass2 折り返し後）
+    // PID wrap（UINT32_MAX 到達）は実用上発生しないが、仮に起きても
+    // 全エントリが <= lastScannedPid_ となり passedOffset 未到達 → pass2 発火で全件カバーされる
+    bool passedOffset = (lastScannedPid_ == 0);
+
+    // パス1: lastScannedPid_ 以降のエントリを処理
+    do {
+        DWORD pid = pe.th32ProcessID;
+        if (!passedOffset) {
+            if (pid > lastScannedPid_) passedOffset = true;
+            else continue;
+        }
+        // std::max で単調増加を保証。snapshot が降順（高 PID 優先）の場合、
+        // lastScannedPid_ = pid だと後退してループが永続するバグを防ぐ
+        lastScannedPid_ = std::max(lastScannedPid_, pid);
+        bool alreadyTracked;
+        { CSLockGuard lk(trackedCs_); alreadyTracked = trackedProcesses_.count(pid) > 0; }
+        if (!alreadyTracked && TryApplyIfMissedTarget(pid, pe.szExeFile))
+            safetyRecoveredCount_.fetch_add(1, std::memory_order_relaxed);
+        scanned++;  // budget はスキャン数で消費（追跡済みを含む全エントリ）
+    } while (scanned < maxScan && Process32NextW(snap, &pe));
+
+    // パス2: パス1で offset 未到達 かつ budget 残あり → 先頭から折り返し
+    if (!passedOffset && scanned < maxScan) {
+        lastScannedPid_ = 0;
+        pe.dwSize = sizeof(pe);
+        if (Process32FirstW(snap, &pe)) {
+            do {
+                DWORD pid = pe.th32ProcessID;
+                lastScannedPid_ = pid;
+                bool alreadyTracked;
+                { CSLockGuard lk(trackedCs_); alreadyTracked = trackedProcesses_.count(pid) > 0; }
+                if (!alreadyTracked && TryApplyIfMissedTarget(pid, pe.szExeFile))
+                    safetyRecoveredCount_.fetch_add(1, std::memory_order_relaxed);
+                scanned++;
+            } while (scanned < maxScan && Process32NextW(snap, &pe));
+        }
+    }
+}
+
+// §9.14-E: Check if a process is a missed target; apply optimization if so.
+bool EngineCore::TryApplyIfMissedTarget(DWORD pid, const wchar_t* exeName) {
+    if (!exeName || !*exeName) return false;
+    if (IsCriticalProcess(exeName)) return false;
+
+    std::wstring lowerName = ToLower(exeName);
+    bool isNameTarget   = false;
+    bool maybePathTarget = false;
+    {
+        CSLockGuard lock(targetCs_);
+        isNameTarget    = (targetNameSet_.count(lowerName) > 0);
+        maybePathTarget = hasPathTargets_.load(std::memory_order_relaxed) &&
+                          (pathTargetFileNames_.count(lowerName) > 0);
+    }
+
+    if (!isNameTarget && !maybePathTarget) return false;
+
+    // Delegate to existing ApplyOptimization — handles IsTracked check + path resolution
+    return ApplyOptimization(pid, exeName, false, 0);
 }
 
 // Drain pending process removal queue (called from EngineControlLoop thread only)
@@ -1157,38 +1321,43 @@ void EngineCore::ProcessPendingRemovals() {
 }
 
 // Schedule deferred verification timer (AGGRESSIVE phase)
+// §9.14-C: std::exchange pattern ensures old timer/context are cancelled outside lock.
+// Previous implementation overwrote deferredTimer/deferredTimerContext without cancellation,
+// leaking the old handle and context when the same PID was re-scheduled.
 void EngineCore::ScheduleDeferredVerification(DWORD pid, uint8_t step) {
     if (!timerQueue_) return;
 
-    // Determine delay based on step
     DWORD delayMs = static_cast<DWORD>(engine_logic::DeferredVerifyDelayMs(step, policy_));
-    if (delayMs == 0) return;  // invalid step
+    if (delayMs == 0) return;
 
-    // Get reference to tracked process and create context with shared_ptr
+    HANDLE oldTimer = nullptr;
+    DeferredVerifyContext* oldCtx = nullptr;
+
     {
         CSLockGuard lock(trackedCs_);
         auto it = trackedProcesses_.find(pid);
-        if (it == trackedProcesses_.end()) {
-            return;
-        }
+        if (it == trackedProcesses_.end()) return;
+
+        // Exchange: atomically swap out old timer/context, insert new ones
+        // Old handles are deleted outside the lock (DeleteTimerQueueTimer may block)
+        oldTimer = std::exchange(it->second->deferredTimer, nullptr);
+        oldCtx   = std::exchange(it->second->deferredTimerContext, nullptr);
 
         auto* context = new DeferredVerifyContext{this, pid, step, it->second};
-
         HANDLE timer = nullptr;
-        if (CreateTimerQueueTimer(
-                &timer,
-                timerQueue_,
-                DeferredVerifyTimerCallback,
-                context,
-                delayMs,
-                0,  // One-shot
-                WT_EXECUTEONLYONCE)) {
-            it->second->deferredTimer = timer;
+        if (CreateTimerQueueTimer(&timer, timerQueue_, DeferredVerifyTimerCallback,
+                                  context, delayMs, 0, WT_EXECUTEONLYONCE)) {
+            it->second->deferredTimer        = timer;
             it->second->deferredTimerContext = context;
         } else {
             delete context;
         }
     }
+
+    // Cancel old timer outside lock — INVALID_HANDLE_VALUE waits for in-flight callbacks
+    // DeferredVerifyTimerCallback only calls EnqueueRequest (lock-free), so μs completion
+    if (oldTimer) DeleteTimerQueueTimer(timerQueue_, oldTimer, INVALID_HANDLE_VALUE);
+    if (oldCtx)   delete oldCtx;
 }
 
 // Cancel all timers for a process
@@ -1498,6 +1667,34 @@ void EngineCore::PerformPeriodicMaintenance(ULONGLONG now) {
         LOG_DEBUG(diagBuf);
 
         lastDiagLogTime_ = now;
+    }
+
+    // §9.14-H: Queue + memory counters (60s cadence, piggybacks on DIAG_LOG_INTERVAL_MS)
+    if (now - lastStatsLogTime_ < 1000) {  // Only emit if stats log just fired this tick (avoid double-log storm)
+        // No-op: combined with stats above
+    }
+    {
+        static ULONGLONG lastQueueDiagTime = 0;
+        if (now - lastQueueDiagTime >= 60000) {
+            lastQueueDiagTime = now;
+            size_t critSz = 0, nonCritSz = 0;
+            {
+                CSLockGuard lock(queueCs_);
+                critSz    = criticalQueue_.size();
+                nonCritSz = nonCriticalQueue_.size();
+            }
+            wchar_t qBuf[320];
+            swprintf_s(qBuf,
+                L"[DIAG] crit=%zu nc=%zu pending=%d drop=%u critDrop=%u critEvict=%u recovered=%u tracked=%zu",
+                critSz, nonCritSz,
+                RegistryPolicyManager::Instance().GetPendingQueueSize(),
+                enforcementDropCount_.load(std::memory_order_relaxed),
+                criticalDropCount_.load(std::memory_order_relaxed),
+                criticalEvictCount_.load(std::memory_order_relaxed),
+                safetyRecoveredCount_.load(std::memory_order_relaxed),
+                GetActiveProcessCount());
+            LOG_DEBUG(qBuf);
+        }
     }
 
     // [MEM] memory diagnostics (10s warmup / 60s steady)
@@ -1896,6 +2093,11 @@ void EngineCore::HandleEnforceError(HANDLE hProcess, DWORD pid, DWORD error) {
         shouldLog = false;
     } else {
         errorLogSuppression_[suppressKey] = now;
+        // §9.14-G: Immediate size cap — oldest-first eviction on insert to bound map growth.
+        // errorLogSuppression_ は std::map<pair<DWORD,DWORD>, ULONGLONG>（順序付き）
+        // erase(begin()) は最小キー（最古 PID+errorCode ペア）を O(log N) で削除
+        while (errorLogSuppression_.size() > SUPPRESSION_MAX_SIZE / 2)
+            errorLogSuppression_.erase(errorLogSuppression_.begin());
     }
 
     // If process has exited, cleanup immediately (no retry)
@@ -2539,29 +2741,14 @@ bool EngineCore::ApplyOptimizationWithHandle(DWORD pid, const std::wstring& name
     {
         CSLockGuard lock(trackedCs_);
 
-        // §9.03: Counter advances unconditionally to avoid period skew.
-        static uint32_t evictionCounter = 0;
-        // NOTE: evictionCounter is intentionally non-atomic.
-        // MUST only be accessed under trackedCs_ lock.
-        // Do NOT move or reuse outside this critical section.
-        evictionCounter++;
-
         size_t currentSize = trackedProcesses_.size();
+        // §9.14-F: Simplified eviction — always select candidates when cap is reached.
+        // Evict up to 16 per insertion (+1 accounts for the process being inserted this call).
+        // Eliminates the period-skew counter; SelectEvictionCandidates handles N distinct PIDs.
         if (currentSize >= MAX_TRACKED_PROCESSES) {
-            bool forceEvict = (currentSize >= MAX_TRACKED_PROCESSES + 32);
-            if (forceEvict) {
-                // §9.07 修正③: Burst drain — select ALL excess candidates in one pass.
-                // Naive while-loop calling SelectEvictionCandidate() repeatedly returns the same PID
-                // (no erase inside lock per §9.02). SelectEvictionCandidates() handles N distinct PIDs.
-                // §9.08 修正①: +1 accounts for the process being inserted in this same call.
-                size_t needed = (currentSize + 1) - MAX_TRACKED_PROCESSES;
-                evictList = SelectEvictionCandidates(trackedProcesses_, needed);
-            } else if ((evictionCounter & 0xF) == 0) {
-                // PRECONDITION: trackedCs_ must be held when calling SelectEvictionCandidate().
-                DWORD c = SelectEvictionCandidate();
-                // §9.02: No erase here — RemoveTrackedProcess() handles all resource cleanup
-                if (c != 0) evictList.push_back(c);
-            }
+            size_t excess  = currentSize - MAX_TRACKED_PROCESSES + 1;
+            size_t toEvict = std::min(excess, static_cast<size_t>(16));
+            evictList = SelectEvictionCandidates(trackedProcesses_, toEvict);
         }
 
         trackedProcesses_[pid] = std::move(tracked);

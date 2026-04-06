@@ -84,6 +84,10 @@ public:
     bool HasPolicy(const std::wstring& canonPath) const;
     std::vector<std::wstring> GetAppliedPolicies() const;
 
+    // §9.14-B: Pending queue size (approximate upper bound) and overflow flag
+    int32_t GetPendingQueueSize() const { return pendingQueueSize_.load(std::memory_order_relaxed); }
+    bool ConsumePendingOverflowFlag() { return pendingOverflowFlag_.exchange(false, std::memory_order_relaxed); }
+
 private:
     RegistryPolicyManager();
     ~RegistryPolicyManager();
@@ -128,6 +132,13 @@ private:
 
     // ── Lock-free pending removal queue (REQ-2) ──
     std::atomic<PendingRemovalNode*>     pendingHead_{nullptr};
+
+    // §9.14-B: Approximate size counter (CAS-based upper bound) and overflow flag
+    // pendingQueueSize_ は近似カウンタ。Treiber stack の特性上（CAS 成功後に push が完了するまでの間）
+    // size と実ノード数に瞬間的な乖離が発生しうる（意図的な設計。Eventual Consistency モデル）。
+    std::atomic<int32_t>                 pendingQueueSize_{0};
+    std::atomic<bool>                    pendingOverflowFlag_{false};
+    static constexpr int32_t             MAX_PENDING_QUEUE_SIZE = 512;
 
     // ── Monotonic version counter (REQ-4: fetch_add only, never reset) ──
     std::atomic<uint64_t>                stateVersion_{0};

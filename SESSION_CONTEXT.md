@@ -1,7 +1,7 @@
 # UnLeaf v1.1.0 Project Context
 
-> **最終更新**: 2026-03-30
-> **ステータス**: **v1.1.0 開発中** — プロアクティブポリシー生成 + CanonicalizePath 正規化統一 + 設計契約コメント追加 完了。ビルド警告ゼロ・151/151 PASS 確認済み。
+> **最終更新**: 2026-04-03
+> **ステータス**: **v1.1.0 開発中** — §9.14 ServiceEngine メモリ増加対策 完了。2キュー + TOTAL_LIMIT 絶対保証 + RAII NodeGuard + SafetyNet 2パスラウンドロビン + 30秒バックストップ。ビルド警告ゼロ・151/151 PASS 確認済み。
 
 ---
 
@@ -24,8 +24,9 @@
 
 | 検証項目 | 結果 |
 |---------|------|
-| ビルド (Service / Manager / Tests) | ✅ 警告ゼロ Release (2026-03-30) |
-| ユニットテスト | ✅ 151/151 PASS (2026-03-30) |
+| ビルド (Service / Manager / Tests) | ✅ 警告ゼロ Release (2026-04-03) |
+| ユニットテスト | ✅ 151/151 PASS (2026-04-03) |
+| §9.14 ServiceEngine メモリ増加対策 | ✅ 実装完了 (2026-04-03) |
 | v1.1.0 リリース (§9.00〜§9.09 メモリ安定化) | ✅ 完了 (2026-03-26) |
 | RegistryPolicyManager v5 (IFEO/PT split) | ✅ 実装完了 (2026-03-29) |
 | CPU 暴走対策 (SetEvent 責務分離 + スピン検知) | ✅ 実装完了 (2026-03-29) |
@@ -130,6 +131,13 @@ src/
 | `DIAG_LOG_INTERVAL_MS` | 30,000 (Debug) / 120,000 (Release) ms | [DIAG] ダンプ間隔 |
 | `ETW_STABLE_RATE_LIMIT` | 200 ms | STABLE ETW レートリミット |
 | `ECOQOS_CACHE_DURATION` | 100 ms | EcoQoS キャッシュ TTL |
+| `ENFORCEMENT_QUEUE_SOFT_LIMIT` | 4,096 | NON-CRITICAL キュー個別上限 (§9.14-A) |
+| `ENFORCEMENT_QUEUE_HARD_LIMIT` | 8,192 | CRITICAL キュー個別上限 (§9.14-A) |
+| `ENFORCEMENT_QUEUE_TOTAL_LIMIT` | 8,192 | 2キュー合計絶対上限 (§9.14-A) |
+| `ENFORCEMENT_CRITICAL_PER_TICK` | 512 | 1 tick あたり CRITICAL 処理上限 (§9.14-A) |
+| `MAX_SAFETY_SCAN_PER_TICK` | 64 | SafetyNet ラウンドロビン 1 tick スキャン上限 (§9.14-E) |
+| `SAFETY_SCAN_BACKSTOP_MS` | 30,000 ms | SafetyNet 30 秒バックストップ (§9.14-E) |
+| `MAX_PENDING_QUEUE_SIZE` | 512 | PendingRemoval キュー上限 (§9.14-B, registry_manager.h) |
 
 ---
 
@@ -208,6 +216,7 @@ ctest --test-dir build -C Release --output-on-failure
 | §9.12 | **プロアクティブポリシー生成** (`engine_core.h/cpp`, `registry_manager.h/cpp`): リアクティブ（ETW 検出時のみ）からプロアクティブ（config 起点）へアーキテクチャ変更。① `ApplyProactivePolicies()` 新設 — Initialize/HandleConfigChange 時に全 config エントリへポリシー適用。② `ApplyIFEOOnly()` 新設 — name-only ターゲットの IFEO プロアクティブ適用。③ `ReconcileWithConfig()` 新設 — config から除外されたエントリの自動クリーンアップ（stateVersion_ CAS による race condition 防止）。④ `ResolvePathByHandle` 完全廃止 → `CanonicalizePath`（GetFullPathNameW ベース、ファイル存在不要）に置換。⑤ `HasPolicy()` 新設 + `ApplyOptimizationWithHandle` にフォールバック ApplyPolicy 復活（proactive 失敗時のリカバリ）。⑥ `FileExistsW()` 新設（GetFileAttributesW）— パス存在時は IFEO+PT、不在時は IFEO のみ適用。⑦ IFEO グローバルスコープの設計契約をコメント明記。151/151 PASS 確認済み | 2026/03/30 |
 | §9.13 | **CanonicalizePath 正規化統一 + 長パス対応** (`types.h`, `engine_core.cpp`, `registry_manager.cpp`): ① `CanonicalizePath` を `types.h` に free function として配置（EngineCore・RegistryPolicyManager 双方から利用可能）。② GetFullPathNameW 2段階呼び出し（動的バッファ）で MAX_PATH 制限撤廃。③ `resultLen` による明示的文字列長指定（バッファ読み過ぎ防止）。④ policyMap_ の全キー生成・検索を `CanonicalizePath` に統一（`NormalizePath` はフォールバック/ログ用途に限定）。⑤ 設計契約コメント（DESIGN CONTRACT / DO NOT）を engine_core.cpp, registry_manager.cpp, registry_manager.h の3ファイルに追加。151/151 PASS 確認済み | 2026/03/30 |
 | §8.61 | **ログシーケンス逆転バグ修正** (`logger.h/cpp`): ローテーション後 `UnLeaf.log` 先頭レコードの日時が `UnLeaf.log.1` 末尾より古くなる現象を修正。根本原因: Manager の stale check が `WriteFile` の**後**にあったため、最低 1 Write が旧ファイル (リネーム済み `.log.1`) に書かれていた。① `hRotationEvent_` (`Global\UnLeafLogRotated`, auto-reset named event) を追加 — Service はローテーション成功直後に `SetEvent`、Manager は `WriteFile` **前**に `WaitForSingleObject(..., 0)` でゼロ待機ポーリング。② stale check ブロックを `WriteFile` の後から前へ移動 — `rotationSignaled` で即時検知、counter フォールバック (100 write) も保持。③ stale reopen 失敗時の early return ガードを追加。これにより stale Write がゼロになりシーケンス逆転が解消。104/104 PASS 確認済み | 2026/03/25 |
+| §9.14 | **ServiceEngine メモリ増加対策** (`engine_core.h/cpp`, `registry_manager.h/cpp`): 長期稼働での Working Set 線形増加を根絶する 8 件の修正を実装 (Rev.17 確定版)。① §9.14-C: `ScheduleDeferredVerification` — `std::exchange` + INVALID_HANDLE_VALUE で旧タイマーハンドル・コンテキストリークを根絶。② §9.14-B: `EnqueuePendingRemoval` — CAS ベース `pendingQueueSize_` 上限ガード + overflow 時 `pendingOverflowFlag_` 即セット → SafetyNet 10秒以内に `VerifyAndRepair` 即発火。`DrainPendingRemovals` — RAII `NodeGuard` (inline struct) で `fetch_sub + delete` をスコープ末尾で不可分保証、re-enqueue ループ（線形増加の主因）を廃止。③ §9.14-A: `enforcementQueue_` を `criticalQueue_ + nonCriticalQueue_`（各 std::deque）に分離。ETW_THREAD_START = NON-CRITICAL（SOFT_LIMIT でドロップ可）、他 = CRITICAL。TOTAL_LIMIT 絶対保証（nonCritical 追い出し → 最古 CRITICAL eviction）。`static_assert(TOTAL_LIMIT >= HARD_LIMIT)` でビルドレベル強制。`ENFORCEMENT_CRITICAL_PER_TICK=512` で CPU バースト防止。④ §9.14-E: `HandleSafetyNetCheck` — CRITICAL drop 差分検出 + 30秒バックストップ (ETW silent drop 対応) で `ScanRunningProcessesForMissedTargets` を発火。2パスラウンドロビン + `std::max` 単調増加保証により特定 PID の永続スキップを根絶。⑤ §9.14-H: `PerformPeriodicMaintenance` に 60秒 `[DIAG]` キュー診断ログ追加。⑥ §9.14-D: `ReconcileWithConfig` 先頭で `ifeoRefCount_.clear()` + policyMap_ 全走査再構築。⑦ §9.14-F: eviction ロジックを簡略化 — 常時最大 16件/挿入でキャップ超過を即処理。⑧ §9.14-G: `HandleEnforceError` — insert 直後に `SUPPRESSION_MAX_SIZE/2` を即キャップ（TTL クリーンアップ前の突発増大防止）。151/151 PASS 確認済み | 2026/04/03 |
 
 ---
 

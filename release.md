@@ -45,6 +45,15 @@ Windows 11 / 10 向けゼロオーバーヘッド EcoQoS オプティマイザ *
 | 11 | **ETW フォールバックパス修正** — `ApplyOptimizationWithHandle` に name-only / path-based 分岐を追加。`chrome.exe=1` 等の name-only ターゲットは `HasPolicy` ゲートをバイパスし、パスが取得できた時点で即座に PowerThrottle ポリシーを適用。サービス起動後に起動したプロセスへの適用漏れを解消 |
 | 12 | **SafetyNet ポリシー回復ループ** — プロセス起動直後に `QueryFullProcessImageNameW` が失敗した場合 (`needsPolicyRetry=true`)、10s 後の SafetyNet サイクルで自動リトライ。確実な適用を保証 |
 
+### 🧠 ServiceEngine メモリ増加対策 (§9.14 Rev.17)
+
+| # | 改善内容 |
+|---|---------|
+| 13 | **enforcementQueue_ 2キュー分離** — CRITICAL / NON-CRITICAL の2キュー (`std::deque`) に分離。TOTAL_LIMIT 絶対保証 + CRITICAL 512件/tick バースト制限で長期稼働時のメモリ線形増加を根絶 |
+| 14 | **PendingRemoval 上限ガード** — CAS ベース上限ガード (MAX=512) + RAII NodeGuard。re-enqueue ループ廃止でキュー無限増大を根絶 |
+| 15 | **タイマーハンドルリーク修正** — `ScheduleDeferredVerification` を `std::exchange` + `INVALID_HANDLE_VALUE` 同期で旧タイマーハンドル・コンテキストリークを根絶 |
+| 16 | **SafetyNet 2パスラウンドロビン** — 2パスラウンドロビンスキャン + 30秒バックストップ追加。ETW silent drop 時も ≤30秒でリカバリ |
+
 ---
 
 ## 🚀 なぜ UnLeaf なのか? (技術的優位性)

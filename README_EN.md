@@ -334,6 +334,12 @@ UnLeaf/
 - Fixed PowerThrottle policy not applied to name-only targets (e.g., `chrome.exe=1`) started after service registration: `ApplyOptimizationWithHandle` now separates name-only targets (always call `ApplyPolicy` when path is available) from path-based targets (guarded by `HasPolicy`)
 - Added SafetyNet (10s) policy recovery: processes whose image path could not be resolved at ETW callback time (`QueryFullProcessImageNameW` returned before image mapping completed) are retried on the next SafetyNet cycle
 
+**ServiceEngine Memory Growth Fix (§9.14 Rev.17)**
+- Split `enforcementQueue_` into CRITICAL / NON-CRITICAL dual-queue with absolute TOTAL_LIMIT guarantee + 512-item/tick burst cap — eliminates linear memory growth under sustained ETW load
+- PendingRemoval: CAS-based size cap (MAX=512) + RAII NodeGuard. Re-enqueue loop removed, eliminating unbounded queue growth
+- Fixed `ScheduleDeferredVerification` timer handle leak (`std::exchange` + `INVALID_HANDLE_VALUE` sync-wait)
+- SafetyNet: 2-pass round-robin scan + 30s backstop. Missed-target recovery guaranteed within ≤30s even under ETW silent drops
+
 ### v1.0.3 (2026-03-24)
 
 **Log Rotation Stability**
