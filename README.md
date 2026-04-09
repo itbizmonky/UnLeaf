@@ -151,6 +151,8 @@ Windows 10 (1709) で Power Throttling として導入された省電力 API で
 LogLevel=INFO
 ; Log output: 1=enabled, 0=disabled
 LogEnabled=1
+; Crash minidump writer: 1=enabled, 0=disabled (default)
+CrashDump=0
 
 [Manager]
 ; ウィンドウ位置・サイズ (Manager UI が自動保存)
@@ -166,6 +168,23 @@ chrome.exe=1
 
 ### サービスが動いているか確認するには？
 `UnLeaf_Manager.exe` を起動し、UIからサービスの状態を確認できます。コマンドラインからは `sc query UnLeafService` でも確認可能です。
+
+### サービスがクラッシュしたときの診断情報を得るには？ (CrashDump 機能)
+UnLeaf はポータブル方針を堅持するため、クラッシュダンプ出力は **既定で無効** です。診断のためにオプトインする場合:
+
+1. サービス停止後、`UnLeaf.ini` の `[Logging]` セクションに `CrashDump=1` を追記
+2. サービスを再起動
+
+有効化後、`UnLeaf_Service.exe` に未処理例外が発生すると、以下に MiniDump が書き出されます:
+
+```
+<インストールフォルダ>\crash\UnLeaf_Service_YYYYMMDD_HHMMSS.sss.dmp
+```
+
+- **ダンプ種別**: `MiniDumpWithThreadInfo | MiniDumpWithIndirectlyReferencedMemory` — 全スレッドのレジスタ/TEB と、スタック/レジスタが指す小さなヒープ断片を含む (サイズは抑えつつクロススレッドレース診断に十分な情報量)
+- **Windows Error Reporting (WER) との関係**: UnLeaf の MiniDump 書き出しは WER と独立しており、WER にもそのままチェインします。両方のダンプを取得できます
+- **デバッグシンボル**: Release ビルドは `/Zi /DEBUG /OPT:REF /OPT:ICF` により PDB を常時出力しています。`UnLeaf_Service.pdb` と dmp を WinDbg / Visual Studio で読み込むことで関数名・行番号付きで解析できます
+- **既定無効の理由**: `CrashDump=1` を明示しない限り `crash\` サブフォルダは一切作成されません。ポータブル方針 (ユーザーが意識しないファイル/フォルダ生成の回避) を維持します
 
 ---
 
@@ -313,6 +332,21 @@ UnLeaf/
 ---
 
 ## 更新履歴 (Changelog)
+
+### v1.1.1 (2026-04-09)
+
+**ProcessMonitor 堅牢性強化 (§9.15)**
+- `IsHealthy()` ヘルスチェックを 3 段判定に再設計: ウォームアップ猶予 (120s) + lost event デルタ閾値 + `ControlTraceW(QUERY)` セッション生存確認。idle (正常な無イベント) と ETW セッション死を正しく区別
+- `instance_` を `std::atomic<ProcessMonitor*>` に変更。`EventRecordCallback` でローカル `self` にスナップショットし TOCTOU を排除
+- `Stop()` を `stopMtx_` で保護し ETW シャットダウン契約 (5 ステップ順序) を厳密化。IPC スレッドの `IsHealthy()` との race を排除
+- `ParseProcessStartEvent` の文字列プロパティを bounded copy に置換。非終端 TDH ペイロードによる領域外読みリスクを排除
+- `Start()` で全ヘルスチェック状態を明示リセット。サービス再起動後の残留状態汚染を防止
+
+**CrashDump オプトイン機能 (Phase 2)**
+- `src/common/crash_handler.{h,cpp}` を新設。`SetUnhandledExceptionFilter` + `MiniDumpWithThreadInfo | MiniDumpWithIndirectlyReferencedMemory` ベースの MiniDump ライターを実装。**既定無効**、`[Logging] CrashDump=1` で opt-in
+- 出力先: `<install dir>\crash\UnLeaf_Service_YYYYMMDD_HHMMSS.sss.dmp` (ポータブル方針堅持)
+- `EXCEPTION_CONTINUE_SEARCH` で WER / デバッガにチェインするため、UnLeaf MiniDump と WER の両方を取得可能
+- Release ビルドに `/Zi /DEBUG /OPT:REF /OPT:ICF` を適用し PDB を常時出力
 
 ### v1.1.0 (2026-03-30)
 

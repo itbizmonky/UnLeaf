@@ -5,6 +5,7 @@
 #include "ipc_server.h"
 #include "../common/logger.h"
 #include "../common/config.h"
+#include "../common/crash_handler.h"
 #include <iostream>
 
 namespace unleaf {
@@ -84,6 +85,14 @@ bool ServiceMain::RunAsConsole() {
 
     // Initialize config
     UnLeafConfig::Instance().Initialize(baseDir_);
+
+    // Install crash dump handler if enabled via [Logging] CrashDump=1.
+    // Default is disabled, so production users who do not opt in see no
+    // crash/ directory created next to the executable.
+    if (UnLeafConfig::Instance().IsCrashDumpEnabled()) {
+        InstallCrashHandler(baseDir_);
+        LOG_DEBUG(L"[CRASH] MiniDump handler installed (CrashDump=1)");
+    }
 
     // Initialize and start engine
     if (!EngineCore::Instance().Initialize(baseDir_)) {
@@ -177,6 +186,13 @@ void WINAPI ServiceMain::ServiceMainFunc(DWORD argc, LPWSTR* argv) {
     if (!UnLeafConfig::Instance().Initialize(service.baseDir_)) {
         service.ReportStatus(SERVICE_STOPPED, 2);
         return;
+    }
+
+    // Install crash dump handler if enabled via [Logging] CrashDump=1.
+    // Default is disabled; opt-in via INI for production diagnostics.
+    if (UnLeafConfig::Instance().IsCrashDumpEnabled()) {
+        InstallCrashHandler(service.baseDir_);
+        LOG_DEBUG(L"[CRASH] MiniDump handler installed (CrashDump=1)");
     }
 
     if (!EngineCore::Instance().Initialize(service.baseDir_)) {

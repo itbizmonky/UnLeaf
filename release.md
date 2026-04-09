@@ -1,14 +1,28 @@
-# 🍃  UnLeaf v1.1.0 — Memory Stability & Long-Run Hardening
+# 🍃  UnLeaf v1.1.1 — ProcessMonitor Hardening & CrashDump
 
-Windows 11 / 10 向けゼロオーバーヘッド EcoQoS オプティマイザ **UnLeaf** のメモリ安定化リリース **v1.1.0** をリリースしました。
-24 時間 365 日稼働を前提とした長期稼働品質の抜本改善です。**v1.0.x ユーザーへのアップデートを推奨します。**
+Windows 11 / 10 向けゼロオーバーヘッド EcoQoS オプティマイザ **UnLeaf** のパッチリリース **v1.1.1** をリリースしました。
+ETW ProcessMonitor のヘルスチェック堅牢性強化と、オプトイン式 CrashDump 機能の追加を含みます。**v1.1.0 ユーザーへのアップデートを推奨します。**
 
 - README: [English](README_EN.md) | [日本語](README.md)
 - 詳細な仕様はこちら: [Technical specifications](docs/Engine_Specification.md)
 
 ---
 
-## ⚡ v1.1.0 の変更点 (What's New)
+## ⚡ v1.1.1 の変更点 (What's New)
+
+### 🔬 ProcessMonitor 堅牢性強化 (§9.15)
+
+| # | 改善内容 |
+|---|---------|
+| 21 | **ヘルスチェック 3 段判定再設計** — ウォームアップ猶予 (120s) + lost event デルタ閾値 + `ControlTraceW(QUERY)` セッション生存確認 (1s キャッシュ)。idle (正常な無イベント) と ETW セッション死を正しく区別し、不要な ETW 再起動の連鎖を防止 |
+| 22 | **`instance_` atomic 化 + TOCTOU 排除** — `std::atomic<ProcessMonitor*>` に変更。`EventRecordCallback` でローカル `self` にスナップショットし、acquire/release ペアリングで安全にルーティング |
+| 23 | **ETW シャットダウン契約厳密化** — `stopMtx_` で Stop() vs IsHealthy() を直列化。5 ステップ順序 (`stopRequested_` → `CloseTrace` → `ControlTrace(STOP)` → `join` → `instance_ clear`) を DO NOT REORDER として明文化 |
+| 24 | **TDH パース境界読みガード** — `ParseProcessStartEvent` の文字列プロパティを `propSize` 上限の bounded copy に置換。非終端 TDH ペイロードによる領域外読み (AV リスク) を排除 |
+| 25 | **Start() 状態リセット** — 全ヘルスチェック状態を明示リセットし、サービス再起動後の残留状態汚染を防止 |
+
+---
+
+## ⚡ v1.1.0 の変更点
 
 ### 🛡️ メモリ安定化 — 長期稼働品質改善
 
@@ -53,6 +67,15 @@ Windows 11 / 10 向けゼロオーバーヘッド EcoQoS オプティマイザ *
 | 14 | **PendingRemoval 上限ガード** — CAS ベース上限ガード (MAX=512) + RAII NodeGuard。re-enqueue ループ廃止でキュー無限増大を根絶 |
 | 15 | **タイマーハンドルリーク修正** — `ScheduleDeferredVerification` を `std::exchange` + `INVALID_HANDLE_VALUE` 同期で旧タイマーハンドル・コンテキストリークを根絶 |
 | 16 | **SafetyNet 2パスラウンドロビン** — 2パスラウンドロビンスキャン + 30秒バックストップ追加。ETW silent drop 時も ≤30秒でリカバリ |
+
+### 🧩 CrashDump オプトイン機能 (Phase 2)
+
+| # | 改善内容 |
+|---|---------|
+| 17 | **MiniDump ライター新設** — `src/common/crash_handler.{h,cpp}` を新設。`SetUnhandledExceptionFilter` + `MiniDumpWithThreadInfo \| MiniDumpWithIndirectlyReferencedMemory` で全スレッドレジスタ・TEB・スタックから参照される小さなヒープ断片を含むダンプを出力 |
+| 18 | **明示的 opt-in** — 既定無効。`UnLeaf.ini` の `[Logging] CrashDump=1` を明示設定した場合にのみインストールされ、`<install dir>\crash\` フォルダが生成される。ポータブル方針を堅持 |
+| 19 | **WER 併用** — `EXCEPTION_CONTINUE_SEARCH` で Windows Error Reporting / デバッガにそのままチェインするため、UnLeaf MiniDump と WER の両方を取得可能 |
+| 20 | **PDB 常時出力** — Release ビルドに `/Zi /DEBUG /OPT:REF /OPT:ICF` を適用し、`UnLeaf_Service.pdb` を常時出力。ダンプの完全シンボル化解析が可能 |
 
 ---
 

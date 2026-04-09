@@ -52,8 +52,12 @@ if(MSVC)
     add_compile_options(/permissive-)
 
     # Release ビルドの最適化設定
-    set(CMAKE_CXX_FLAGS_RELEASE "${CMAKE_CXX_FLAGS_RELEASE} /O2 /GL")
-    set(CMAKE_EXE_LINKER_FLAGS_RELEASE "${CMAKE_EXE_LINKER_FLAGS_RELEASE} /LTCG")
+    # /Zi: PDB を生成する (Release でもクラッシュダンプをソース行へ逆引き可能にする)
+    # /DEBUG: リンカに PDB を出力させる
+    # /OPT:REF: 未参照コード/データを除去 (/DEBUG により既定で OFF になるのを明示的に復帰)
+    # /OPT:ICF: 同一関数/データの畳み込み
+    set(CMAKE_CXX_FLAGS_RELEASE "${CMAKE_CXX_FLAGS_RELEASE} /O2 /GL /Zi")
+    set(CMAKE_EXE_LINKER_FLAGS_RELEASE "${CMAKE_EXE_LINKER_FLAGS_RELEASE} /LTCG /DEBUG /OPT:REF /OPT:ICF")
 
     # スタンドアロン実行ファイル用のスタティックランタイムリンク
     set(CMAKE_MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
@@ -82,6 +86,7 @@ set(COMMON_SOURCES
     src/common/config.cpp           # INI 設定ファイル読み書き
     src/common/registry_manager.cpp # レジストリポリシー管理
     src/common/win_string_utils.cpp # UTF-8 ↔ ワイド文字列変換
+    src/common/crash_handler.cpp    # MiniDumpWriteDump クラッシュダンプ
 )
 
 set(COMMON_HEADERS
@@ -90,6 +95,7 @@ set(COMMON_HEADERS
     src/common/logger.h
     src/common/config.h
     src/common/registry_manager.h
+    src/common/crash_handler.h
 )
 
 # =============================================================================
@@ -137,6 +143,7 @@ target_link_libraries(UnLeaf_Service PRIVATE
     kernel32             # Windows コア API
     user32               # ユーザーインターフェース
     tdh                  # Trace Data Helper (ETW イベントパース)
+    dbghelp              # MiniDumpWriteDump (クラッシュダンプ)
     nlohmann_json::nlohmann_json
 )
 

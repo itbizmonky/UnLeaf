@@ -380,19 +380,39 @@ void EngineCore::Stop() {
     bool expected = true;
     if (!running_.compare_exchange_strong(expected, false)) return;
 
+    // Step-elapsed diagnostic: every [STOP] step logs cumulative ms since
+    // Stop() entry. When WER/MiniDumpWriteDump fires during shutdown the
+    // last logged step identifies the phase that took too long or died.
+    const ULONGLONG stopT0 = GetTickCount64();
+    auto elapsed = [stopT0]() -> unsigned long long {
+        return GetTickCount64() - stopT0;
+    };
+
     stopRequested_ = true;
     SetEvent(stopEvent_);
-    LOG_DEBUG(L"[STOP] Step 1: Stop signal sent");
+    {
+        wchar_t b[96];
+        swprintf_s(b, L"[STOP] Step 1: Stop signal sent (+%llums)", elapsed());
+        LOG_DEBUG(b);
+    }
 
     // Stop ETW monitor
     processMonitor_.Stop();
-    LOG_DEBUG(L"[STOP] Step 2: ETW monitor stopped");
+    {
+        wchar_t b[96];
+        swprintf_s(b, L"[STOP] Step 2: ETW monitor stopped (+%llums)", elapsed());
+        LOG_DEBUG(b);
+    }
 
     // Wait for single control thread
     if (engineControlThread_.joinable()) {
         engineControlThread_.join();
     }
-    LOG_DEBUG(L"[STOP] Step 3: Control thread joined");
+    {
+        wchar_t b[96];
+        swprintf_s(b, L"[STOP] Step 3: Control thread joined (+%llums)", elapsed());
+        LOG_DEBUG(b);
+    }
 
     // Collect timer contexts before destroying timer queue
     std::vector<DeferredVerifyContext*> timerContextsToDelete;
@@ -415,9 +435,9 @@ void EngineCore::Stop() {
         }
     }
     {
-        wchar_t stepBuf[128];
-        swprintf_s(stepBuf, L"[STOP] Step 4: Timer contexts collected (%zu deferred, %zu persistent)",
-                   deferredCount, persistentCount);
+        wchar_t stepBuf[144];
+        swprintf_s(stepBuf, L"[STOP] Step 4: Timer contexts collected (%zu deferred, %zu persistent) (+%llums)",
+                   deferredCount, persistentCount, elapsed());
         LOG_DEBUG(stepBuf);
     }
 
@@ -431,7 +451,11 @@ void EngineCore::Stop() {
         }
         timerQueue_ = nullptr;
     }
-    LOG_DEBUG(L"[STOP] Step 5: Timer Queue deleted");
+    {
+        wchar_t b[96];
+        swprintf_s(b, L"[STOP] Step 5: Timer Queue deleted (+%llums)", elapsed());
+        LOG_DEBUG(b);
+    }
 
     // Free persistent timer contexts after timer queue is destroyed
     for (auto* ctx : timerContextsToDelete) {
@@ -472,16 +496,20 @@ void EngineCore::Stop() {
         }
 
         {
-            wchar_t stepBuf[96];
-            swprintf_s(stepBuf, L"[STOP] Step 6: Wait handles unregistered (%zu handles)",
-                       waitHandles.size());
+            wchar_t stepBuf[112];
+            swprintf_s(stepBuf, L"[STOP] Step 6: Wait handles unregistered (%zu handles) (+%llums)",
+                       waitHandles.size(), elapsed());
             LOG_DEBUG(stepBuf);
         }
     }
 
     // Cleanup Job Objects
     CleanupJobObjects();
-    LOG_DEBUG(L"[STOP] Step 7: Job Objects cleaned up");
+    {
+        wchar_t b[96];
+        swprintf_s(b, L"[STOP] Step 7: Job Objects cleaned up (+%llums)", elapsed());
+        LOG_DEBUG(b);
+    }
 
     // Cleanup all registry policies (both PowerThrottling + IFEO)
     RegistryPolicyManager::Instance().CleanupAllPolicies();
@@ -490,17 +518,25 @@ void EngineCore::Stop() {
         policyCacheLru_.clear();
         policyCacheMap_.clear();
     }
-    LOG_DEBUG(L"[STOP] Step 8: Registry policies cleaned up");
+    {
+        wchar_t b[96];
+        swprintf_s(b, L"[STOP] Step 8: Registry policies cleaned up (+%llums)", elapsed());
+        LOG_DEBUG(b);
+    }
 
     CleanupHandles();
-    LOG_DEBUG(L"[STOP] Step 9: Event handles closed");
+    {
+        wchar_t b[96];
+        swprintf_s(b, L"[STOP] Step 9: Event handles closed (+%llums)", elapsed());
+        LOG_DEBUG(b);
+    }
 
     // running_ already set to false by compare_exchange_strong at entry
 
     {
         wchar_t stopBuf[256];
-        swprintf_s(stopBuf, L"[STOP] Complete: ShutdownWarnings=%u",
-                   shutdownWarnings_.load());
+        swprintf_s(stopBuf, L"[STOP] Complete: ShutdownWarnings=%u TotalElapsed=%llums",
+                   shutdownWarnings_.load(), elapsed());
         LOG_DEBUG(stopBuf);
     }
 

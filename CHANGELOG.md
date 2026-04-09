@@ -4,6 +4,26 @@ All notable changes to UnLeaf will be documented in this file.
 
 ---
 
+## [1.1.1] - 2026-04-09
+
+### Changed (§9.15 ProcessMonitor 堅牢性強化)
+- `IsHealthy()` を 3 段判定に再設計: (1) ウォームアップ猶予 120s (2) lost event デルタ閾値チェック (3) `ControlTraceW(QUERY)` によるセッション生存確認 (1s キャッシュ)。idle (正常な無イベント) と ETW セッション死を区別する
+- `instance_` を `std::atomic<ProcessMonitor*>` に変更。`EventRecordCallback` でローカル `self` にスナップショットし TOCTOU を排除。acquire/release ペアリング
+- `Stop()` を `stopMtx_` で保護し ETW シャットダウン契約 (5 ステップ順序: `stopRequested_` → `CloseTrace` → `ControlTrace(STOP)` → `join` → `instance_ clear`) を厳密化。IPC スレッドの `IsHealthy()` との race を排除
+- `ParseProcessStartEvent` の文字列プロパティ読み取りを `propSize` 上限の bounded copy に置換。非終端 TDH ペイロードによる領域外読み (AV リスク) を排除。未知 `InType` はスキップ
+- `Start()` で `eventCount_` / `lostEventCount_` / `lastEventTime_` / `startTime_` / `lastCheckedLost_` / `cachedTraceAlive_` を明示リセット。再起動後の残留状態汚染を防止
+- `ControlTraceW(STOP)` の戻り値を検査。`ERROR_SUCCESS` / `ERROR_MORE_DATA` / `ERROR_WMI_INSTANCE_NOT_FOUND` 以外は `LOG_DEBUG` で記録
+- `Stop()` 時に `cachedTraceAlive_` / `lastTraceCheckTime_` をクリアし、次回 `Start()` 後の stale "alive" を防止
+
+### Added (CrashDump opt-in — Phase 2)
+- `src/common/crash_handler.{h,cpp}` 新設: `SetUnhandledExceptionFilter` + `MiniDumpWriteDump(MiniDumpWithThreadInfo | MiniDumpWithIndirectlyReferencedMemory)` ベースの未処理例外ハンドラ。既定無効、`[Logging] CrashDump=1` で opt-in
+- 出力先: `<install dir>\crash\UnLeaf_Service_YYYYMMDD_HHMMSS.sss.dmp` (ポータブル方針堅持)
+- `UnLeafConfig::IsCrashDumpEnabled()` + `crashDumpEnabled_` メンバ追加
+- `SetUnhandledExceptionFilter` の戻り値 (旧フィルタ) を install 時に取得し、非 null のみ `LOG_DEBUG` で記録。crash 時チェインは行わず `EXCEPTION_CONTINUE_SEARCH` で WER に委譲
+- `dbghelp.lib` リンク + `/Zi /DEBUG /OPT:REF /OPT:ICF` で PDB 常時出力
+
+---
+
 ## [1.1.0] - 2026-03-30
 
 ### Changed (§9.00〜§9.09 メモリ安定化・長期稼働品質改善)

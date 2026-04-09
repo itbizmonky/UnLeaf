@@ -151,6 +151,8 @@ The following security measures are implemented:
 LogLevel=INFO
 ; Log output: 1=enabled, 0=disabled
 LogEnabled=1
+; Crash minidump writer: 1=enabled, 0=disabled (default)
+CrashDump=0
 
 [Manager]
 ; Window position and size (auto-saved by Manager UI)
@@ -166,6 +168,23 @@ chrome.exe=1
 
 ### How do I check if the service is running?
 Launch `UnLeaf_Manager.exe` and check the service status from the UI. You can also run `sc query UnLeafService` from the command line.
+
+### How do I collect crash diagnostics when the service crashes? (CrashDump feature)
+UnLeaf is designed to be strictly portable, so crash dump writing is **disabled by default**. To opt in for diagnostics:
+
+1. Stop the service, then add `CrashDump=1` under the `[Logging]` section of `UnLeaf.ini`
+2. Restart the service
+
+Once enabled, any unhandled exception inside `UnLeaf_Service.exe` will write a MiniDump to:
+
+```
+<install folder>\crash\UnLeaf_Service_YYYYMMDD_HHMMSS.sss.dmp
+```
+
+- **Dump type**: `MiniDumpWithThreadInfo | MiniDumpWithIndirectlyReferencedMemory` — includes per-thread registers / TEB pointers plus small slices of heap referenced from stack/register values (enough to diagnose cross-thread races without bloating the dump)
+- **Relationship with Windows Error Reporting (WER)**: UnLeaf's MiniDump writer is independent of WER and chains to it via `EXCEPTION_CONTINUE_SEARCH`, so both dumps are produced
+- **Debug symbols**: Release builds are compiled with `/Zi /DEBUG /OPT:REF /OPT:ICF` and always emit `UnLeaf_Service.pdb`. Load the PDB together with the dmp in WinDbg or Visual Studio for fully symbolicated analysis
+- **Why disabled by default**: The `crash\` subfolder is never created unless you explicitly set `CrashDump=1`. This preserves UnLeaf's portable philosophy of never producing files or folders the user did not ask for
 
 ---
 
@@ -313,6 +332,21 @@ UnLeaf/
 ---
 
 ## Changelog
+
+### v1.1.1 (2026-04-09)
+
+**ProcessMonitor Hardening (§9.15)**
+- Redesigned `IsHealthy()` with 3-stage evaluation: warmup grace period (120s) + lost event delta threshold + `ControlTraceW(QUERY)` session liveness check (1s cached). Correctly distinguishes idle (no events, session alive) from ETW session death
+- Changed `instance_` to `std::atomic<ProcessMonitor*>`. `EventRecordCallback` snapshots into local `self` to eliminate TOCTOU. acquire/release pairing
+- Protected `Stop()` with `stopMtx_`, enforcing ETW shutdown contract (5-step order: `stopRequested_` → `CloseTrace` → `ControlTrace(STOP)` → `join` → `instance_ clear`). Eliminates race with IPC thread's `IsHealthy()`
+- Replaced string property reads in `ParseProcessStartEvent` with bounded copies capped by `propSize`. Prevents out-of-bounds reads from unterminated TDH payloads (AV risk). Unknown `InType` is now skipped
+- Explicit state reset in `Start()` (`eventCount_`, `lostEventCount_`, `lastEventTime_`, `startTime_`, `lastCheckedLost_`, `cachedTraceAlive_`) to prevent stale state contamination after service restart
+
+**CrashDump opt-in feature (Phase 2)**
+- Added `src/common/crash_handler.{h,cpp}`: `SetUnhandledExceptionFilter` + `MiniDumpWithThreadInfo | MiniDumpWithIndirectlyReferencedMemory` writer. **Disabled by default**; opt-in via `[Logging] CrashDump=1`
+- Output: `<install dir>\crash\UnLeaf_Service_YYYYMMDD_HHMMSS.sss.dmp` (portable philosophy — no `%ProgramData%` writes)
+- Chains to WER / debugger via `EXCEPTION_CONTINUE_SEARCH`; both UnLeaf MiniDump and WER are captured
+- Release builds compile with `/Zi /DEBUG /OPT:REF /OPT:ICF`, always emitting PDB for full symbolication
 
 ### v1.1.0 (2026-03-30)
 

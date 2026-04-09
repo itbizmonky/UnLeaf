@@ -15,7 +15,7 @@ static constexpr UCHAR EVENT_TRACE_TYPE_LOST_EVENT = 0x20;
 namespace unleaf {
 
 // Static instance for callback routing
-ProcessMonitor* ProcessMonitor::instance_ = nullptr;
+std::atomic<ProcessMonitor*> ProcessMonitor::instance_{nullptr};
 
 // Microsoft-Windows-Kernel-Process provider GUID
 // {22FB2CD6-0E7B-422B-A0C7-2FAD1FD0E716}
@@ -35,9 +35,13 @@ ProcessMonitor::ProcessMonitor()
     , running_(false)
     , stopRequested_(false)
     , lastEventTime_(0)
+    , startTime_(0)
     , eventCount_(0)
     , lostEventCount_(0)
-    , sessionHealthy_(false) {
+    , sessionHealthy_(false)
+    , lastCheckedLost_(0)
+    , lastTraceCheckTime_(0)
+    , cachedTraceAlive_(true) {
 
     // Generate unique session name
     std::wstringstream ss;
@@ -56,8 +60,17 @@ bool ProcessMonitor::Start(ProcessStartCallback processCallback, ThreadStartCall
 
     processCallback_ = processCallback;
     threadCallback_ = threadCallback;
-    instance_ = this;
+    instance_.store(this, std::memory_order_release);
     stopRequested_ = false;
+
+    // Reset session state for clean start (prevents false starvation after restart)
+    eventCount_ = 0;
+    lostEventCount_ = 0;
+    lastEventTime_ = 0;
+    startTime_ = GetTickCount64();
+    lastCheckedLost_ = 0;
+    lastTraceCheckTime_ = 0;
+    cachedTraceAlive_ = true;
 
     // Allocate properties buffer
     std::vector<BYTE> propertiesBuffer(PROPERTIES_BUFFER_SIZE, 0);
@@ -121,36 +134,73 @@ bool ProcessMonitor::Start(ProcessStartCallback processCallback, ThreadStartCall
 }
 
 void ProcessMonitor::Stop() {
+    // === ETW shutdown contract — DO NOT REORDER ===
+    // ProcessTrace() in the consumer thread only returns after CloseTrace()
+    // (or ControlTrace(STOP)) is called. Joining the consumer thread BEFORE
+    // closing the trace would deadlock permanently. The only safe order is:
+    //   1. stopRequested_ = true           (callback early-return guard)
+    //   2. CloseTrace()                    (unblock ProcessTrace)
+    //   3. ControlTrace(STOP)              (terminate session)
+    //   4. consumerThread_.join()          (wait for callback drain & exit)
+    //   5. clear instance_ / running_      (only safe after join)
+    // After step 4 the ETW runtime guarantees no further callback invocations.
     if (!running_.load()) {
         return;
     }
 
-    stopRequested_ = true;
+    {
+        std::lock_guard<std::mutex> lk(stopMtx_);
 
-    // Close trace handle to unblock ProcessTrace
-    if (traceHandle_ != INVALID_PROCESSTRACE_HANDLE) {
-        CloseTrace(traceHandle_);
-        traceHandle_ = INVALID_PROCESSTRACE_HANDLE;
+        // Publish stop with release semantics; the callback loads with acquire.
+        stopRequested_.store(true, std::memory_order_release);
+
+        // Close trace handle to unblock ProcessTrace
+        if (traceHandle_ != INVALID_PROCESSTRACE_HANDLE) {
+            CloseTrace(traceHandle_);
+            traceHandle_ = INVALID_PROCESSTRACE_HANDLE;
+        }
+
+        // Stop the session
+        if (sessionHandle_ != 0) {
+            std::vector<BYTE> propertiesBuffer(PROPERTIES_BUFFER_SIZE, 0);
+            auto* properties = reinterpret_cast<EVENT_TRACE_PROPERTIES*>(propertiesBuffer.data());
+            properties->Wnode.BufferSize = static_cast<ULONG>(PROPERTIES_BUFFER_SIZE);
+            properties->LoggerNameOffset = sizeof(EVENT_TRACE_PROPERTIES);
+
+            ULONG stopStatus = ControlTraceW(sessionHandle_, nullptr, properties,
+                                             EVENT_TRACE_CONTROL_STOP);
+            // ERROR_SUCCESS             = stopped cleanly
+            // ERROR_MORE_DATA           = buffer too small for return data (still stopped)
+            // ERROR_WMI_INSTANCE_NOT_FOUND = already stopped (e.g. via CloseTrace path)
+            // Anything else is worth logging for diagnostics. Next Start() will
+            // issue a name-based STOP to reclaim any leftover session, so we do
+            // not retry here.
+            if (stopStatus != ERROR_SUCCESS &&
+                stopStatus != ERROR_MORE_DATA &&
+                stopStatus != ERROR_WMI_INSTANCE_NOT_FOUND) {
+                std::wstringstream ss;
+                ss << L"[ETW] ControlTrace(STOP) returned unexpected status="
+                   << stopStatus;
+                LOG_DEBUG(ss.str());
+            }
+            sessionHandle_ = 0;
+        }
+
+        // Invalidate cached health state so the next IsHealthy() after a
+        // potential restart does not see stale "alive" readings.
+        cachedTraceAlive_ = false;
+        lastTraceCheckTime_ = 0;
     }
 
-    // Stop the session
-    if (sessionHandle_ != 0) {
-        std::vector<BYTE> propertiesBuffer(PROPERTIES_BUFFER_SIZE, 0);
-        auto* properties = reinterpret_cast<EVENT_TRACE_PROPERTIES*>(propertiesBuffer.data());
-        properties->Wnode.BufferSize = static_cast<ULONG>(PROPERTIES_BUFFER_SIZE);
-        properties->LoggerNameOffset = sizeof(EVENT_TRACE_PROPERTIES);
-
-        ControlTraceW(sessionHandle_, nullptr, properties, EVENT_TRACE_CONTROL_STOP);
-        sessionHandle_ = 0;
-    }
-
-    // Wait for consumer thread
+    // Join OUTSIDE the mutex: ProcessTrace drains remaining buffered events
+    // and returns, then the consumer thread exits. Holding stopMtx_ across
+    // join would block IsHealthy() callers unnecessarily (IPC thread).
     if (consumerThread_.joinable()) {
         consumerThread_.join();
     }
 
     running_ = false;
-    instance_ = nullptr;
+    instance_.store(nullptr, std::memory_order_release);
 
     LOG_INFO(L"ETW: Process Monitor stopped");
 }
@@ -191,20 +241,29 @@ void ProcessMonitor::ConsumerThread() {
 }
 
 void WINAPI ProcessMonitor::EventRecordCallback(PEVENT_RECORD pEvent) {
-    if (!instance_ || instance_->stopRequested_.load()) {
+    // Load instance_ once into a local to avoid repeated atomic reads and to
+    // prevent a theoretical TOCTOU where instance_ could be re-checked at
+    // different points. Acquire pairs with the release store in Start()/Stop().
+    ProcessMonitor* self = instance_.load(std::memory_order_acquire);
+    if (!self) return;
+
+    // Once Stop() has set stopRequested_, any events delivered by ETW during
+    // the ProcessTrace drain phase are ignored, so no further callback side
+    // effects occur before consumerThread_.join() completes.
+    if (self->stopRequested_.load(std::memory_order_acquire)) {
         return;
     }
 
     // Detect ETW buffer overflow: lost event notification
     // ETW uses Opcode EVENT_TRACE_TYPE_LOST_EVENT (0x20) to signal dropped events
     if (pEvent->EventHeader.EventDescriptor.Opcode == EVENT_TRACE_TYPE_LOST_EVENT) {
-        uint32_t count = ++instance_->lostEventCount_;
+        uint32_t count = ++self->lostEventCount_;
         LOG_ALERT(L"[ETW] Lost event detected (buffer overflow). Total lost: " + std::to_wstring(count));
         return;
     }
 
-    instance_->lastEventTime_ = GetTickCount64();
-    instance_->eventCount_.fetch_add(1, std::memory_order_relaxed);
+    self->lastEventTime_ = GetTickCount64();
+    self->eventCount_.fetch_add(1, std::memory_order_relaxed);
 
     // Filter by provider
     if (!IsEqualGUID(pEvent->EventHeader.ProviderId, KernelProcessProviderGuid)) {
@@ -221,8 +280,8 @@ void WINAPI ProcessMonitor::EventRecordCallback(PEVENT_RECORD pEvent) {
         std::wstring imagePath;
 
         if (ParseProcessStartEvent(pEvent, pid, parentPid, imageName, imagePath)) {
-            if (instance_->processCallback_) {
-                instance_->processCallback_(pid, parentPid, imageName, imagePath);
+            if (self->processCallback_) {
+                self->processCallback_(pid, parentPid, imageName, imagePath);
             }
         }
         return;
@@ -231,13 +290,13 @@ void WINAPI ProcessMonitor::EventRecordCallback(PEVENT_RECORD pEvent) {
     // Handle thread start event
     // Thread creation is a trigger point where OS may re-apply EcoQoS
     if (eventId == EVENT_ID_THREAD_START) {
-        if (instance_->threadCallback_) {
+        if (self->threadCallback_) {
             // The owner PID is in the event header (the process that owns the new thread)
             DWORD ownerPid = pEvent->EventHeader.ProcessId;
             // Thread ID can be extracted from user data, but we don't need it for our use case
             // We only care about which process is creating threads
             DWORD threadId = pEvent->EventHeader.ThreadId;
-            instance_->threadCallback_(threadId, ownerPid);
+            self->threadCallback_(threadId, ownerPid);
         }
         return;
     }
@@ -304,24 +363,39 @@ bool ProcessMonitor::ParseProcessStartEvent(PEVENT_RECORD pEvent,
             parentPid = *reinterpret_cast<DWORD*>(propData.data());
         }
         else if (_wcsicmp(propName, L"ImageName") == 0 || _wcsicmp(propName, L"ImageFileName") == 0) {
-            // Image name is a null-terminated string
+            // Image name is a null-terminated string. TDH usually returns a
+            // terminated payload, but truncated events or malformed providers
+            // can hand us an unterminated buffer. Always bound the read by
+            // propSize to avoid reading past the heap allocation (AV risk).
             if (propSize > 0) {
-                // Check if it's Unicode or ANSI
                 if (propInfo.nonStructType.InType == TDH_INTYPE_UNICODESTRING) {
-                    imageName = reinterpret_cast<LPCWSTR>(propData.data());
+                    // Bounded wide-string copy: stop at first L'\0' or propSize.
+                    const wchar_t* wp = reinterpret_cast<const wchar_t*>(propData.data());
+                    size_t maxChars = propSize / sizeof(wchar_t);
+                    size_t wlen = 0;
+                    while (wlen < maxChars && wp[wlen] != L'\0') ++wlen;
+                    imageName.assign(wp, wlen);
                 } else if (propInfo.nonStructType.InType == TDH_INTYPE_ANSISTRING) {
-                    // Convert ANSI to Unicode
-                    std::string ansiName(reinterpret_cast<char*>(propData.data()));
-                    int wideLen = MultiByteToWideChar(CP_ACP, 0, ansiName.c_str(), -1, nullptr, 0);
-                    if (wideLen > 0) {
-                        imageName.resize(wideLen - 1);
-                        int converted = MultiByteToWideChar(CP_ACP, 0, ansiName.c_str(), -1,
-                                                            &imageName[0], wideLen);
-                        if (converted == 0) imageName.clear();
+                    // Bounded ANSI copy, then convert to wide.
+                    const char* cp = reinterpret_cast<const char*>(propData.data());
+                    size_t alen = 0;
+                    while (alen < propSize && cp[alen] != '\0') ++alen;
+                    if (alen > 0) {
+                        int wideLen = MultiByteToWideChar(CP_ACP, 0, cp,
+                                                          static_cast<int>(alen),
+                                                          nullptr, 0);
+                        if (wideLen > 0) {
+                            imageName.resize(wideLen);
+                            int converted = MultiByteToWideChar(CP_ACP, 0, cp,
+                                                                static_cast<int>(alen),
+                                                                &imageName[0], wideLen);
+                            if (converted == 0) imageName.clear();
+                        }
                     }
                 } else {
-                    // Try as raw string
-                    imageName = reinterpret_cast<LPCWSTR>(propData.data());
+                    // Unknown InType — do NOT reinterpret as a string. Skip this
+                    // property to avoid reading arbitrary bytes as wchar_t.
+                    continue;
                 }
 
                 // Preserve full path before extracting filename
@@ -339,31 +413,79 @@ bool ProcessMonitor::ParseProcessStartEvent(PEVENT_RECORD pEvent,
 }
 
 bool ProcessMonitor::IsHealthy() const {
-    // Not running = not healthy
+    // Atomic fast paths — no lock needed
     if (!running_.load()) {
         return false;
     }
-
-    // Session marked unhealthy (e.g., OpenTrace/ProcessTrace failed)
     if (!sessionHealthy_.load()) {
         return false;
     }
 
-    // Check for event starvation (no events for 60 seconds)
-    // Note: This is a soft check - system might just be idle
-    // We use 60 seconds to avoid false positives
     ULONGLONG now = GetTickCount64();
+
+    // Warmup grace period: unconditionally healthy for 120s after session start
+    // Prevents false positives during boot storm → quiet transition
+    if ((now - startTime_.load()) < WARMUP_PERIOD_MS) {
+        return true;
+    }
+
     ULONGLONG lastEvent = lastEventTime_.load();
-    if (lastEvent > 0 && (now - lastEvent) > 60000) {
-        // No events for 60 seconds - might be unhealthy
-        // But only flag as unhealthy if we've received events before
-        // (to handle initial startup period)
-        if (eventCount_.load() > 0) {
+
+    // Acquire stopMtx_ to serialize with Stop() and protect mutable health state.
+    // Note: IsHealthy() callers (IPC thread) may briefly block if Stop() is in
+    // progress — this is intentional, it prevents data races on sessionHandle_.
+    std::lock_guard<std::mutex> lk(stopMtx_);
+
+    // Re-check running_ under the lock — Stop() may have completed while we
+    // were computing `now`, in which case there is nothing left to query.
+    if (!running_.load()) {
+        return false;
+    }
+
+    if (lastEvent == 0) {
+        // No events ever received after warmup - check session liveness only
+        return IsTraceSessionAliveLocked(now);
+    }
+
+    if ((now - lastEvent) > STARVATION_MS) {
+        // Event starvation detected - check delta of lost events since last check
+        uint32_t currentLost = lostEventCount_.load();
+        uint32_t deltaLost = currentLost - lastCheckedLost_;
+        lastCheckedLost_ = currentLost;
+
+        if (deltaLost > LOST_EVENT_THRESHOLD) {
+            return false;
+        }
+        // No significant lost event burst - check if ETW session is alive
+        if (!IsTraceSessionAliveLocked(now)) {
             return false;
         }
     }
 
     return true;
+}
+
+bool ProcessMonitor::IsTraceSessionAliveLocked(ULONGLONG now) const {
+    // Caller must hold stopMtx_. Safe to read sessionHandle_ under the lock.
+    if (lastTraceCheckTime_ > 0 && (now - lastTraceCheckTime_) < TRACE_CHECK_CACHE_MS) {
+        return cachedTraceAlive_;
+    }
+
+    lastTraceCheckTime_ = now;
+
+    if (sessionHandle_ == 0) {
+        cachedTraceAlive_ = false;
+        return false;
+    }
+
+    std::vector<BYTE> buf(PROPERTIES_BUFFER_SIZE, 0);
+    auto* props = reinterpret_cast<EVENT_TRACE_PROPERTIES*>(buf.data());
+    props->Wnode.BufferSize = static_cast<ULONG>(PROPERTIES_BUFFER_SIZE);
+    props->LoggerNameOffset = sizeof(EVENT_TRACE_PROPERTIES);
+
+    ULONG status = ControlTraceW(sessionHandle_, nullptr, props, EVENT_TRACE_CONTROL_QUERY);
+    cachedTraceAlive_ = (status == ERROR_SUCCESS);
+    return cachedTraceAlive_;
 }
 
 } // namespace unleaf

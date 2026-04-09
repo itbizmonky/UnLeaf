@@ -8,6 +8,7 @@
 #include <functional>
 #include <thread>
 #include <atomic>
+#include <mutex>
 #include <string>
 
 #pragma comment(lib, "advapi32.lib")
@@ -69,8 +70,15 @@ private:
                                         std::wstring& imagePath);
 
     // ETW handles
+    // Protected by stopMtx_ for writes. Reads on the Consumer thread are safe
+    // because Start() publishes both handles before the thread is launched, and
+    // Stop() joins the thread before the object can be destroyed.
     TRACEHANDLE sessionHandle_;
     TRACEHANDLE traceHandle_;
+
+    // Serializes Stop() teardown vs. IsHealthy()/IsTraceSessionAlive() from the
+    // IPC thread. Also protects mutable health-check state below.
+    mutable std::mutex stopMtx_;
 
     // Consumer thread
     std::thread consumerThread_;
@@ -78,9 +86,16 @@ private:
     std::atomic<bool> stopRequested_;
 
     std::atomic<ULONGLONG> lastEventTime_;    // Last event received timestamp
+    std::atomic<ULONGLONG> startTime_;        // Session start timestamp (for warmup grace period)
     std::atomic<uint32_t> eventCount_;        // Total events received
     std::atomic<uint32_t> lostEventCount_;    // ETW lost event count (buffer overflow indicator)
     std::atomic<bool> sessionHealthy_;        // Session health flag
+
+    // Health check state (mutable: updated by const IsHealthy/IsTraceSessionAliveLocked)
+    // All fields below are protected by stopMtx_.
+    mutable uint32_t  lastCheckedLost_;       // lostEventCount_ snapshot at last health check
+    mutable ULONGLONG lastTraceCheckTime_;    // Last IsTraceSessionAliveLocked() call timestamp
+    mutable bool      cachedTraceAlive_;      // Cached result of IsTraceSessionAliveLocked()
 
     // Callbacks
     ProcessStartCallback processCallback_;
@@ -89,8 +104,16 @@ private:
     // Session name (unique per instance)
     std::wstring sessionName_;
 
-    // Static instance pointer for callback routing
-    static ProcessMonitor* instance_;
+    // Query whether the underlying ETW trace session is still alive (1s cached).
+    // Caller MUST hold stopMtx_.
+    bool IsTraceSessionAliveLocked(ULONGLONG now) const;
+
+    // Static instance pointer for callback routing.
+    // Atomic as a defensive measure: current synchronization (thread start/join
+    // + ETW's "no callback after ProcessTrace returns" contract) already makes
+    // non-atomic safe, but atomic hardens against future modifications that
+    // might introduce additional readers on other threads.
+    static std::atomic<ProcessMonitor*> instance_;
 
     // ETW session properties buffer
     static constexpr size_t PROPERTIES_BUFFER_SIZE =
@@ -102,6 +125,12 @@ private:
     static constexpr ULONG ETW_MIN_BUFFERS    = 4;    // Minimum buffer count
     static constexpr ULONG ETW_MAX_BUFFERS    = 32;   // Maximum buffer count (Microsoft: CPU*2)
     static constexpr ULONG ETW_FLUSH_TIMER    = 0;    // 0 = disabled; real-time consumer pulls directly
+
+    // Health check thresholds
+    static constexpr ULONGLONG WARMUP_PERIOD_MS   = 120000;  // 120s grace period after session start
+    static constexpr ULONGLONG STARVATION_MS      = 60000;   // 60s without events = potential starvation
+    static constexpr uint32_t  LOST_EVENT_THRESHOLD = 10;    // Lost events (delta) above this = unhealthy
+    static constexpr ULONGLONG TRACE_CHECK_CACHE_MS = 1000;  // IsTraceSessionAlive cache duration
 };
 
 } // namespace unleaf

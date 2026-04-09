@@ -33,6 +33,7 @@ UnLeafConfig& UnLeafConfig::Instance() {
 UnLeafConfig::UnLeafConfig()
     : logLevel_(LogLevel::LOG_INFO)
     , logEnabled_(true)
+    , crashDumpEnabled_(false)
     , lastModTime_(0) {
 }
 
@@ -188,6 +189,7 @@ bool UnLeafConfig::ParseIni(const std::string& contentIn) {
         targets_.clear();
         logLevel_ = LogLevel::LOG_INFO;
         logEnabled_ = true;
+        crashDumpEnabled_ = false;
         managerWindowState_ = ManagerWindowState{};
         logColumnOrder_     = LogColumnOrder{};
 
@@ -292,6 +294,12 @@ bool UnLeafConfig::ParseIni(const std::string& contentIn) {
                                   [](unsigned char c) { return static_cast<char>(::tolower(c)); });
                     logEnabled_ = (lowerValue == "1" || lowerValue == "true" || lowerValue == "yes" || lowerValue == "on");
                 }
+                else if (lowerKey == "crashdump") {
+                    std::string lowerValue = value;
+                    std::transform(lowerValue.begin(), lowerValue.end(), lowerValue.begin(),
+                                  [](unsigned char c) { return static_cast<char>(::tolower(c)); });
+                    crashDumpEnabled_ = (lowerValue == "1" || lowerValue == "true" || lowerValue == "yes" || lowerValue == "on");
+                }
                 else {
                     // Warn on unknown keys in [Logging]
                     std::wstring wideKey(key.begin(), key.end());
@@ -349,6 +357,9 @@ std::string UnLeafConfig::SerializeIni() const {
     }
     oss << "; Log output: 1=enabled, 0=disabled\n";
     oss << "LogEnabled=" << (logEnabled_ ? "1" : "0") << "\n";
+    oss << "; Crash dump (MiniDump) on unhandled exception: 1=enabled, 0=disabled\n";
+    oss << "; Dumps are written to <install dir>\\crash\\UnLeaf_Service_<timestamp>.dmp\n";
+    oss << "CrashDump=" << (crashDumpEnabled_ ? "1" : "0") << "\n";
     oss << "\n";
 
     // Manager section (window state + column order)

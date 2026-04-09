@@ -53,6 +53,7 @@ public:
     const std::wstring& GetConfigPath() const { return configPath_; }
     LogLevel GetLogLevel() const { return logLevel_; }
     bool IsLogEnabled() const { return logEnabled_; }
+    bool IsCrashDumpEnabled() const { return crashDumpEnabled_; }
 
     // Target management
     bool AddTarget(const std::wstring& name);
@@ -96,6 +97,7 @@ private:
     std::vector<TargetProcess> targets_;
     LogLevel logLevel_;
     bool logEnabled_;
+    bool crashDumpEnabled_;    // [Logging] CrashDump=0/1 — default disabled
     ManagerWindowState managerWindowState_;
     LogColumnOrder     logColumnOrder_;
 
