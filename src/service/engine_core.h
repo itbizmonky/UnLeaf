@@ -489,8 +489,20 @@ private:
     LARGE_INTEGER qpcFreq_;       // QueryPerformanceFrequency cache (initialized in Start())
 
     // Job Objects (rootPid -> JobObjectInfo)
+    // THREAD SAFETY: jobObjects_ is accessed from both the EngineControlLoop thread
+    // (RemoveTrackedProcess, RefreshJobObjectPids) and the ETW ConsumerThread
+    // (CreateAndAssignJobObject via OnProcessStart -> ApplyOptimizationWithHandle).
+    // All accesses MUST hold jobCs_. Safety is guaranteed by jobCs_ exclusion,
+    // NOT by single-thread ownership.
+    // FUTURE: If jobObjects_ access patterns change, ensure strict lock ordering
+    // (jobCs_ before trackedCs_) or move to a dedicated worker thread.
     std::map<DWORD, std::unique_ptr<JobObjectInfo>> jobObjects_;
     mutable CriticalSection jobCs_;
+
+    // EngineControlLoop thread ID (set at loop entry, cleared at loop exit).
+    // Debug-only: used for thread ownership assertions in loop-exclusive functions.
+    // atomic<DWORD>: visibility guarantee for reads from other threads (misuse detection).
+    std::atomic<DWORD> engineControlThreadId_{0};
 
     // Self-healing statistics
     std::atomic<uint32_t> totalRetries_;

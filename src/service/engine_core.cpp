@@ -635,6 +635,9 @@ void EngineCore::OnThreadStart(DWORD threadId, DWORD ownerPid) {
 // === Event-Driven Engine Control Loop ===
 
 void EngineCore::EngineControlLoop() {
+#ifdef _DEBUG
+    engineControlThreadId_.store(GetCurrentThreadId(), std::memory_order_relaxed);
+#endif
     LOG_INFO(L"Engine: Event-driven control loop started (SafetyNet=10s, Event-triggered)");
 
     // Build wait handle array
@@ -736,6 +739,9 @@ void EngineCore::EngineControlLoop() {
     }
 
     LOG_INFO(L"Engine: Event-driven control loop ended");
+#ifdef _DEBUG
+    engineControlThreadId_.store(0, std::memory_order_relaxed);  // Prevent stale ID after loop exit / restart
+#endif
 }
 
 // Enqueue enforcement request (called from ETW callbacks and timer callbacks)
@@ -1313,6 +1319,14 @@ bool EngineCore::TryApplyIfMissedTarget(DWORD pid, const wchar_t* exeName) {
 
 // Drain pending process removal queue (called from EngineControlLoop thread only)
 void EngineCore::ProcessPendingRemovals() {
+#ifdef _DEBUG
+    {
+        DWORD tid = engineControlThreadId_.load(std::memory_order_relaxed);
+        assert(tid != 0 &&
+               GetCurrentThreadId() == tid &&
+               "Must be called from EngineControlLoop thread");
+    }
+#endif
     constexpr size_t MAX_DRAIN_PER_TICK = 256;
 
     std::queue<DWORD> pending;
@@ -2325,6 +2339,14 @@ bool EngineCore::CreateAndAssignJobObject(DWORD rootPid, HANDLE hProcess) {
 
 // Optimized 2-pass approach to minimize lock contention
 void EngineCore::RefreshJobObjectPids() {
+#ifdef _DEBUG
+    {
+        DWORD tid = engineControlThreadId_.load(std::memory_order_relaxed);
+        assert(tid != 0 &&
+               GetCurrentThreadId() == tid &&
+               "Must be called from EngineControlLoop thread");
+    }
+#endif
     // Pass 1: Collect job info and PIDs under lock
     struct JobQueryResult {
         DWORD rootPid;
@@ -2924,6 +2946,14 @@ void CALLBACK EngineCore::OnProcessExit(PVOID lpParameter, BOOLEAN timerOrWaitFi
 
 // Safely remove tracked process with proper wait handle cleanup
 void EngineCore::RemoveTrackedProcess(DWORD pid) {
+#ifdef _DEBUG
+    {
+        DWORD tid = engineControlThreadId_.load(std::memory_order_relaxed);
+        assert(tid != 0 &&
+               GetCurrentThreadId() == tid &&
+               "Must be called from EngineControlLoop thread");
+    }
+#endif
     HANDLE waitHandleToUnregister  = nullptr;
     WaitCallbackContext* contextToDelete   = nullptr;
     DeferredVerifyContext* timerCtxToDelete    = nullptr;
@@ -3002,6 +3032,18 @@ void EngineCore::RemoveTrackedProcess(DWORD pid) {
     delete contextToDelete;
     delete timerCtxToDelete;
     delete deferredCtxToDelete;
+
+    // Remove Job Object entry (if this was a root target process).
+    // Placed last for clarity; JobObjectInfo and wait/timer contexts are independent
+    // kernel objects with no cross-dependency on close order.
+    // MUST be outside trackedCs_ to avoid lock inversion with RefreshJobObjectPids()
+    // which holds jobCs_ -> trackedCs_ simultaneously.
+    // PID recycling race is not a concern: CreateAndAssignJobObject() and this function
+    // both protect jobObjects_ with jobCs_, so accesses are mutually exclusive.
+    {
+        CSLockGuard lock(jobCs_);
+        jobObjects_.erase(pid);   // unique_ptr dtor calls CloseHandle; no-op if not a root process
+    }
 }
 
 bool EngineCore::IsTracked(DWORD pid) const {

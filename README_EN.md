@@ -18,7 +18,7 @@ Traditional tools in the PC tuning space (like Process Lasso) rely on an outdate
 It uses a fully **event-driven architecture** integrated directly with the Windows Kernel via **ETW (Event Tracing for Windows)**.
 
 * **0.00% CPU while idle:** The engine wakes up for just a few milliseconds when a process is created or destroyed, then returns to a complete sleep (0% CPU).
-* **Extreme memory efficiency:** Built directly on modern C++ and Win32 APIs, it consumes only **~3MB–5MB** of memory with zero memory leaks — verified through prolonged stress testing.
+* **Extreme memory efficiency:** Built directly on modern C++ and Win32 APIs, it consumes only **~15MB** of memory with zero memory leaks — verified through prolonged stress testing.
 * **Millisecond assassin:** Detects child process spawns at the OS level the instant they occur, and strips EcoQoS with no lag.
 
 ---
@@ -332,6 +332,14 @@ UnLeaf/
 ---
 
 ## Changelog
+
+### v1.1.2 (2026-04-11)
+
+**Memory Leak Fix & Heap Fragmentation Reduction**
+- Fixed `jobObjects_` handle accumulation: `jobObjects_.erase(pid)` added at the end of `RemoveTrackedProcess()` under `jobCs_`. Job Object handles are now released on every process exit, stopping the ~9 MB / 41 hours Private Bytes growth
+- `ParseProcessStartEvent`: replaced per-call `std::vector<BYTE>` allocations with `thread_local` reusable buffers. Eliminates heap alloc/free on every ETW event
+- `ProcessMonitor` log sites (4 locations): replaced `std::wstringstream` with `std::to_wstring()` to reduce heap fragmentation
+- `engineControlThreadId_` changed to `std::atomic<DWORD>` for cross-thread visibility. DEBUG asserts in `RemoveTrackedProcess`, `RefreshJobObjectPids`, `ProcessPendingRemovals` use `relaxed` load for deterministic misuse detection
 
 ### v1.1.1 (2026-04-09)
 

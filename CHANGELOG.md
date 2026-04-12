@@ -4,6 +4,18 @@ All notable changes to UnLeaf will be documented in this file.
 
 ---
 
+## [1.1.2] - 2026-04-11
+
+### Fixed
+- `jobObjects_` entries not erased on process exit, causing Windows Job Object handle accumulation (~9 MB / 41 hours). Added `jobObjects_.erase(pid)` under `jobCs_` at the end of `RemoveTrackedProcess()`, after all wait/timer teardown and outside `trackedCs_` to preserve `jobCs_ → trackedCs_` lock order
+
+### Changed
+- `ParseProcessStartEvent`: replaced per-call `std::vector<BYTE>` allocations with `thread_local` reusable buffers (`s_tdhBuffer`, `s_propBuffer`). Capacity grows on demand and never shrinks, eliminating repeated heap alloc/free per ETW event. Added `#ifdef _DEBUG` check for abnormal buffer growth (> `MAX_TDH_BUFFER * 2`)
+- `ProcessMonitor` ctor / `Start()` / `Stop()`: replaced `std::wstringstream` with `std::to_wstring()` at 4 log sites to reduce heap fragmentation
+- `engineControlThreadId_` changed from `DWORD` to `std::atomic<DWORD>` for cross-thread visibility guarantee. `EngineControlLoop` uses `store(..., relaxed)` at entry and exit. Debug asserts in `RemoveTrackedProcess`, `RefreshJobObjectPids`, `ProcessPendingRemovals` use `load(..., relaxed)` for deterministic misuse detection
+
+---
+
 ## [1.1.1] - 2026-04-09
 
 ### Changed (§9.15 ProcessMonitor 堅牢性強化)
@@ -157,4 +169,4 @@ Initial release.
 - Win32 GUI Manager with dark theme (GDI+)
 - 72 unit tests (GoogleTest)
 - Zero CPU usage at idle (`WaitForMultipleObjects(INFINITE)`)
-- Memory footprint: 3–5 MB
+- Memory footprint: ~15 MB

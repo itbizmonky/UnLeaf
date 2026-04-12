@@ -44,9 +44,7 @@ ProcessMonitor::ProcessMonitor()
     , cachedTraceAlive_(true) {
 
     // Generate unique session name
-    std::wstringstream ss;
-    ss << L"UnLeafProcessMonitor_" << GetCurrentProcessId();
-    sessionName_ = ss.str();
+    sessionName_ = L"UnLeafProcessMonitor_" + std::to_wstring(GetCurrentProcessId());
 }
 
 ProcessMonitor::~ProcessMonitor() {
@@ -94,9 +92,7 @@ bool ProcessMonitor::Start(ProcessStartCallback processCallback, ThreadStartCall
     // Start new trace session
     ULONG status = StartTraceW(&sessionHandle_, sessionName_.c_str(), properties);
     if (status != ERROR_SUCCESS) {
-        std::wstringstream ss;
-        ss << L"Failed to start ETW session: " << status;
-        LOG_DEBUG(ss.str());
+        LOG_DEBUG(L"[ETW] Failed to start ETW session: " + std::to_wstring(status));
         return false;
     }
 
@@ -115,9 +111,7 @@ bool ProcessMonitor::Start(ProcessStartCallback processCallback, ThreadStartCall
     );
 
     if (status != ERROR_SUCCESS) {
-        std::wstringstream ss;
-        ss << L"Failed to enable Kernel-Process provider: " << status;
-        LOG_DEBUG(ss.str());
+        LOG_DEBUG(L"[ETW] Failed to enable Kernel-Process provider: " + std::to_wstring(status));
 
         // Cleanup session
         ControlTraceW(sessionHandle_, nullptr, properties, EVENT_TRACE_CONTROL_STOP);
@@ -178,10 +172,7 @@ void ProcessMonitor::Stop() {
             if (stopStatus != ERROR_SUCCESS &&
                 stopStatus != ERROR_MORE_DATA &&
                 stopStatus != ERROR_WMI_INSTANCE_NOT_FOUND) {
-                std::wstringstream ss;
-                ss << L"[ETW] ControlTrace(STOP) returned unexpected status="
-                   << stopStatus;
-                LOG_DEBUG(ss.str());
+                LOG_DEBUG(L"[ETW] ControlTrace(STOP) returned unexpected status=" + std::to_wstring(stopStatus));
             }
             sessionHandle_ = 0;
         }
@@ -322,8 +313,22 @@ bool ProcessMonitor::ParseProcessStartEvent(PEVENT_RECORD pEvent,
         return false;
     }
 
-    std::vector<BYTE> buffer(bufferSize);
-    auto* eventInfo = reinterpret_cast<TRACE_EVENT_INFO*>(buffer.data());
+    // thread_local: ConsumerThread 専用。capacity は縮小しない（反復ヒープ確保を排除）
+    thread_local std::vector<BYTE> s_tdhBuffer;
+    if (s_tdhBuffer.capacity() < bufferSize)
+        s_tdhBuffer.reserve(bufferSize);
+    s_tdhBuffer.resize(bufferSize);
+
+#ifdef _DEBUG
+    // Debug: MAX_TDH_BUFFER を超える成長は現在の設計では発生しない。
+    // 将来の cap 変更・スキーマ拡張を検知するためのセーフティネット。
+    if (s_tdhBuffer.capacity() > MAX_TDH_BUFFER * 2) {
+        LOG_DEBUG(L"[ETW] TDH buffer abnormal growth: "
+                  + std::to_wstring(s_tdhBuffer.capacity()) + L" bytes");
+    }
+#endif
+
+    auto* eventInfo = reinterpret_cast<TRACE_EVENT_INFO*>(s_tdhBuffer.data());
 
     status = TdhGetEventInformation(pEvent, 0, nullptr, eventInfo, &bufferSize);
     if (status != ERROR_SUCCESS) {
@@ -349,18 +354,22 @@ bool ProcessMonitor::ParseProcessStartEvent(PEVENT_RECORD pEvent,
             continue;
         }
 
-        std::vector<BYTE> propData(propSize);
-        status = TdhGetProperty(pEvent, 0, nullptr, 1, &dataDesc, propSize, propData.data());
+        thread_local std::vector<BYTE> s_propBuffer;
+        if (s_propBuffer.capacity() < propSize)
+            s_propBuffer.reserve(propSize);
+        s_propBuffer.resize(propSize);
+
+        status = TdhGetProperty(pEvent, 0, nullptr, 1, &dataDesc, propSize, s_propBuffer.data());
         if (status != ERROR_SUCCESS) {
             continue;
         }
 
         // Extract relevant properties
         if (_wcsicmp(propName, L"ProcessID") == 0 && propSize >= sizeof(DWORD)) {
-            pid = *reinterpret_cast<DWORD*>(propData.data());
+            pid = *reinterpret_cast<DWORD*>(s_propBuffer.data());
         }
         else if (_wcsicmp(propName, L"ParentProcessID") == 0 && propSize >= sizeof(DWORD)) {
-            parentPid = *reinterpret_cast<DWORD*>(propData.data());
+            parentPid = *reinterpret_cast<DWORD*>(s_propBuffer.data());
         }
         else if (_wcsicmp(propName, L"ImageName") == 0 || _wcsicmp(propName, L"ImageFileName") == 0) {
             // Image name is a null-terminated string. TDH usually returns a
@@ -370,14 +379,14 @@ bool ProcessMonitor::ParseProcessStartEvent(PEVENT_RECORD pEvent,
             if (propSize > 0) {
                 if (propInfo.nonStructType.InType == TDH_INTYPE_UNICODESTRING) {
                     // Bounded wide-string copy: stop at first L'\0' or propSize.
-                    const wchar_t* wp = reinterpret_cast<const wchar_t*>(propData.data());
+                    const wchar_t* wp = reinterpret_cast<const wchar_t*>(s_propBuffer.data());
                     size_t maxChars = propSize / sizeof(wchar_t);
                     size_t wlen = 0;
                     while (wlen < maxChars && wp[wlen] != L'\0') ++wlen;
                     imageName.assign(wp, wlen);
                 } else if (propInfo.nonStructType.InType == TDH_INTYPE_ANSISTRING) {
                     // Bounded ANSI copy, then convert to wide.
-                    const char* cp = reinterpret_cast<const char*>(propData.data());
+                    const char* cp = reinterpret_cast<const char*>(s_propBuffer.data());
                     size_t alen = 0;
                     while (alen < propSize && cp[alen] != '\0') ++alen;
                     if (alen > 0) {

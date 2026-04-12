@@ -18,7 +18,7 @@ PCチューニング界隈で長年使われてきた既存のツール（Proces
 Windowsカーネルの **ETW (Event Tracing for Windows)** と直接連携する「完全なイベント駆動アーキテクチャ」を採用しています。
 
 * **待機時CPU 0.00% の衝撃:** プロセスが生成・終了した「その数ミリ秒」だけ目を覚まし、仕事が終われば再び完全なスリープ（CPU 0%）に戻ります。
-* **極限の省メモリ設計:** モダンC++とWin32 APIで直接組み上げられたコアは、長時間の過酷なストレステストを経てもメモリリークを一切起こさず、わずか **3MB〜5MB** のメモリしか消費しません。
+* **極限の省メモリ設計:** モダンC++とWin32 APIで直接組み上げられたコアは、長時間の過酷なストレステストを経てもメモリリークを一切起こさず、**約 15MB** のメモリしか消費しません。
 * **ミリ秒の暗殺者:** 対象アプリが子プロセスを生成した瞬間をOSレベルで検知し、ラグなしで即座にEcoQoSを剥がし取ります。
 
 ---
@@ -55,7 +55,7 @@ Windowsカーネルの **ETW (Event Tracing for Windows)** と直接連携する
 |------|------|
 | OS | Windows 10 (1709 以降) / Windows 11 |
 | 権限 | 管理者権限 |
-| メモリ | 約 2MB |
+| メモリ | 約 15MB |
 | ディスク | 約 1.2MB |
 
 > **補足**: Windows 11 では `NtSetInformationProcess` (NT API) を優先使用し、Windows 10 では `SetProcessInformation` (Win32 API) で同等の制御を行います。OS バージョンは起動時に自動判定されます。
@@ -332,6 +332,14 @@ UnLeaf/
 ---
 
 ## 更新履歴 (Changelog)
+
+### v1.1.2 (2026-04-11)
+
+**メモリリーク修正・ヒープ断片化抑制**
+- `jobObjects_` エントリ削除漏れによる Job Object ハンドル蓄積を修正: `RemoveTrackedProcess()` 末尾に `jobObjects_.erase(pid)` を追加。プロセス終了のたびにハンドルが解放されるようになり、41 時間で約 9MB だったメモリ増加が停止
+- `ParseProcessStartEvent`: per-call `std::vector<BYTE>` を `thread_local` 再利用バッファ (`s_tdhBuffer`, `s_propBuffer`) に置換。ETW イベントごとのヒープ alloc/free を排除
+- `ProcessMonitor` ログサイト (4箇所) の `std::wstringstream` を `std::to_wstring()` に置換。ヒープ断片化を抑制
+- `engineControlThreadId_` を `std::atomic<DWORD>` に変更。クロススレッド可視性を保証し、DEBUG アサート (`RemoveTrackedProcess`, `RefreshJobObjectPids`, `ProcessPendingRemovals`) の検出精度を向上
 
 ### v1.1.1 (2026-04-09)
 
