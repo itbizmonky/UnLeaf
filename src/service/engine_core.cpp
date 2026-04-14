@@ -317,6 +317,15 @@ bool EngineCore::Initialize(const std::wstring& baseDir) {
 void EngineCore::Start() {
     if (running_.load()) return;
 
+    // Encourage the process heap to decommit idle pages more aggressively (Windows 8.1+).
+    // Reduces Private Working Set growth from heap fragmentation over long runs.
+    // Best-effort: failure is harmless and silently ignored.
+    HEAP_OPTIMIZE_RESOURCES_INFORMATION heapOpt = {};
+    heapOpt.Version = HEAP_OPTIMIZE_RESOURCES_CURRENT_VERSION;
+    heapOpt.Flags = 0;
+    HeapSetInformation(GetProcessHeap(), HeapOptimizeResources,
+                       &heapOpt, sizeof(heapOpt));
+
     running_ = true;
     stopRequested_ = false;
     totalViolations_ = 0;

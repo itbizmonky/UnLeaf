@@ -29,15 +29,22 @@ Windows 11 / 10 向けゼロオーバーヘッド EcoQoS オプティマイザ *
 |---|---------|
 | 4 | **`engineControlThreadId_` の `atomic<DWORD>` 化** — `DWORD` のまま他スレッドから参照した場合の C++ 可視性保証欠如を修正。`std::atomic<DWORD>` (`memory_order_relaxed`) に変更し、DEBUG アサート (`RemoveTrackedProcess`, `RefreshJobObjectPids`, `ProcessPendingRemovals`) の検出精度を 100% に向上。Release ビルドへの実行時コスト影響なし |
 
+### 🧹 ヒープメモリ管理強化 (§9.17-B)
+
+| # | 改善内容 |
+|---|---------|
+| 5 | **`HeapOptimizeResources` の適用** — `EngineCore::Start()` に `HeapSetInformation(GetProcessHeap(), HeapOptimizeResources, ...)` を追加。プロセスヒープが idle 時に未使用コミットページを積極的にデコミット (Windows 8.1+、失敗時は無視)。長時間稼働時のヒープ断片化による Private Working Set 成長を抑制 |
+
 ---
 
 ## 📊 修正効果
 
-| 指標 | 修正前 | 修正後 |
+| 指標 | 修正前 (v1.1.1) | 修正後 (v1.1.2) |
 |------|--------|--------|
 | Private Bytes 増加率 | ~220 KB/時 (41h で約 9MB) | 停止 (収束) |
 | Handle Count | 単調増加 | 収束 |
 | ETW イベントあたりのヒープ確保 | 2 alloc/event | 0 alloc/event (thread_local) |
+| メモリ増加率 (ヒープ断片化) | ~2 MB/時 (3→15.5 MB) | ~0.38 MB/時 (3.78→6.26 MB / 6.5h) ≈ 5倍改善 |
 
 ---
 

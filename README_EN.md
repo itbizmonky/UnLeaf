@@ -340,6 +340,7 @@ UnLeaf/
 - `ParseProcessStartEvent`: replaced per-call `std::vector<BYTE>` allocations with `thread_local` reusable buffers. Eliminates heap alloc/free on every ETW event
 - `ProcessMonitor` log sites (4 locations): replaced `std::wstringstream` with `std::to_wstring()` to reduce heap fragmentation
 - `engineControlThreadId_` changed to `std::atomic<DWORD>` for cross-thread visibility. DEBUG asserts in `RemoveTrackedProcess`, `RefreshJobObjectPids`, `ProcessPendingRemovals` use `relaxed` load for deterministic misuse detection
+- Added `HeapSetInformation(GetProcessHeap(), HeapOptimizeResources, ...)` to `EngineCore::Start()`. Instructs the process heap to decommit idle pages aggressively (Windows 8.1+, best-effort). 6.5-hour test confirmed ~5x improvement in memory growth rate (3.78→6.26 MB / 6.5h vs 3→15.5 MB)
 
 ### v1.1.1 (2026-04-09)
 

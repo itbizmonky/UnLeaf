@@ -340,6 +340,7 @@ UnLeaf/
 - `ParseProcessStartEvent`: per-call `std::vector<BYTE>` を `thread_local` 再利用バッファ (`s_tdhBuffer`, `s_propBuffer`) に置換。ETW イベントごとのヒープ alloc/free を排除
 - `ProcessMonitor` ログサイト (4箇所) の `std::wstringstream` を `std::to_wstring()` に置換。ヒープ断片化を抑制
 - `engineControlThreadId_` を `std::atomic<DWORD>` に変更。クロススレッド可視性を保証し、DEBUG アサート (`RemoveTrackedProcess`, `RefreshJobObjectPids`, `ProcessPendingRemovals`) の検出精度を向上
+- `EngineCore::Start()` に `HeapSetInformation(GetProcessHeap(), HeapOptimizeResources, ...)` を追加。プロセスヒープが idle 時に未使用コミットページを積極的にデコミット (Windows 8.1+、ベストエフォート)。6.5 時間テストでメモリ増加率が約 5 倍改善 (3.78→6.26 MB / 6.5h vs 3→15.5 MB) を確認
 
 ### v1.1.1 (2026-04-09)
 
