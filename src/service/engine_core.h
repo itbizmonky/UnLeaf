@@ -412,6 +412,11 @@ private:
     // Returns true if optimization was applied (new tracking started)
     bool TryApplyIfMissedTarget(DWORD pid, const wchar_t* exeName);
 
+    // §9.18: Lightweight Toolhelp32 probe used by ETW stall detection.
+    // Returns true if at least one running process matches targetNameSet_ /
+    // pathTargetFileNames_. No descendant collection, no policy work.
+    bool HasAnyTargetRunning() const;
+
     // Check if parent is being tracked
     bool IsTrackedParent(DWORD parentPid) const;
 
@@ -536,6 +541,12 @@ private:
     // Operation mode and health tracking
     OperationMode operationMode_;
     ULONGLONG lastEtwHealthCheck_;
+
+    // §9.18: periodic InitialScan + ETW stall detection state
+    ULONGLONG lastFullScanTime_       = 0;
+    ULONGLONG lastEtwStallCheckTime_  = 0;
+    ULONGLONG lastEtwRestartTime_     = 0;
+    uint32_t  lastEtwEventCount_      = 0;
 
     // Last degraded mode scan time
     ULONGLONG lastDegradedScanTime_;
@@ -709,6 +720,20 @@ private:
     // 30 秒 periodic バックストップ: ETW silent drop（kernel レベルのイベントロス）で
     // hasCriticalDrop が不発の場合でも最大 30 秒以内に ScanRunningProcessesForMissedTargets を発火。
     static constexpr ULONGLONG SAFETY_SCAN_BACKSTOP_MS = 30ULL * 1000;
+
+    // §9.18: 周期 InitialScan + ETW stall 検知パラメータ
+    // PERIODIC_FULL_SCAN_INTERVAL: NORMAL モードで 60 秒毎に InitialScan を発火し
+    //   ETW silent drop を補正。SafetyNet (#1 PID リセット) が 30〜50 秒で全 PID をカバーするため
+    //   InitialScan は ETW 欠損時の descendant 追跡強制補完として 60 秒で十分機能する。
+    // ETW_STALL_CHECK_INTERVAL: 30 秒間隔で ETW total event count delta を監視。
+    //   10 秒は idle 状態（低負荷・スリープ復帰直後）での正常無イベント期間と区別できず誤検知リスクが高い。
+    //   30 秒は最大 +20 秒の検知遅延と引き換えにノイズを低減し、UX とのバランスを取る。
+    // ETW_RESTART_COOLDOWN_MS: stall 検知 → restart の最短間隔（無限ループ防止）。
+    // ETW_MIN_EVENTS_FOR_CHECK: サービス起動直後の偽陽性回避閾値。
+    static constexpr ULONGLONG PERIODIC_FULL_SCAN_INTERVAL = 60000;   // 60 秒
+    static constexpr ULONGLONG ETW_STALL_CHECK_INTERVAL    = 30000;   // 30 秒
+    static constexpr ULONGLONG ETW_RESTART_COOLDOWN_MS     = 180000;  // 3 分
+    static constexpr uint32_t  ETW_MIN_EVENTS_FOR_CHECK    = 100;
 
     // Select eviction candidate from trackedProcesses_ (call while holding trackedCs_)
     // Priority: 1) invalid handle (zombie), 2) oldest phaseStartTime

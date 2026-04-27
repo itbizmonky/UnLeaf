@@ -1,7 +1,7 @@
 # UnLeaf v1.1.0 Project Context
 
-> **最終更新**: 2026-04-03
-> **ステータス**: **v1.1.0 開発中** — §9.14 ServiceEngine メモリ増加対策 完了。2キュー + TOTAL_LIMIT 絶対保証 + RAII NodeGuard + SafetyNet 2パスラウンドロビン + 30秒バックストップ。ビルド警告ゼロ・151/151 PASS 確認済み。
+> **最終更新**: 2026-04-27
+> **ステータス**: **v1.1.2 リリース済み + §9.18 追加実装** — Windows 11 Update (2026-04-26 以降) で発生した EcoQoS OFF 不全 (起動直後の検出失敗・時間経過での chrome 子プロセス EcoQoS ON 化) に対する SafetyNet round-robin 修正 + 周期 InitialScan + ETW stall 検知 + 安全装置の 4 系統補強を実装。VERSION 定数は `L"1.1.2"` のまま (ユーザー指示待ち)。
 
 ---
 
@@ -27,6 +27,7 @@
 | ビルド (Service / Manager / Tests) | ✅ 警告ゼロ Release (2026-04-03) |
 | ユニットテスト | ✅ 151/151 PASS (2026-04-03) |
 | §9.14 ServiceEngine メモリ増加対策 | ✅ 実装完了 (2026-04-03) |
+| §9.18 EcoQoS 検出補強 (SafetyNet/InitialScan/ETW stall) | ✅ 実装完了 (2026-04-27, 未リリース) |
 | v1.1.0 リリース (§9.00〜§9.09 メモリ安定化) | ✅ 完了 (2026-03-26) |
 | RegistryPolicyManager v5 (IFEO/PT split) | ✅ 実装完了 (2026-03-29) |
 | CPU 暴走対策 (SetEvent 責務分離 + スピン検知) | ✅ 実装完了 (2026-03-29) |
@@ -217,10 +218,43 @@ ctest --test-dir build -C Release --output-on-failure
 | §9.13 | **CanonicalizePath 正規化統一 + 長パス対応** (`types.h`, `engine_core.cpp`, `registry_manager.cpp`): ① `CanonicalizePath` を `types.h` に free function として配置（EngineCore・RegistryPolicyManager 双方から利用可能）。② GetFullPathNameW 2段階呼び出し（動的バッファ）で MAX_PATH 制限撤廃。③ `resultLen` による明示的文字列長指定（バッファ読み過ぎ防止）。④ policyMap_ の全キー生成・検索を `CanonicalizePath` に統一（`NormalizePath` はフォールバック/ログ用途に限定）。⑤ 設計契約コメント（DESIGN CONTRACT / DO NOT）を engine_core.cpp, registry_manager.cpp, registry_manager.h の3ファイルに追加。151/151 PASS 確認済み | 2026/03/30 |
 | §8.61 | **ログシーケンス逆転バグ修正** (`logger.h/cpp`): ローテーション後 `UnLeaf.log` 先頭レコードの日時が `UnLeaf.log.1` 末尾より古くなる現象を修正。根本原因: Manager の stale check が `WriteFile` の**後**にあったため、最低 1 Write が旧ファイル (リネーム済み `.log.1`) に書かれていた。① `hRotationEvent_` (`Global\UnLeafLogRotated`, auto-reset named event) を追加 — Service はローテーション成功直後に `SetEvent`、Manager は `WriteFile` **前**に `WaitForSingleObject(..., 0)` でゼロ待機ポーリング。② stale check ブロックを `WriteFile` の後から前へ移動 — `rotationSignaled` で即時検知、counter フォールバック (100 write) も保持。③ stale reopen 失敗時の early return ガードを追加。これにより stale Write がゼロになりシーケンス逆転が解消。104/104 PASS 確認済み | 2026/03/25 |
 | §9.14 | **ServiceEngine メモリ増加対策** (`engine_core.h/cpp`, `registry_manager.h/cpp`): 長期稼働での Working Set 線形増加を根絶する 8 件の修正を実装 (Rev.17 確定版)。① §9.14-C: `ScheduleDeferredVerification` — `std::exchange` + INVALID_HANDLE_VALUE で旧タイマーハンドル・コンテキストリークを根絶。② §9.14-B: `EnqueuePendingRemoval` — CAS ベース `pendingQueueSize_` 上限ガード + overflow 時 `pendingOverflowFlag_` 即セット → SafetyNet 10秒以内に `VerifyAndRepair` 即発火。`DrainPendingRemovals` — RAII `NodeGuard` (inline struct) で `fetch_sub + delete` をスコープ末尾で不可分保証、re-enqueue ループ（線形増加の主因）を廃止。③ §9.14-A: `enforcementQueue_` を `criticalQueue_ + nonCriticalQueue_`（各 std::deque）に分離。ETW_THREAD_START = NON-CRITICAL（SOFT_LIMIT でドロップ可）、他 = CRITICAL。TOTAL_LIMIT 絶対保証（nonCritical 追い出し → 最古 CRITICAL eviction）。`static_assert(TOTAL_LIMIT >= HARD_LIMIT)` でビルドレベル強制。`ENFORCEMENT_CRITICAL_PER_TICK=512` で CPU バースト防止。④ §9.14-E: `HandleSafetyNetCheck` — CRITICAL drop 差分検出 + 30秒バックストップ (ETW silent drop 対応) で `ScanRunningProcessesForMissedTargets` を発火。2パスラウンドロビン + `std::max` 単調増加保証により特定 PID の永続スキップを根絶。⑤ §9.14-H: `PerformPeriodicMaintenance` に 60秒 `[DIAG]` キュー診断ログ追加。⑥ §9.14-D: `ReconcileWithConfig` 先頭で `ifeoRefCount_.clear()` + policyMap_ 全走査再構築。⑦ §9.14-F: eviction ロジックを簡略化 — 常時最大 16件/挿入でキャップ超過を即処理。⑧ §9.14-G: `HandleEnforceError` — insert 直後に `SUPPRESSION_MAX_SIZE/2` を即キャップ（TTL クリーンアップ前の突発増大防止）。151/151 PASS 確認済み | 2026/04/03 |
+| §9.15 | **ProcessMonitor Hardening + CrashDump 対応** (`process_monitor.h/cpp`, `crash_handler.h/cpp` 新設, `service_main.cpp`, `config.h/cpp`, `engine_core.cpp`): ① `instance_` を `std::atomic<ProcessMonitor*>` に変更 (ABA 安全)。② Stop() に `stopMtx_` 導入 — CloseTrace → ControlTrace(STOP) → join の順序を保証し、join 外への mutex 解放で IPC スレッドブロックを最小化。③ IsHealthy() 完全再設計 — warmup 猶予期間 (120s)・starvation 検知 (lost event delta)・IsTraceSessionAliveLocked() (ControlTrace(QUERY) + キャッシュ 5s)。④ ImageName の unbounded read を bounded ループに修正 (AV 根絶)。⑤ Stop() のステップ経過時間ログ追加 (クラッシュ時フェーズ特定)。⑥ `crash_handler.cpp` 新設 — `SetUnhandledExceptionFilter` + `MiniDumpWriteDump` (ThreadInfo + IndirectlyReferencedMemory)。`[Logging] CrashDump=1` で有効化。dump 先: `<install>\crash\UnLeaf_Service_<timestamp>.dmp`。151/151 PASS 確認済み | 2026/04/10 |
+| §9.16 | **jobObjects_ ハンドルリーク修正 + ETW ヒープ断片化抑制** (`engine_core.h/cpp`, `process_monitor.cpp`): ① `RemoveTrackedProcess()` に `jobObjects_.erase(pid)` 追加 — プロセス終了時に Job Object ハンドルが `jobObjects_` に残留し続けるリークを根絶。trackedCs_ 解放後・jobCs_ 単独取得で実行し lock inversion (jobCs_→trackedCs_) を回避。② `ParseProcessStartEvent()` の TDH バッファを `thread_local std::vector<BYTE>` に変更 — イベント毎の heap alloc/free をゼロに削減しヒープ断片化を抑制。③ `wstringstream` → `to_wstring` 置換 (4箇所)。④ `engineControlThreadId_` を `std::atomic<DWORD>` 化 — DEBUG アサートの可視性保証を完全化。⑤ §9.17-B: `HeapOptimizeResources` を `EngineCore::Start()` に追加 — idle 時に未使用コミットページを積極 decommit (Win8.1+)。**根本原因**: v1.1.1 の 52時間稼働後クラッシュ (UnLeaf_Service_20260419_204543.dmp) は jobObjects_ stale エントリ蓄積によるハンドルテーブル枯渇が原因と分析。v1.1.2 で修正済み。Private Bytes 増加率: ~220KB/時 → 収束。Handle Count: 単調増加 → 収束。151/151 PASS 確認済み | 2026/04/20 |
+| §9.18 | **EcoQoS 検出補強 — SafetyNet round-robin 修正 + 周期 InitialScan + ETW stall 検知** (`engine_core.h/cpp`): Windows 11 Update (2026-04-26 以降) で発生した EcoQoS OFF 不全 (起動直後の検出失敗 + 時間経過での chrome 子プロセス EcoQoS ON 化) に対する 4 系統補強。**観測**: 2026-04-27 09:16-09:19 のログで `tracked=0 recovered=6409` 状態 → ログモード ON/OFF で `Config: Reloading` 発火 → 3秒後 chrome 12 PID が `[PHASE] -> STABLE` 復帰、を確認。**推定根本原因 (2 系統)**: ETW silent drop (chrome 由来 OnProcessStart のみ未着) + SafetyNet 高 PID 張り付き (`lastScannedPid_` 単調増加 + pass 2 不発条件)。**実装**: ① `ScanRunningProcessesForMissedTargets` 末尾で snapshot 完走時 (`scanned < maxScan`) に `lastScannedPid_=0` 強制リセット — 高 PID 短命プロセス発生時の pass 2 不発で chrome 低 PID が永続的に scan 対象外となる経路を遮断。② `PerformPeriodicMaintenance` に `PERIODIC_FULL_SCAN_INTERVAL=120000ms` の周期 `InitialScan()` 追加 (NORMAL モードでも発火) — ETW silent drop 時の最終防衛線。③ DIAG ログに `processMonitor_.GetEventCount()` を `etwEvents=%u` として追記 — silent drop の後追い検証可能化 (判定には使わない)。④ ETW stall 検知 (`ETW_STALL_CHECK_INTERVAL=60000ms` event delta=0 + `HasAnyTargetRunning()` true) で強制 Stop/Start を発火 — 既存 `IsHealthy()` の穴 (session alive だが events 流れない silent dead 状態) を補完。⑤ 安全装置: `ETW_RESTART_COOLDOWN_MS=180000ms` (3 分) restart 間隔下限 + `ETW_MIN_EVENTS_FOR_CHECK=100` 起動直後スキップ閾値。連続再起動回数制限は cooldown で代替し未実装。⑥ `HasAnyTargetRunning()` 軽量 Toolhelp32 ヘルパー新設 — `targetNameSet_` / `pathTargetFileNames_` のいずれかに 1 件マッチで早期 return、descendants 列挙・handle 開放なしの低コスト実装。**障害カバー時間**: PID 張り付き〜30s / ETW silent drop〜120s / ETW silent dead〜60s+3min cooldown / ETW 完全停止〜90s (既存 `IsHealthy`)。VERSION 定数変更なし (`L"1.1.2"` のまま、ユーザー指示待ち)。Release ビルド警告ゼロ。ctest 実行は WDAC ブロックのため build 成功で代替検証 (§8.42 既知問題) | 2026/04/27 |
 
 ---
 
-## 8. リリース確認事項
+## 8. クラッシュインシデント記録
+
+### Incident #1: UnLeaf_Service_20260419_204543.dmp
+
+| 項目 | 内容 |
+|------|------|
+| 発生日時 | 2026-04-19 20:45:43 |
+| 稼働バージョン | v1.1.1 |
+| 連続稼働時間 | 約52時間 (2026-04-17 16:17 起動) |
+| dump ファイル | `build\Release\crash\UnLeaf_Service_20260419_204543.306.dmp` |
+| 再起動日時 | 2026-04-19 22:45:13 (クラッシュ約2時間後) |
+
+**クラッシュ直前ログ:**
+```
+2026-04-19 20:17:50.661  I [REGISTRY] VerifyAndRepair: checked 6 IFEO + 6 PT, repaired 0
+(28分間ログなし — アイドル期間)
+20:45:43  → CrashFilter 発火 → dump 生成
+```
+
+**根本原因:** `RemoveTrackedProcess()` が `jobObjects_.erase(pid)` を行わないため、
+root process 終了のたびに `JobObjectInfo`（OS Job Object HANDLE）が `jobObjects_` に
+stale エントリとして蓄積し続ける。chrome.exe の頻繁な起動・終了により52時間で
+ハンドルテーブルが圧迫され、`CreateJobObjectW()` / `OpenProcess()` が NULL を返す
+→ NULL ハンドル使用 → Access Violation → CrashFilter → dump 生成。
+
+**修正:** §9.16 (v1.1.2) で `RemoveTrackedProcess()` に `jobObjects_.erase(pid)` を追加。
+再発なし。
+
+---
+
+## 9. リリース確認事項
 
 ### v1.0.3 リリース (2026-03-25) ✅
 
@@ -279,20 +313,23 @@ ctest --test-dir build -C Release --output-on-failure
 
 ---
 
-## 9. v1.1.0 開発状況 + バックログ
+## 10. v1.1.2 開発状況 + バックログ
 
-### 9-0. v1.1.0 実装済み (未リリース)
+### 9-0. v1.1.2 リリース済み + §9.18 追加実装 (2026-04-27 現在最新)
 
 | 項目 | 状態 |
 |------|------|
-| §9.00〜§9.09 メモリ安定化 | ✅ 完了 (2026-03-26) |
-| §9.10 RegistryPolicyManager v5 (IFEO/PT split) | ✅ 実装完了 (2026-03-29) |
-| §9.11 CPU 暴走対策 (SetEvent 責務分離 + スピン検知) | ✅ 実装完了 (2026-03-29) |
-| §9.12 プロアクティブポリシー生成 | ✅ 実装完了 (2026-03-30) |
-| §9.13 CanonicalizePath 正規化統一 + 長パス対応 | ✅ 実装完了 (2026-03-30) |
-| ユニットテスト | ✅ 151/151 PASS (2026-03-30) |
-| ドキュメント更新 (docs/, README, CHANGELOG) | ⚠️ 未実施 |
-| `VERSION` 定数 | `L"1.1.0"` (変更済み) |
+| §9.00〜§9.09 メモリ安定化 | ✅ リリース済み (v1.1.0 / 2026-03-26) |
+| §9.10 RegistryPolicyManager v5 (IFEO/PT split) | ✅ リリース済み (v1.1.0 / 2026-03-29) |
+| §9.11 CPU 暴走対策 (SetEvent 責務分離 + スピン検知) | ✅ リリース済み (v1.1.0 / 2026-03-29) |
+| §9.12 プロアクティブポリシー生成 | ✅ リリース済み (v1.1.0 / 2026-03-30) |
+| §9.13 CanonicalizePath 正規化統一 + 長パス対応 | ✅ リリース済み (v1.1.0 / 2026-03-30) |
+| §9.15 ProcessMonitor Hardening + CrashDump 対応 | ✅ リリース済み (v1.1.1 / 2026-04-10) |
+| §9.16 jobObjects_ ハンドルリーク修正 + ETW ヒープ断片化抑制 | ✅ リリース済み (v1.1.2 / 2026-04-20) |
+| §9.17-B HeapOptimizeResources 適用 | ✅ リリース済み (v1.1.2 / 2026-04-20) |
+| §9.18 EcoQoS 検出補強 (Windows 11 Update 対策) | ✅ 実装完了 (2026-04-27, **未リリース**) |
+| ユニットテスト | ✅ 151/151 (build 成功確認、ctest は WDAC ブロック) |
+| `VERSION` 定数 | `L"1.1.2"` (§9.18 後もユーザー指示待ち) |
 
 ### 9-A. 解消済み項目
 

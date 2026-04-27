@@ -1,50 +1,58 @@
-# 🍃  UnLeaf v1.1.2 — Memory Leak Fix & Heap Fragmentation Reduction
+# 🍃  UnLeaf v1.1.3 — ETW Monitoring Stability Fix
 
-Windows 11 / 10 向けゼロオーバーヘッド EcoQoS オプティマイザ **UnLeaf** のパッチリリース **v1.1.2** をリリースしました。
-長時間稼働時に観測された Private Bytes の線形増加 (41 時間で約 9MB) を引き起こすメモリリークを修正します。**v1.1.1 以前のユーザーへのアップデートを強く推奨します。**
+Windows 11 / 10 向けゼロオーバーヘッド EcoQoS オプティマイザ **UnLeaf** のパッチリリース **v1.1.3** をリリースしました。
+2026-04-26 の Windows 11 アップデート以降に観測された **EcoQoS 無効化の不安定化** (chrome.exe 子プロセスが時間経過とともに EcoQoS ON のまま残留する現象) を修正します。
 
 - README: [English](README_EN.md) | [日本語](README.md)
 - 詳細な仕様はこちら: [Technical specifications](docs/Engine_Specification.md)
 
 ---
 
-## ⚡ v1.1.2 の変更点 (What's New)
+## ⚡ v1.1.3 の変更点 (What's New)
 
-### 🐛 メモリリーク修正 (P0)
-
-| # | 改善内容 |
-|---|---------|
-| 1 | **`jobObjects_` ハンドル蓄積を修正** — `RemoveTrackedProcess()` が `jobObjects_` のエントリを削除していなかったため、プロセス終了のたびに Windows Job Object ハンドルが蓄積し続けていた。`jobObjects_.erase(pid)` を `trackedCs_` 解放後・`jobCs_` 単独取得で実行するよう修正。ロック順序 (`jobCs_` → `trackedCs_`) を維持し lock inversion を回避 |
-
-### ⚡ ヒープ断片化抑制 (P1/P2)
+### 🐛 SafetyNet ラウンドロビン PID 張り付き修正 (#1)
 
 | # | 改善内容 |
 |---|---------|
-| 2 | **TDH バッファの `thread_local` 化** — `ParseProcessStartEvent()` がイベントごとに `std::vector<BYTE>` を alloc/free していた問題を解消。`thread_local` 再利用バッファ (`s_tdhBuffer`, `s_propBuffer`) に置換し、capacity を縮小しないことで反復ヒープ確保をゼロに削減 |
-| 3 | **`wstringstream` → `to_wstring` 置換** — `ProcessMonitor` の 4 箇所のログサイトで `std::wstringstream` を `std::to_wstring()` に置換。一時 string オブジェクトの生成を最小化しヒープ断片化を抑制 |
+| 1 | **`lastScannedPid_` 強制リセット** — `ScanRunningProcessesForMissedTargets` の全走査完了時 (pass1 自然終了 / pass2 完了) に `lastScannedPid_=0` を強制セット。次 tick で必ず PID 0 から再走査し、高 PID 領域への継続的な張り付きによる低 PID ターゲット (早期起動の chrome.exe 等) の取りこぼしを防止 |
 
-### 🔍 デバッグ品質強化
-
-| # | 改善内容 |
-|---|---------|
-| 4 | **`engineControlThreadId_` の `atomic<DWORD>` 化** — `DWORD` のまま他スレッドから参照した場合の C++ 可視性保証欠如を修正。`std::atomic<DWORD>` (`memory_order_relaxed`) に変更し、DEBUG アサート (`RemoveTrackedProcess`, `RefreshJobObjectPids`, `ProcessPendingRemovals`) の検出精度を 100% に向上。Release ビルドへの実行時コスト影響なし |
-
-### 🧹 ヒープメモリ管理強化 (§9.17-B)
+### 🔄 周期 InitialScan 追加 (#2)
 
 | # | 改善内容 |
 |---|---------|
-| 5 | **`HeapOptimizeResources` の適用** — `EngineCore::Start()` に `HeapSetInformation(GetProcessHeap(), HeapOptimizeResources, ...)` を追加。プロセスヒープが idle 時に未使用コミットページを積極的にデコミット (Windows 8.1+、失敗時は無視)。長時間稼働時のヒープ断片化による Private Working Set 成長を抑制 |
+| 2 | **60 秒周期の全プロセス再スキャン** — NORMAL モード時に `InitialScan()` を 60 秒ごとに自動発火 (`PERIODIC_FULL_SCAN_INTERVAL=60000`)。SafetyNet ラウンドロビン (10s × 64 PID/tick) が ~30〜50s で全 PID をインクリメンタルにカバーするため、InitialScan は ETW 欠損時の descendant 追跡強制補完として機能する |
+
+### 🔍 ETW stall 検知 + 自動再起動 (#4 + #5)
+
+| # | 改善内容 |
+|---|---------|
+| 3 | **ETW stall 検知** — 30 秒間 ETW イベントカウントが増加せず (`ETW_STALL_CHECK_INTERVAL=30s`)、かつターゲットプロセスが稼働中の場合に ETW session dead を検知。`ProcessMonitor` を自動停止→再起動。3 分クールダウン (`ETW_RESTART_COOLDOWN_MS=180s`) により再起動ループを防止。再起動失敗時は `DEGRADED_ETW` モードに遷移 |
+
+### 📊 診断ログ強化 (#3)
+
+| # | 改善内容 |
+|---|---------|
+| 4 | **`[DIAG]` ログに `etwEvents=N` 追加** — 既存の 60 秒周期 `[DIAG]` 診断行に ETW 累計イベント数フィールドを追加。ETW デリバリが正常に機能しているかをログから直接検証可能に |
+
+---
+
+## 🛡️ 障害ケース別の対処時間
+
+| 障害パターン | 最大検知〜補正時間 | 担当機構 |
+|---|---|---|
+| SafetyNet PID 張り付き (chrome 低 PID 取りこぼし) | 〜30 秒 | #1 lastScannedPid_ リセット |
+| ETW silent drop (chrome イベントのみ不着) | 〜60 秒 | #2 周期 InitialScan |
+| ETW stall (session alive だが events 増加なし) | 〜30 秒 + 3分 cooldown | #4+#5 stall 検知 & 再起動 |
+| ETW 完全停止 (session dead) | 〜90 秒 | 既存 `IsHealthy()` 機構 |
 
 ---
 
 ## 📊 修正効果
 
-| 指標 | 修正前 (v1.1.1) | 修正後 (v1.1.2) |
-|------|--------|--------|
-| Private Bytes 増加率 | ~220 KB/時 (41h で約 9MB) | 停止 (収束) |
-| Handle Count | 単調増加 | 収束 |
-| ETW イベントあたりのヒープ確保 | 2 alloc/event | 0 alloc/event (thread_local) |
-| メモリ増加率 (ヒープ断片化) | ~2 MB/時 (3→15.5 MB) | ~0.38 MB/時 (3.78→6.26 MB / 6.5h) ≈ 5倍改善 |
+本バージョンで修正される主症状:
+
+- **症状 A**: OS 起動後しばらくは機能するが、時間経過とともに chrome.exe 子プロセスに EcoQoS ON が残留する → `#1` + `#2` で対処
+- **症状 B**: OS 起動直後に EcoQoS 解除が全く機能せず、ログモード切替等の操作で正常化する → `#4+#5` で対処
 
 ---
 
@@ -117,11 +125,14 @@ ctest --test-dir build -C Release --output-on-failure
 
 ---
 
-### UnLeaf Manager UI
-<img width="546" height="439" alt="UnLeaf_v1 0 3" src="https://github.com/user-attachments/assets/51b88928-ddd7-4a3e-96d5-81021479d7b8" />
-
 ### UnLeaf promotional photos
-<img width="2339" height="1536" alt="UnLeaf promotional photos" src="https://github.com/user-attachments/assets/f9d36565-315c-409e-9eb5-2b09e4b4e02f" />
+<img width="1376" height="768" alt="Gemini_Generated_Image_wg9r5cwg9r5cwg9r" src="https://github.com/user-attachments/assets/a7c0f3eb-866c-43f8-b421-36df078e5fb9" />
+
+### Comparison of UnLeaf before and after use
+![unleaf_before_after](https://github.com/user-attachments/assets/3d35e6d2-548d-4bc7-8678-946ec2a2c05a)
+
+### UnLeaf Manager UI
+<img width="546" height="439" alt="スクリーンショット 2026-04-12 175809" src="https://github.com/user-attachments/assets/29f6411c-2061-4a15-b5cd-81db993ad608" />
 
 ### EcoQoS before and after images
 <img width="1024" height="559" alt="EcoQoS before and after images" src="https://github.com/user-attachments/assets/02ae2b76-6eb1-4eca-83fc-aff15763ef15" />

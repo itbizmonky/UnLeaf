@@ -4,6 +4,19 @@ All notable changes to UnLeaf will be documented in this file.
 
 ---
 
+## [1.1.3] - 2026-04-27
+
+### Fixed
+- `ScanRunningProcessesForMissedTargets`: force-reset `lastScannedPid_=0` when a full scan completes (pass1 natural end or pass2 done), so the next tick always restarts from PID 0. Prevents low-PID targets (e.g. early-launched chrome.exe) from being permanently starved when a short-lived high-PID process causes the round-robin to pin at the top of the PID space
+
+### Added
+- **Periodic full scan** (`PerformPeriodicMaintenance`): `InitialScan()` is now triggered every 60 s in NORMAL mode (`PERIODIC_FULL_SCAN_INTERVAL = 60000`). Acts as a forced full-recovery fallback against ETW silent drop. The SafetyNet round-robin (10 s × 64 PID/tick) covers the full PID space in ~30–50 s incrementally; `InitialScan` supplements it with descendant tracking at 60 s intervals
+- **ETW stall detection** (`PerformPeriodicMaintenance`): Every 30 s (`ETW_STALL_CHECK_INTERVAL`), the engine compares the current cumulative ETW event count against the previous check. If the count is unchanged, at least 100 events have been observed since startup (`ETW_MIN_EVENTS_FOR_CHECK`), a target process is running (`HasAnyTargetRunning()`), and the 3-minute restart cooldown has elapsed (`ETW_RESTART_COOLDOWN_MS`), `ProcessMonitor` is stopped and restarted. On restart failure the engine transitions to `DEGRADED_ETW` mode. Detection window: ≤ 30 s after onset
+- **`HasAnyTargetRunning()`**: lightweight `Toolhelp32Snapshot` helper (no `collectDescendants`, no handle open) that returns `true` if any exe matching `targetNameSet_` or `pathTargetFileNames_` is currently running. Used exclusively by the ETW stall guard to avoid false restarts when no target is present
+- **`[DIAG]` log enhancement**: `etwEvents=N` field appended to the existing 60-second `[DIAG]` diagnostic line, enabling post-hoc verification of ETW delivery health
+
+---
+
 ## [1.1.2] - 2026-04-11
 
 ### Fixed

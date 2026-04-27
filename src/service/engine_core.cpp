@@ -1303,6 +1303,51 @@ void EngineCore::ScanRunningProcessesForMissedTargets(int maxScan) {
             } while (scanned < maxScan && Process32NextW(snap, &pe));
         }
     }
+
+    // §9.18 #1: 全走査完了時は lastScannedPid_=0 にリセット
+    // scanned < maxScan で抜けた = Process32NextW(snap,&pe) が false を返した
+    // = snapshot 末尾に到達 = 次 tick は先頭から再開すべき。
+    // 既存の単調増加 round-robin (lastScannedPid_ = std::max(...)) では、
+    // 高 PID の短命プロセスが現れると低 PID の chrome が永続的に scan 対象外となるため、
+    // 全走査完了を契機に強制リセットする。
+    if (scanned < maxScan) {
+        lastScannedPid_ = 0;
+    }
+}
+
+// §9.18 #4: Lightweight Toolhelp32 probe for ETW stall detection.
+// Returns true if any running process matches targetNameSet_ or pathTargetFileNames_.
+// No descendant collection, no policy work, no handle opening. Bails out at first hit.
+bool EngineCore::HasAnyTargetRunning() const {
+    std::set<std::wstring> localNames;
+    std::set<std::wstring> localPathFileNames;
+    {
+        CSLockGuard lock(targetCs_);
+        if (targetNameSet_.empty() && pathTargetFileNames_.empty()) {
+            return false;
+        }
+        localNames         = targetNameSet_;
+        localPathFileNames = pathTargetFileNames_;
+    }
+
+    HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+    if (snap == INVALID_HANDLE_VALUE) return false;
+    ScopedSnapshot scoped = MakeScopedSnapshot(snap);
+
+    PROCESSENTRY32W pe = {};
+    pe.dwSize = sizeof(pe);
+    if (!Process32FirstW(snap, &pe)) return false;
+
+    do {
+        if (IsCriticalProcess(pe.szExeFile)) continue;
+        std::wstring lowerName = ToLower(pe.szExeFile);
+        if (localNames.count(lowerName) > 0 ||
+            localPathFileNames.count(lowerName) > 0) {
+            return true;
+        }
+    } while (Process32NextW(snap, &pe));
+
+    return false;
 }
 
 // §9.14-E: Check if a process is a missed target; apply optimization if so.
@@ -1535,6 +1580,62 @@ void EngineCore::PerformPeriodicMaintenance(ULONGLONG now) {
         lastEtwHealthCheck_ = now;
     }
 
+    // §9.18 #4 + #5: ETW stall 検知（既存 IsHealthy() の補完）
+    // 既存 IsHealthy() は (now - lastEvent) > 60s かつ (lost burst OR session dead) で
+    // 初めて unhealthy 判定するため、ETW session が ControlTrace(QUERY) には alive を返しつつ
+    // 実際にはイベントが流れない silent dead 状態を検知できない穴があった。
+    // 本ブロックで etwEvents の 60 秒 delta=0 を検知して強制 Stop/Start を発火する。
+    // 安全装置:
+    //   #5a: ETW_RESTART_COOLDOWN_MS (3 分) — restart 後の再起動禁止期間。無限ループ防止。
+    //   #5b: ETW_MIN_EVENTS_FOR_CHECK (100) — サービス起動直後の偽陽性回避。
+    //   対象プロセス存在チェック — Toolhelp32 軽量版（descendants 列挙なし）。
+    if (now - lastEtwStallCheckTime_ >= ETW_STALL_CHECK_INTERVAL) {
+        uint32_t currentEvents = processMonitor_.GetEventCount();
+
+        if (lastEtwStallCheckTime_ > 0 &&
+            operationMode_ == OperationMode::NORMAL &&
+            currentEvents >= ETW_MIN_EVENTS_FOR_CHECK &&
+            currentEvents == lastEtwEventCount_ &&
+            (now - lastEtwRestartTime_) >= ETW_RESTART_COOLDOWN_MS &&
+            HasAnyTargetRunning()) {
+
+            LOG_ALERT(L"ETW: Event stall detected (60s no events) - forcing restart");
+            processMonitor_.Stop();
+
+            bool restarted = processMonitor_.Start(
+                [this](DWORD pid, DWORD parentPid, const std::wstring& imageName,
+                       const std::wstring& imagePath) {
+                    this->OnProcessStart(pid, parentPid, imageName, imagePath);
+                },
+                [this](DWORD threadId, DWORD ownerPid) {
+                    this->OnThreadStart(threadId, ownerPid);
+                }
+            );
+
+            if (restarted) {
+                LOG_INFO(L"ETW: Stall recovery restart succeeded");
+            } else {
+                operationMode_ = OperationMode::DEGRADED_ETW;
+                LOG_ERROR(L"ETW: Stall recovery restart failed - switching to DEGRADED mode");
+            }
+
+            lastEtwRestartTime_ = now;
+        }
+
+        lastEtwStallCheckTime_ = now;
+        lastEtwEventCount_ = currentEvents;
+    }
+
+    // §9.18 #2: 周期 InitialScan（NORMAL モードでも 120 秒毎に発火）
+    // ETW silent drop で chrome 由来の OnProcessStart イベントだけが届かないケースを
+    // Toolhelp32 ベースの全列挙で補正する。DEGRADED_ETW モードは既存の
+    // InitialScanForDegradedMode (30s 周期) があるため対象外。
+    if (operationMode_ == OperationMode::NORMAL &&
+        now - lastFullScanTime_ >= PERIODIC_FULL_SCAN_INTERVAL) {
+        InitialScan();
+        lastFullScanTime_ = now;
+    }
+
     // Job Object refresh (every 5s) - skip if no active Job Objects
     if (now - lastJobQueryTime_ >= JOB_QUERY_INTERVAL) {
         bool hasJobs;
@@ -1717,12 +1818,16 @@ void EngineCore::PerformPeriodicMaintenance(ULONGLONG now) {
         uint64_t unregFail = waitUnregisterFailures_.load(std::memory_order_relaxed);
         int64_t  waitDelta = static_cast<int64_t>(regCnt) - static_cast<int64_t>(unregCnt);
 
-        wchar_t diagBuf[320];
+        // §9.18 #3: etwEvents（累計）を DIAG 出力に追加
+        // ETW silent drop / stall 状態の後追い検証を可能にする。判定ロジックには使わない。
+        uint32_t etwEvents = processMonitor_.GetEventCount();
+
+        wchar_t diagBuf[384];
         swprintf_s(diagBuf,
             L"[DIAG] wait(reg:%llu unreg:%llu fail:%llu delta:%lld) "
-            L"tracked=%zu watchMap=%zu deferCtx=%zu errSup=%zu handles=%u",
+            L"tracked=%zu watchMap=%zu deferCtx=%zu errSup=%zu handles=%u etwEvents=%u",
             regCnt, unregCnt, unregFail, waitDelta,
-            trackedSz, watchMapSz, deferCtxCnt, errSupSz, handleCount);
+            trackedSz, watchMapSz, deferCtxCnt, errSupSz, handleCount, etwEvents);
         LOG_DEBUG(diagBuf);
 
         lastDiagLogTime_ = now;

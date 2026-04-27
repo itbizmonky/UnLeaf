@@ -333,6 +333,14 @@ UnLeaf/
 
 ## 更新履歴 (Changelog)
 
+### v1.1.3 (2026-04-27)
+
+**ETW 監視安定化・Windows 11 Update 後の EcoQoS 解除不全対策**
+- `ScanRunningProcessesForMissedTargets`: 全走査完了時に `lastScannedPid_=0` を強制リセット。高 PID 領域に張り付いたラウンドロビンが低 PID の chrome.exe を継続的に取りこぼす問題を修正
+- 周期 `InitialScan()` を 2 分間隔 (`PERIODIC_FULL_SCAN_INTERVAL=120s`) で追加。ETW silent drop 時の最終防衛線として機能し、取りこぼしを最大 2 分以内に補足
+- ETW stall 検知を追加: 60 秒間イベント無増加 + ターゲット稼働中の条件が成立した場合に `ProcessMonitor` を自動再起動 (3 分クールダウン付き)。検知窓 ≤ 60 秒
+- `[DIAG]` 診断ログに `etwEvents=N` フィールドを追加。ETW デリバリ健全性の事後検証を可能に
+
 ### v1.1.2 (2026-04-11)
 
 **メモリリーク修正・ヒープ断片化抑制**
