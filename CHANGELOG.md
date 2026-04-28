@@ -4,16 +4,23 @@ All notable changes to UnLeaf will be documented in this file.
 
 ---
 
-## [1.1.3] - 2026-04-27
+## [1.1.3] - 2026-04-28
 
 ### Fixed
 - `ScanRunningProcessesForMissedTargets`: force-reset `lastScannedPid_=0` when a full scan completes (pass1 natural end or pass2 done), so the next tick always restarts from PID 0. Prevents low-PID targets (e.g. early-launched chrome.exe) from being permanently starved when a short-lived high-PID process causes the round-robin to pin at the top of the PID space
 
+### Changed
+- **`PERIODIC_FULL_SCAN_INTERVAL` 60 s → 20 s**: Root-requirement fix — "disable EcoQoS" must be guaranteed regardless of ETW state. During ETW cold-dead (up to 4 min before detection), new Chrome processes are now caught within ≤ 20 s instead of ≤ 60 s. CPU impact: ~0.007 % additional (ToolHelp32 scan 1–5 ms × 3/min); no memory increase (snapshot released per call)
+- **`DEGRADED_SCAN_INTERVAL` 30 s → 20 s**: Reduces EcoQoS detection delay in `DEGRADED_ETW` mode from 30 s to 20 s
+- **ETW stall detection extended to 2-trigger + 3-state machine**: Hot stall (eventCount ≥ 100, delta = 0) is supplemented by **cold-dead detection** (eventCount = 0 for `ETW_COLD_DEAD_THRESHOLD_MS` = 240 s after service start or last restart). `IsHealthy()` misses cold-dead because `ControlTrace(QUERY)` succeeds even when the session delivers no events; this block compensates. After restart, engine enters `EtwState::VERIFYING_RECOVERY` and waits up to `ETW_RECOVERY_VERIFY_MS` = 30 s for eventCount to increase. Two consecutive timeouts → `DEGRADED_ETW`. `etwVerificationBaseCount_` fixes the baseline immediately after `Start()` to avoid false-positive comparison against pre-restart counts
+- **`HasAnyTargetRunning()`**: added `trackedProcesses_` fast-path check before `Toolhelp32Snapshot` fallback, reducing overhead when targets are already tracked
+
 ### Added
-- **Periodic full scan** (`PerformPeriodicMaintenance`): `InitialScan()` is now triggered every 60 s in NORMAL mode (`PERIODIC_FULL_SCAN_INTERVAL = 60000`). Acts as a forced full-recovery fallback against ETW silent drop. The SafetyNet round-robin (10 s × 64 PID/tick) covers the full PID space in ~30–50 s incrementally; `InitialScan` supplements it with descendant tracking at 60 s intervals
-- **ETW stall detection** (`PerformPeriodicMaintenance`): Every 30 s (`ETW_STALL_CHECK_INTERVAL`), the engine compares the current cumulative ETW event count against the previous check. If the count is unchanged, at least 100 events have been observed since startup (`ETW_MIN_EVENTS_FOR_CHECK`), a target process is running (`HasAnyTargetRunning()`), and the 3-minute restart cooldown has elapsed (`ETW_RESTART_COOLDOWN_MS`), `ProcessMonitor` is stopped and restarted. On restart failure the engine transitions to `DEGRADED_ETW` mode. Detection window: ≤ 30 s after onset
-- **`HasAnyTargetRunning()`**: lightweight `Toolhelp32Snapshot` helper (no `collectDescendants`, no handle open) that returns `true` if any exe matching `targetNameSet_` or `pathTargetFileNames_` is currently running. Used exclusively by the ETW stall guard to avoid false restarts when no target is present
+- **`bool RestartETW()`** private helper: consolidates `ProcessMonitor.Stop() → Sleep(50 ms) → Start()` + state update (`etwState_`, `etwVerificationBaseCount_`, `etwRestartVerificationDeadline_`) into one call. `Sleep(50)` guards against ETW session teardown race
+- **`EtwState` enum** (`HEALTHY` / `VERIFYING_RECOVERY` / `DEGRADED`): explicit 3-state machine replacing implicit `etwRestartVerificationDeadline_ > 0` check. Phase A (verification) is isolated from Phase B (fault detection) via `else` branching to prevent restart racing
 - **`[DIAG]` log enhancement**: `etwEvents=N` field appended to the existing 60-second `[DIAG]` diagnostic line, enabling post-hoc verification of ETW delivery health
+- New constants: `ETW_COLD_DEAD_THRESHOLD_MS = 240000`, `ETW_RECOVERY_VERIFY_MS = 30000`
+- `static_assert(ETW_COLD_DEAD_THRESHOLD_MS > ETW_RESTART_COOLDOWN_MS)` to ensure cold-dead threshold exceeds cooldown guard
 
 ---
 

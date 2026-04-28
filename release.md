@@ -1,7 +1,8 @@
-# 🍃  UnLeaf v1.1.3 — ETW Monitoring Stability Fix
+# 🍃  UnLeaf v1.1.3 — ETW Monitoring Extended & EcoQoS Guarantee
 
 Windows 11 / 10 向けゼロオーバーヘッド EcoQoS オプティマイザ **UnLeaf** のパッチリリース **v1.1.3** をリリースしました。
 2026-04-26 の Windows 11 アップデート以降に観測された **EcoQoS 無効化の不安定化** (chrome.exe 子プロセスが時間経過とともに EcoQoS ON のまま残留する現象) を修正します。
+ETW cold-dead 検知・3 ステート復帰機械の追加と、ETW 状態によらず EcoQoS を ≤ 20 秒以内に解除する根本要件対応を含みます。
 
 - README: [English](README_EN.md) | [日本語](README.md)
 - 詳細な仕様はこちら: [Technical specifications](docs/Engine_Specification.md)
@@ -16,34 +17,49 @@ Windows 11 / 10 向けゼロオーバーヘッド EcoQoS オプティマイザ *
 |---|---------|
 | 1 | **`lastScannedPid_` 強制リセット** — `ScanRunningProcessesForMissedTargets` の全走査完了時 (pass1 自然終了 / pass2 完了) に `lastScannedPid_=0` を強制セット。次 tick で必ず PID 0 から再走査し、高 PID 領域への継続的な張り付きによる低 PID ターゲット (早期起動の chrome.exe 等) の取りこぼしを防止 |
 
-### 🔄 周期 InitialScan 追加 (#2)
+### 🔄 周期 InitialScan 短縮 — 根本要件対応 (#2)
 
 | # | 改善内容 |
 |---|---------|
-| 2 | **60 秒周期の全プロセス再スキャン** — NORMAL モード時に `InitialScan()` を 60 秒ごとに自動発火 (`PERIODIC_FULL_SCAN_INTERVAL=60000`)。SafetyNet ラウンドロビン (10s × 64 PID/tick) が ~30〜50s で全 PID をインクリメンタルにカバーするため、InitialScan は ETW 欠損時の descendant 追跡強制補完として機能する |
+| 2 | **`PERIODIC_FULL_SCAN_INTERVAL` 60 s → 20 s** — 「EcoQoS を OFF にする」という根本要件は ETW 状態によらず保証すべき。ETW が破損している間 (cold-dead 検知前の最大 4 分間) でも、NORMAL モードの `InitialScan()` が 20 秒ごとに発火し新規 Chrome EcoQoS を最大 20 秒以内に解除する。リソース影響: ToolHelp32 scan ~1-5 ms × 3 回/分 → 追加 CPU ≈ 0.007 %、メモリ増加なし (Snapshot は都度解放) |
+| 2b | **`DEGRADED_SCAN_INTERVAL` 30 s → 20 s** — DEGRADED_ETW モード中の `InitialScanForDegradedMode` 周期も短縮し、全モードで検知遅延 ≤ 20 s を統一 |
 
-### 🔍 ETW stall 検知 + 自動再起動 (#4 + #5)
+### 🔍 ETW Cold-Dead 検知 + 3 ステート復帰機械 (#4+#5 拡張)
 
 | # | 改善内容 |
 |---|---------|
-| 3 | **ETW stall 検知** — 30 秒間 ETW イベントカウントが増加せず (`ETW_STALL_CHECK_INTERVAL=30s`)、かつターゲットプロセスが稼働中の場合に ETW session dead を検知。`ProcessMonitor` を自動停止→再起動。3 分クールダウン (`ETW_RESTART_COOLDOWN_MS=180s`) により再起動ループを防止。再起動失敗時は `DEGRADED_ETW` モードに遷移 |
+| 3 | **ETW cold-dead 検知** — 従来の hot stall 検知 (eventCount ≥ 100、delta = 0) に加え、**cold-dead 検知** (起動/再起動後 eventCount = 0 が `ETW_COLD_DEAD_THRESHOLD_MS = 240 s` 継続 + ターゲット稼働中) を追加。`IsHealthy()` は `ControlTrace(QUERY)` 成功なら healthy と誤判定するため cold dead を見逃す盲点を補完 |
+| 4 | **`EtwState` 3 ステート機械** (`HEALTHY` / `VERIFYING_RECOVERY` / `DEGRADED`) — 再起動後は `VERIFYING_RECOVERY` に遷移し `ETW_RECOVERY_VERIFY_MS = 30 s` 以内に eventCount 増加を確認。増加なければ最大 2 回リトライ後 `DEGRADED_ETW` 遷移。`etwVerificationBaseCount_` で Start() 直後の基準値を固定し、hotStall 後の `lastEtwEventCount_` 汚染による偽陰性を回避 |
+| 5 | **`RestartETW()` ヘルパー** — `ProcessMonitor.Stop() → Sleep(50 ms) → Start()` + state 更新を集約。Sleep(50 ms) で ETW セッション teardown race を防止 |
 
 ### 📊 診断ログ強化 (#3)
 
 | # | 改善内容 |
 |---|---------|
-| 4 | **`[DIAG]` ログに `etwEvents=N` 追加** — 既存の 60 秒周期 `[DIAG]` 診断行に ETW 累計イベント数フィールドを追加。ETW デリバリが正常に機能しているかをログから直接検証可能に |
+| 6 | **`[DIAG]` ログに `etwEvents=N` 追加** — 既存の 60 秒周期 `[DIAG]` 診断行に ETW 累計イベント数フィールドを追加。ETW デリバリが正常に機能しているかをログから直接検証可能に |
 
 ---
 
-## 🛡️ 障害ケース別の対処時間
+## 🛡️ 障害ケース別の対処時間 (変更後)
 
 | 障害パターン | 最大検知〜補正時間 | 担当機構 |
 |---|---|---|
 | SafetyNet PID 張り付き (chrome 低 PID 取りこぼし) | 〜30 秒 | #1 lastScannedPid_ リセット |
-| ETW silent drop (chrome イベントのみ不着) | 〜60 秒 | #2 周期 InitialScan |
-| ETW stall (session alive だが events 増加なし) | 〜30 秒 + 3分 cooldown | #4+#5 stall 検知 & 再起動 |
+| ETW silent drop (chrome イベントのみ不着) | **〜20 秒** | #2 周期 InitialScan (20 s) |
+| ETW stall (session alive だが events 増加なし) | 〜30 秒 + 3 分 cooldown | #4+#5 hot stall 検知 |
+| ETW cold dead (起動直後から events なし) | 〜240 秒 + 30 s×2 verify | #4+#5 cold dead 検知 |
 | ETW 完全停止 (session dead) | 〜90 秒 | 既存 `IsHealthy()` 機構 |
+| 新 Chrome (ETW 破損中) | **〜20 秒** | #2 PERIODIC_FULL_SCAN |
+
+---
+
+## 📊 EcoQoS 検知遅延保証 (変更後)
+
+| ETW 状態 | 新規 Chrome EcoQoS 最大遅延 |
+|---------|---------------------------|
+| ETW 正常 | ≒ 0ms（ETW リアルタイム）|
+| ETW 破損（cold-dead 検知前の最大 4 分間） | **≤ 20 秒**（PERIODIC_FULL_SCAN 20 s） |
+| DEGRADED_ETW | **≤ 20 秒**（InitialScanForDegradedMode 20 s） |
 
 ---
 
@@ -52,7 +68,8 @@ Windows 11 / 10 向けゼロオーバーヘッド EcoQoS オプティマイザ *
 本バージョンで修正される主症状:
 
 - **症状 A**: OS 起動後しばらくは機能するが、時間経過とともに chrome.exe 子プロセスに EcoQoS ON が残留する → `#1` + `#2` で対処
-- **症状 B**: OS 起動直後に EcoQoS 解除が全く機能せず、ログモード切替等の操作で正常化する → `#4+#5` で対処
+- **症状 B**: OS 起動直後に EcoQoS 解除が全く機能せず、ログモード切替等の操作で正常化する → `#4+#5 cold dead` で対処
+- **症状 C** (新規): ETW が破損している 4 分間、新規 Chrome の EcoQoS 解除が最大 60 秒遅延する → `#2 PERIODIC_FULL_SCAN 20 s` で ≤ 20 秒に短縮
 
 ---
 

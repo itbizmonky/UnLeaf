@@ -1319,6 +1319,12 @@ void EngineCore::ScanRunningProcessesForMissedTargets(int maxScan) {
 // Returns true if any running process matches targetNameSet_ or pathTargetFileNames_.
 // No descendant collection, no policy work, no handle opening. Bails out at first hit.
 bool EngineCore::HasAnyTargetRunning() const {
+    // Fast path: 追跡済みプロセスが存在すれば即 true（Toolhelp32 スキャン不要）
+    {
+        CSLockGuard lock(trackedCs_);
+        if (!trackedProcesses_.empty()) return true;
+    }
+
     std::set<std::wstring> localNames;
     std::set<std::wstring> localPathFileNames;
     {
@@ -1552,6 +1558,42 @@ void CALLBACK EngineCore::PersistentEnforceTimerCallback(PVOID lpParameter, BOOL
     // Note: Do NOT delete context for recurring timer - it's reused
 }
 
+// §9.18: ETW restart helper — Stop / Sleep(50ms) / Start / state update.
+// ★ etwState_ と operationMode_ は常に同時更新する。
+bool EngineCore::RestartETW() {
+    processMonitor_.Stop();
+    Sleep(50);  // ETW セッション teardown race 対策（30s ループ内で無視可能）
+
+    bool ok = processMonitor_.Start(
+        [this](DWORD pid, DWORD parentPid, const std::wstring& imageName,
+               const std::wstring& imagePath) {
+            this->OnProcessStart(pid, parentPid, imageName, imagePath);
+        },
+        [this](DWORD threadId, DWORD ownerPid) {
+            this->OnThreadStart(threadId, ownerPid);
+        }
+    );
+
+    lastEtwRestartTime_ = GetTickCount64();  // ★ unsigned 差分は wrap-safe
+
+    if (ok) {
+        // ★ Start() はカウンタをリセットするため、直後の GetEventCount() を
+        //   verification ベースラインとして固定する（lastEtwEventCount_ 汚染回避）。
+        //   通常は 0 が返るが、実値取得で race 時の部分カウントも正確に扱う。
+        etwVerificationBaseCount_       = processMonitor_.GetEventCount();
+        etwState_                       = EtwState::VERIFYING_RECOVERY;
+        etwRestartVerificationDeadline_ = lastEtwRestartTime_ + ETW_RECOVERY_VERIFY_MS;
+        LOG_INFO(L"ETW: Restart attempted - monitoring recovery for " +
+                 std::to_wstring(ETW_RECOVERY_VERIFY_MS / 1000) + L"s");
+    } else {
+        // ★ etwState_ / operationMode_ は必ず同時更新する
+        etwState_      = EtwState::DEGRADED;
+        operationMode_ = OperationMode::DEGRADED_ETW;
+        LOG_ERROR(L"ETW: Restart failed - transitioning to DEGRADED_ETW");
+    }
+    return ok;
+}
+
 // Periodic maintenance (piggybacks on wakeups)
 void EngineCore::PerformPeriodicMaintenance(ULONGLONG now) {
     // ETW health check (every 30s)
@@ -1576,60 +1618,90 @@ void EngineCore::PerformPeriodicMaintenance(ULONGLONG now) {
                 operationMode_ = OperationMode::DEGRADED_ETW;
                 LOG_ERROR(L"ETW: Restart failed - switching to DEGRADED mode");
             }
+            lastEtwRestartTime_ = now;
         }
         lastEtwHealthCheck_ = now;
     }
 
-    // §9.18 #4 + #5: ETW stall 検知（既存 IsHealthy() の補完）
-    // 既存 IsHealthy() は (now - lastEvent) > 60s かつ (lost burst OR session dead) で
-    // 初めて unhealthy 判定するため、ETW session が ControlTrace(QUERY) には alive を返しつつ
-    // 実際にはイベントが流れない silent dead 状態を検知できない穴があった。
-    // 本ブロックで etwEvents の 60 秒 delta=0 を検知して強制 Stop/Start を発火する。
-    // 安全装置:
-    //   #5a: ETW_RESTART_COOLDOWN_MS (3 分) — restart 後の再起動禁止期間。無限ループ防止。
-    //   #5b: ETW_MIN_EVENTS_FOR_CHECK (100) — サービス起動直後の偽陽性回避。
-    //   対象プロセス存在チェック — Toolhelp32 軽量版（descendants 列挙なし）。
+    // §9.18 #4 + #5: ETW 障害検知（cold-dead/hot-stall の 2 系統 + 復帰確認）
+    // 2 系統の再起動トリガー:
+    //   Hot stall:  ETW が一時動作 (>=100 events) 後に停止 → delta=0 検知
+    //   Cold dead:  起動/再起動後から一切イベントなし → time-based 検知
+    // IsHealthy() は lastEvent=0 時に ControlTrace(QUERY) のみ確認するため cold dead を見逃す。
+    // 本ブロックがその補完。Phase A (復帰確認) / Phase B (障害検知) の 2 フェーズ構成。
     if (now - lastEtwStallCheckTime_ >= ETW_STALL_CHECK_INTERVAL) {
         uint32_t currentEvents = processMonitor_.GetEventCount();
 
-        if (lastEtwStallCheckTime_ > 0 &&
-            operationMode_ == OperationMode::NORMAL &&
-            currentEvents >= ETW_MIN_EVENTS_FOR_CHECK &&
-            currentEvents == lastEtwEventCount_ &&
-            (now - lastEtwRestartTime_) >= ETW_RESTART_COOLDOWN_MS &&
-            HasAnyTargetRunning()) {
-
-            LOG_ALERT(L"ETW: Event stall detected (60s no events) - forcing restart");
-            processMonitor_.Stop();
-
-            bool restarted = processMonitor_.Start(
-                [this](DWORD pid, DWORD parentPid, const std::wstring& imageName,
-                       const std::wstring& imagePath) {
-                    this->OnProcessStart(pid, parentPid, imageName, imagePath);
-                },
-                [this](DWORD threadId, DWORD ownerPid) {
-                    this->OnThreadStart(threadId, ownerPid);
+        // ── Phase A: VERIFYING_RECOVERY 専用ブロック ─────────────────────────────
+        // VERIFYING_RECOVERY 中は Phase B（stall 検知）を else で skip する。
+        // これにより、復帰確認中の再起動競合を構造的に排除する。
+        if (etwState_ == EtwState::VERIFYING_RECOVERY) {
+            if (currentEvents > etwVerificationBaseCount_) {
+                // eventCount 増加確認（Start() 直後ベース基準で単純 >0 より厳密）
+                LOG_INFO(L"ETW: Recovery confirmed (eventCount=" +
+                         std::to_wstring(currentEvents) + L")");
+                etwState_              = EtwState::HEALTHY;
+                etwRecoveryRetryCount_ = 0;
+            } else if (now >= etwRestartVerificationDeadline_) {
+                // 60s タイムアウト
+                if (HasAnyTargetRunning()) {
+                    etwRecoveryRetryCount_++;
+                    if (etwRecoveryRetryCount_ >= 2) {
+                        // ★ etwState_ / operationMode_ は必ず同時更新する
+                        LOG_ALERT(L"ETW: Recovery failed twice (retryCount=" +
+                                  std::to_wstring(etwRecoveryRetryCount_) +
+                                  L") - transitioning to DEGRADED_ETW");
+                        etwState_      = EtwState::DEGRADED;
+                        operationMode_ = OperationMode::DEGRADED_ETW;
+                    } else {
+                        LOG_ALERT(L"ETW: Recovery failed - retry restart (#" +
+                                  std::to_wstring(etwRecoveryRetryCount_) + L")");
+                        RestartETW();
+                    }
+                } else {
+                    // 対象プロセス消滅 → 誤降格防止のため HEALTHY に戻す
+                    etwState_ = EtwState::HEALTHY;
                 }
-            );
-
-            if (restarted) {
-                LOG_INFO(L"ETW: Stall recovery restart succeeded");
-            } else {
-                operationMode_ = OperationMode::DEGRADED_ETW;
-                LOG_ERROR(L"ETW: Stall recovery restart failed - switching to DEGRADED mode");
             }
+            // else: 60s ウィンドウ内、待機継続
+        } else {
+            // ── Phase B: 障害検知・再起動トリガー ─────────────────────────────────
+            bool hotStall = (currentEvents >= ETW_MIN_EVENTS_FOR_CHECK &&
+                             currentEvents == lastEtwEventCount_);
 
-            lastEtwRestartTime_ = now;
+            // ★ now - lastXxx 差分は unsigned wrap-safe（GetTickCount64 は単調増加）
+            ULONGLONG etwAge = (lastEtwRestartTime_ > 0)
+                ? (now - lastEtwRestartTime_)
+                : (now - startTime_);
+            bool coldDead = (currentEvents == 0 && etwAge >= ETW_COLD_DEAD_THRESHOLD_MS);
+
+            if (lastEtwStallCheckTime_ > 0 &&
+                operationMode_ == OperationMode::NORMAL &&
+                (hotStall || coldDead) &&
+                (now - lastEtwRestartTime_) >= ETW_RESTART_COOLDOWN_MS &&
+                HasAnyTargetRunning()) {
+
+                ULONGLONG ageSeconds = etwAge / 1000;
+                if (coldDead) {
+                    LOG_ALERT(L"ETW: Cold-dead detected (count=0, age=" +
+                              std::to_wstring(ageSeconds) + L"s) - forcing restart");
+                } else {
+                    LOG_ALERT(L"ETW: Event stall detected (count=" +
+                              std::to_wstring(currentEvents) + L", age=" +
+                              std::to_wstring(ageSeconds) + L"s) - forcing restart");
+                }
+                RestartETW();
+            }
         }
 
         lastEtwStallCheckTime_ = now;
-        lastEtwEventCount_ = currentEvents;
+        lastEtwEventCount_     = currentEvents;
     }
 
-    // §9.18 #2: 周期 InitialScan（NORMAL モードでも 120 秒毎に発火）
-    // ETW silent drop で chrome 由来の OnProcessStart イベントだけが届かないケースを
-    // Toolhelp32 ベースの全列挙で補正する。DEGRADED_ETW モードは既存の
-    // InitialScanForDegradedMode (30s 周期) があるため対象外。
+    // §9.18 #2: 周期 InitialScan（NORMAL モードで 20 秒毎に発火）
+    // ETW silent drop / cold-dead 中の新規 Chrome プロセス取りこぼしを補正。
+    // EcoQoS 検知遅延上限を ETW 状態によらず 20s に抑制する。
+    // DEGRADED_ETW モードは InitialScanForDegradedMode (20s 周期) があるため対象外。
     if (operationMode_ == OperationMode::NORMAL &&
         now - lastFullScanTime_ >= PERIODIC_FULL_SCAN_INTERVAL) {
         InitialScan();

@@ -1,7 +1,7 @@
 # UnLeaf v1.1.0 Project Context
 
-> **最終更新**: 2026-04-27
-> **ステータス**: **v1.1.2 リリース済み + §9.18 追加実装** — Windows 11 Update (2026-04-26 以降) で発生した EcoQoS OFF 不全 (起動直後の検出失敗・時間経過での chrome 子プロセス EcoQoS ON 化) に対する SafetyNet round-robin 修正 + 周期 InitialScan + ETW stall 検知 + 安全装置の 4 系統補強を実装。VERSION 定数は `L"1.1.2"` のまま (ユーザー指示待ち)。
+> **最終更新**: 2026-04-28
+> **ステータス**: **v1.1.3 リリース済み** — §9.18 拡張: ETW cold-dead 検知 + 3 ステート復帰機械 (EtwState: HEALTHY/VERIFYING_RECOVERY/DEGRADED) + PERIODIC_FULL_SCAN_INTERVAL 60s→20s (根本要件対応: ETW 状態によらず新規 Chrome EcoQoS ≤20s 保証) + DEGRADED_SCAN_INTERVAL 30s→20s + ETW_COLD_DEAD_THRESHOLD_MS=240s + ETW_RECOVERY_VERIFY_MS=30s。ビルド警告ゼロ・151/151 PASS 確認済み。ドキュメント同期完了。
 
 ---
 
@@ -27,7 +27,7 @@
 | ビルド (Service / Manager / Tests) | ✅ 警告ゼロ Release (2026-04-03) |
 | ユニットテスト | ✅ 151/151 PASS (2026-04-03) |
 | §9.14 ServiceEngine メモリ増加対策 | ✅ 実装完了 (2026-04-03) |
-| §9.18 EcoQoS 検出補強 (SafetyNet/InitialScan/ETW stall) | ✅ 実装完了 (2026-04-27, 未リリース) |
+| §9.18 EcoQoS 検出補強 + ETW cold-dead 検知拡張 | ✅ 実装完了・v1.1.3 リリース済み (2026-04-28) |
 | v1.1.0 リリース (§9.00〜§9.09 メモリ安定化) | ✅ 完了 (2026-03-26) |
 | RegistryPolicyManager v5 (IFEO/PT split) | ✅ 実装完了 (2026-03-29) |
 | CPU 暴走対策 (SetEvent 責務分離 + スピン検知) | ✅ 実装完了 (2026-03-29) |
@@ -139,6 +139,13 @@ src/
 | `MAX_SAFETY_SCAN_PER_TICK` | 64 | SafetyNet ラウンドロビン 1 tick スキャン上限 (§9.14-E) |
 | `SAFETY_SCAN_BACKSTOP_MS` | 30,000 ms | SafetyNet 30 秒バックストップ (§9.14-E) |
 | `MAX_PENDING_QUEUE_SIZE` | 512 | PendingRemoval キュー上限 (§9.14-B, registry_manager.h) |
+| `PERIODIC_FULL_SCAN_INTERVAL` | 20,000 ms | NORMAL モード周期 InitialScan 間隔 (§9.18 #2) |
+| `DEGRADED_SCAN_INTERVAL` | 20,000 ms | DEGRADED_ETW モード InitialScanForDegradedMode 間隔 (§9.18) |
+| `ETW_STALL_CHECK_INTERVAL` | 30,000 ms | ETW stall/cold-dead チェック間隔 (§9.18 #4+#5) |
+| `ETW_RESTART_COOLDOWN_MS` | 180,000 ms | ETW 再起動クールダウン（Phase B のみ適用）(§9.18) |
+| `ETW_MIN_EVENTS_FOR_CHECK` | 100 | hot stall 判定の最小イベント数 (§9.18, cold dead パスには不使用) |
+| `ETW_COLD_DEAD_THRESHOLD_MS` | 240,000 ms | cold-dead 判定猶予（start/restart 後 eventCount=0 継続）(§9.18) |
+| `ETW_RECOVERY_VERIFY_MS` | 30,000 ms | RestartETW 後の eventCount 増加確認ウィンドウ (§9.18) |
 
 ---
 
@@ -220,7 +227,7 @@ ctest --test-dir build -C Release --output-on-failure
 | §9.14 | **ServiceEngine メモリ増加対策** (`engine_core.h/cpp`, `registry_manager.h/cpp`): 長期稼働での Working Set 線形増加を根絶する 8 件の修正を実装 (Rev.17 確定版)。① §9.14-C: `ScheduleDeferredVerification` — `std::exchange` + INVALID_HANDLE_VALUE で旧タイマーハンドル・コンテキストリークを根絶。② §9.14-B: `EnqueuePendingRemoval` — CAS ベース `pendingQueueSize_` 上限ガード + overflow 時 `pendingOverflowFlag_` 即セット → SafetyNet 10秒以内に `VerifyAndRepair` 即発火。`DrainPendingRemovals` — RAII `NodeGuard` (inline struct) で `fetch_sub + delete` をスコープ末尾で不可分保証、re-enqueue ループ（線形増加の主因）を廃止。③ §9.14-A: `enforcementQueue_` を `criticalQueue_ + nonCriticalQueue_`（各 std::deque）に分離。ETW_THREAD_START = NON-CRITICAL（SOFT_LIMIT でドロップ可）、他 = CRITICAL。TOTAL_LIMIT 絶対保証（nonCritical 追い出し → 最古 CRITICAL eviction）。`static_assert(TOTAL_LIMIT >= HARD_LIMIT)` でビルドレベル強制。`ENFORCEMENT_CRITICAL_PER_TICK=512` で CPU バースト防止。④ §9.14-E: `HandleSafetyNetCheck` — CRITICAL drop 差分検出 + 30秒バックストップ (ETW silent drop 対応) で `ScanRunningProcessesForMissedTargets` を発火。2パスラウンドロビン + `std::max` 単調増加保証により特定 PID の永続スキップを根絶。⑤ §9.14-H: `PerformPeriodicMaintenance` に 60秒 `[DIAG]` キュー診断ログ追加。⑥ §9.14-D: `ReconcileWithConfig` 先頭で `ifeoRefCount_.clear()` + policyMap_ 全走査再構築。⑦ §9.14-F: eviction ロジックを簡略化 — 常時最大 16件/挿入でキャップ超過を即処理。⑧ §9.14-G: `HandleEnforceError` — insert 直後に `SUPPRESSION_MAX_SIZE/2` を即キャップ（TTL クリーンアップ前の突発増大防止）。151/151 PASS 確認済み | 2026/04/03 |
 | §9.15 | **ProcessMonitor Hardening + CrashDump 対応** (`process_monitor.h/cpp`, `crash_handler.h/cpp` 新設, `service_main.cpp`, `config.h/cpp`, `engine_core.cpp`): ① `instance_` を `std::atomic<ProcessMonitor*>` に変更 (ABA 安全)。② Stop() に `stopMtx_` 導入 — CloseTrace → ControlTrace(STOP) → join の順序を保証し、join 外への mutex 解放で IPC スレッドブロックを最小化。③ IsHealthy() 完全再設計 — warmup 猶予期間 (120s)・starvation 検知 (lost event delta)・IsTraceSessionAliveLocked() (ControlTrace(QUERY) + キャッシュ 5s)。④ ImageName の unbounded read を bounded ループに修正 (AV 根絶)。⑤ Stop() のステップ経過時間ログ追加 (クラッシュ時フェーズ特定)。⑥ `crash_handler.cpp` 新設 — `SetUnhandledExceptionFilter` + `MiniDumpWriteDump` (ThreadInfo + IndirectlyReferencedMemory)。`[Logging] CrashDump=1` で有効化。dump 先: `<install>\crash\UnLeaf_Service_<timestamp>.dmp`。151/151 PASS 確認済み | 2026/04/10 |
 | §9.16 | **jobObjects_ ハンドルリーク修正 + ETW ヒープ断片化抑制** (`engine_core.h/cpp`, `process_monitor.cpp`): ① `RemoveTrackedProcess()` に `jobObjects_.erase(pid)` 追加 — プロセス終了時に Job Object ハンドルが `jobObjects_` に残留し続けるリークを根絶。trackedCs_ 解放後・jobCs_ 単独取得で実行し lock inversion (jobCs_→trackedCs_) を回避。② `ParseProcessStartEvent()` の TDH バッファを `thread_local std::vector<BYTE>` に変更 — イベント毎の heap alloc/free をゼロに削減しヒープ断片化を抑制。③ `wstringstream` → `to_wstring` 置換 (4箇所)。④ `engineControlThreadId_` を `std::atomic<DWORD>` 化 — DEBUG アサートの可視性保証を完全化。⑤ §9.17-B: `HeapOptimizeResources` を `EngineCore::Start()` に追加 — idle 時に未使用コミットページを積極 decommit (Win8.1+)。**根本原因**: v1.1.1 の 52時間稼働後クラッシュ (UnLeaf_Service_20260419_204543.dmp) は jobObjects_ stale エントリ蓄積によるハンドルテーブル枯渇が原因と分析。v1.1.2 で修正済み。Private Bytes 増加率: ~220KB/時 → 収束。Handle Count: 単調増加 → 収束。151/151 PASS 確認済み | 2026/04/20 |
-| §9.18 | **EcoQoS 検出補強 — SafetyNet round-robin 修正 + 周期 InitialScan + ETW stall 検知** (`engine_core.h/cpp`): Windows 11 Update (2026-04-26 以降) で発生した EcoQoS OFF 不全 (起動直後の検出失敗 + 時間経過での chrome 子プロセス EcoQoS ON 化) に対する 4 系統補強。**観測**: 2026-04-27 09:16-09:19 のログで `tracked=0 recovered=6409` 状態 → ログモード ON/OFF で `Config: Reloading` 発火 → 3秒後 chrome 12 PID が `[PHASE] -> STABLE` 復帰、を確認。**推定根本原因 (2 系統)**: ETW silent drop (chrome 由来 OnProcessStart のみ未着) + SafetyNet 高 PID 張り付き (`lastScannedPid_` 単調増加 + pass 2 不発条件)。**実装**: ① `ScanRunningProcessesForMissedTargets` 末尾で snapshot 完走時 (`scanned < maxScan`) に `lastScannedPid_=0` 強制リセット — 高 PID 短命プロセス発生時の pass 2 不発で chrome 低 PID が永続的に scan 対象外となる経路を遮断。② `PerformPeriodicMaintenance` に `PERIODIC_FULL_SCAN_INTERVAL=120000ms` の周期 `InitialScan()` 追加 (NORMAL モードでも発火) — ETW silent drop 時の最終防衛線。③ DIAG ログに `processMonitor_.GetEventCount()` を `etwEvents=%u` として追記 — silent drop の後追い検証可能化 (判定には使わない)。④ ETW stall 検知 (`ETW_STALL_CHECK_INTERVAL=60000ms` event delta=0 + `HasAnyTargetRunning()` true) で強制 Stop/Start を発火 — 既存 `IsHealthy()` の穴 (session alive だが events 流れない silent dead 状態) を補完。⑤ 安全装置: `ETW_RESTART_COOLDOWN_MS=180000ms` (3 分) restart 間隔下限 + `ETW_MIN_EVENTS_FOR_CHECK=100` 起動直後スキップ閾値。連続再起動回数制限は cooldown で代替し未実装。⑥ `HasAnyTargetRunning()` 軽量 Toolhelp32 ヘルパー新設 — `targetNameSet_` / `pathTargetFileNames_` のいずれかに 1 件マッチで早期 return、descendants 列挙・handle 開放なしの低コスト実装。**障害カバー時間**: PID 張り付き〜30s / ETW silent drop〜120s / ETW silent dead〜60s+3min cooldown / ETW 完全停止〜90s (既存 `IsHealthy`)。VERSION 定数変更なし (`L"1.1.2"` のまま、ユーザー指示待ち)。Release ビルド警告ゼロ。ctest 実行は WDAC ブロックのため build 成功で代替検証 (§8.42 既知問題) | 2026/04/27 |
+| §9.18 | **EcoQoS 根本要件保証 + ETW cold-dead 検知拡張** (`engine_core.h/cpp`): Windows 11 Update (2026-04-26 以降) での EcoQoS OFF 不全に対する拡張実装。**根本要件**: 「EcoQoS を OFF にする」は ETW 状態によらず保証すべき。`PERIODIC_FULL_SCAN_INTERVAL` 60s→**20s** で ETW 破損中でも新規 Chrome ≤20s 以内に検知。`DEGRADED_SCAN_INTERVAL` 30s→**20s**。**ETW cold-dead 検知**: 起動/再起動後 eventCount=0 が `ETW_COLD_DEAD_THRESHOLD_MS=240s` 継続 + HasAnyTargetRunning()=true で強制再起動。`IsHealthy()` は ControlTrace(QUERY) 成功なら healthy 誤判定し cold dead を見逃す盲点を補完。**EtwState 3ステート機械**: HEALTHY → VERIFYING_RECOVERY (RestartETW 後) → DEGRADED (ETW_RECOVERY_VERIFY_MS=30s タイムアウト×2回)。`etwVerificationBaseCount_` で Start() 直後の基準値を固定し hotStall 後の lastEtwEventCount_ 汚染回避。`RestartETW()` ヘルパーで Stop/Sleep(50ms)/Start/state 更新を集約。HasAnyTargetRunning() に trackedProcesses_ fast path 追加。**障害カバー時間**: PID 張り付き〜30s / ETW silent drop〜20s / ETW cold dead〜240s+30s×2 / ETW hot stall〜30s+3min cooldown / ETW 完全停止〜90s。VERSION=`L"1.1.3"`。Release ビルド警告ゼロ・151/151 PASS 確認済み | 2026/04/28 |
 
 ---
 

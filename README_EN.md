@@ -333,12 +333,14 @@ UnLeaf/
 
 ## Changelog
 
-### v1.1.3 (2026-04-27)
+### v1.1.3 (2026-04-28)
 
-**ETW Monitoring Stability — EcoQoS OFF Regression Fix for Windows 11 Update**
-- `ScanRunningProcessesForMissedTargets`: force-reset `lastScannedPid_=0` on full-scan completion. Prevents the round-robin from pinning at the high-PID range and permanently missing early-launched chrome.exe
-- Added periodic `InitialScan()` every 120 s in NORMAL mode (`PERIODIC_FULL_SCAN_INTERVAL`). Final safety net against ETW silent drop; missed targets detected within at most 2 minutes
-- Added ETW stall detection: if the cumulative ETW event count has not increased for 60 s and a target process is running, `ProcessMonitor` is automatically restarted (3-minute cooldown). Detection window ≤ 60 s
+**ETW Monitoring Extended — EcoQoS Guarantee Regardless of ETW State (§9.18 expanded)**
+- `ScanRunningProcessesForMissedTargets`: force-reset `lastScannedPid_=0` on full-scan completion. Prevents the round-robin from pinning at high-PID range and permanently missing early-launched chrome.exe
+- `PERIODIC_FULL_SCAN_INTERVAL` 60 s → **20 s**: Root-requirement fix — new Chrome processes are detected within ≤ 20 s regardless of ETW state, including during cold-dead window
+- `DEGRADED_SCAN_INTERVAL` 30 s → **20 s**: Reduces detection delay in `DEGRADED_ETW` mode
+- **ETW cold-dead detection added**: if eventCount remains 0 for 240 s after service start or last restart (and targets are running), `ProcessMonitor` is force-restarted. Compensates for `IsHealthy()` blind spot where `ControlTrace(QUERY)` succeeds but no events are delivered
+- **`EtwState` 3-state machine** (`HEALTHY` / `VERIFYING_RECOVERY` / `DEGRADED`): after restart, confirms eventCount increase within 30 s. Up to 2 retries before `DEGRADED_ETW` transition
 - Extended `[DIAG]` diagnostic log with `etwEvents=N` field for post-hoc ETW delivery health verification
 
 ### v1.1.2 (2026-04-11)

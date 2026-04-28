@@ -417,6 +417,11 @@ private:
     // pathTargetFileNames_. No descendant collection, no policy work.
     bool HasAnyTargetRunning() const;
 
+    // §9.18: ETW restart helper — Stop / Sleep(50ms) / Start / state update.
+    // Sets etwState_ = VERIFYING_RECOVERY (Start success) or DEGRADED (Start failure).
+    // ★ etwState_ と operationMode_ は常に同時更新する。
+    bool RestartETW();
+
     // Check if parent is being tracked
     bool IsTrackedParent(DWORD parentPid) const;
 
@@ -548,6 +553,14 @@ private:
     ULONGLONG lastEtwRestartTime_     = 0;
     uint32_t  lastEtwEventCount_      = 0;
 
+    // §9.18: ETW 3-state health machine
+    // HEALTHY: 通常監視。VERIFYING_RECOVERY: 再起動後の復帰確認中。DEGRADED: ETW 恒久障害。
+    enum class EtwState { HEALTHY, VERIFYING_RECOVERY, DEGRADED };
+    EtwState  etwState_                       = EtwState::HEALTHY;
+    uint32_t  etwRecoveryRetryCount_          = 0;    // 復帰失敗回数（2回でDEGRADED）
+    ULONGLONG etwRestartVerificationDeadline_ = 0;    // 0=検証待ちなし, >0=確認デッドライン
+    uint32_t  etwVerificationBaseCount_       = 0;    // Start() 直後の eventCount 固定ベース
+
     // Last degraded mode scan time
     ULONGLONG lastDegradedScanTime_;
 
@@ -666,7 +679,7 @@ private:
     static constexpr ULONGLONG ETW_HEALTH_CHECK_INTERVAL = 30000; // ETW health check
 
     // DEGRADED_ETW mode: Fallback scan interval
-    static constexpr ULONGLONG DEGRADED_SCAN_INTERVAL = 30000;   // 30s fallback scan
+    static constexpr ULONGLONG DEGRADED_SCAN_INTERVAL = 20000;   // 20s fallback scan
 
     // Process liveness check interval (zombie TrackedProcess cleanup)
     static constexpr ULONGLONG LIVENESS_CHECK_INTERVAL = 60000;  // 60s
@@ -722,18 +735,25 @@ private:
     static constexpr ULONGLONG SAFETY_SCAN_BACKSTOP_MS = 30ULL * 1000;
 
     // §9.18: 周期 InitialScan + ETW stall 検知パラメータ
-    // PERIODIC_FULL_SCAN_INTERVAL: NORMAL モードで 60 秒毎に InitialScan を発火し
-    //   ETW silent drop を補正。SafetyNet (#1 PID リセット) が 30〜50 秒で全 PID をカバーするため
-    //   InitialScan は ETW 欠損時の descendant 追跡強制補完として 60 秒で十分機能する。
+    // PERIODIC_FULL_SCAN_INTERVAL: NORMAL モードで 20 秒毎に InitialScan を発火し ETW silent drop を補正。EcoQoS 検知遅延上限を 20s に抑制する。
     // ETW_STALL_CHECK_INTERVAL: 30 秒間隔で ETW total event count delta を監視。
-    //   10 秒は idle 状態（低負荷・スリープ復帰直後）での正常無イベント期間と区別できず誤検知リスクが高い。
-    //   30 秒は最大 +20 秒の検知遅延と引き換えにノイズを低減し、UX とのバランスを取る。
     // ETW_RESTART_COOLDOWN_MS: stall 検知 → restart の最短間隔（無限ループ防止）。
-    // ETW_MIN_EVENTS_FOR_CHECK: サービス起動直後の偽陽性回避閾値。
-    static constexpr ULONGLONG PERIODIC_FULL_SCAN_INTERVAL = 60000;   // 60 秒
+    // ETW_MIN_EVENTS_FOR_CHECK: hot stall パス専用の誤検知防止閾値（cold dead パスには不要）。
+    // ETW_COLD_DEAD_THRESHOLD_MS: 起動/再起動後 eventCount=0 が続く cold dead 判定猶予。
+    //   IsHealthy() は lastEvent=0 でも ControlTrace(QUERY) 成功なら healthy を返すため
+    //   cold dead を見逃す。本閾値を超えても 0 イベント + 対象プロセス存在 → 強制再起動。
+    //   ETW_RESTART_COOLDOWN_MS より長く設定し cooldown ガードと競合させないこと。
+    // ETW_RECOVERY_VERIFY_MS: 再起動後に eventCount 増加を確認する猶予。
+    //   Start() 成功 ≠ イベント配送開始。本ウィンドウ内に増加なければ DEGRADED_ETW へ。
+    static constexpr ULONGLONG PERIODIC_FULL_SCAN_INTERVAL = 20000;   // 20 秒
     static constexpr ULONGLONG ETW_STALL_CHECK_INTERVAL    = 30000;   // 30 秒
     static constexpr ULONGLONG ETW_RESTART_COOLDOWN_MS     = 180000;  // 3 分
+    // COOLDOWN applies only to detection (Phase B); retries in VERIFYING_RECOVERY bypass it and are bounded by ETW_RECOVERY_VERIFY_MS × retry count.
+    static constexpr ULONGLONG ETW_COLD_DEAD_THRESHOLD_MS  = 240000;  // 4 分（COOLDOWN+60s余裕）
+    static constexpr ULONGLONG ETW_RECOVERY_VERIFY_MS      =  30000;  // 30s
     static constexpr uint32_t  ETW_MIN_EVENTS_FOR_CHECK    = 100;
+    static_assert(ETW_COLD_DEAD_THRESHOLD_MS > ETW_RESTART_COOLDOWN_MS,
+        "ETW_COLD_DEAD_THRESHOLD_MS must exceed COOLDOWN to avoid race at cold-dead detection");
 
     // Select eviction candidate from trackedProcesses_ (call while holding trackedCs_)
     // Priority: 1) invalid handle (zombie), 2) oldest phaseStartTime
