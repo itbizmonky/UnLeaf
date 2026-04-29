@@ -1657,7 +1657,7 @@ PerformPeriodicMaintenance(now)
   │   ├── jobObjects_.empty() → skip (ロック取得のみで判定)
   │   └── RefreshJobObjectPids() → 新しい子プロセスを検出
   │
-  ├── DEGRADED_ETW フォールバックスキャン (30s ごと)
+  ├── DEGRADED_ETW フォールバックスキャン (20s ごと)
   │   └── InitialScanForDegradedMode()
   │       Toolhelp32 で全プロセスをスキャン
   │       ターゲット名 or 追跡中の親 PID にマッチ → ApplyOptimization
@@ -1987,7 +1987,7 @@ PerformPeriodicMaintenance() (30s ごと)
   │
   └── operationMode_ == DEGRADED_ETW
       │
-      └── 30s ごとに InitialScanForDegradedMode()
+      └── 20s ごとに InitialScanForDegradedMode()
           (Toolhelp32 でプロセス一覧スキャン)
 ```
 
@@ -1996,7 +1996,7 @@ PerformPeriodicMaintenance() (30s ごと)
 | モード | 条件 | 動作 |
 |--------|------|------|
 | `NORMAL` | ETW 正常 | ETW イベント駆動 + Safety Net |
-| `DEGRADED_ETW` | ETW 障害 | 30s ごとの Toolhelp32 フォールバックスキャン |
+| `DEGRADED_ETW` | ETW 障害 | 20s ごとの Toolhelp32 フォールバックスキャン |
 | `DEGRADED_CONFIG` | 設定読み込み失敗 | 限定機能 (未使用) |
 
 ### 15.5 エラーログ抑制
