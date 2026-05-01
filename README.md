@@ -333,6 +333,13 @@ UnLeaf/
 
 ## 更新履歴 (Changelog)
 
+### v1.1.4 (2026-05-01)
+
+**ETW コールバック非ブロッキング化 — クラッシュ根本修正**
+- `OnProcessStart` が ETW コールバックスレッド上で `AssignProcessToJobObject` 等のブロッキング OS 呼び出しを実行し、`consumerThread_.join()` が EngineControlLoop を無期限ブロック → `INVALID_PROCESSTRACE_HANDLE` ACCESS VIOLATION クラッシュを引き起こしていた問題を根本修正
+- `OnProcessStart` を `EnqueueRequest(ETW_PROCESS_START)` のみ実行するよう変更。重処理はすべて `EngineControlLoop` 上で実行
+- `EnforcementRequest` 構造体に `parentPid` / `imageName` / `imagePath` フィールドを追加
+
 ### v1.1.3 (2026-04-28)
 
 **ETW 監視安定化拡張・EcoQoS 根本要件保証 (§9.18 拡張)**

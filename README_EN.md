@@ -333,6 +333,13 @@ UnLeaf/
 
 ## Changelog
 
+### v1.1.4 (2026-05-01)
+
+**ETW Callback Non-Blocking — Crash Root Fix**
+- Fixed ACCESS VIOLATION crash (INVALID_PROCESSTRACE_HANDLE) caused by blocking OS calls (`AssignProcessToJobObject` etc.) executing on the ETW consumer thread inside `OnProcessStart`, which could block `consumerThread_.join()` for up to 9 minutes and freeze `EngineControlLoop`
+- `OnProcessStart` now only calls `EnqueueRequest(ETW_PROCESS_START)` and returns immediately; all heavy work executes on `EngineControlLoop`
+- `EnforcementRequest` struct extended with `parentPid` / `imageName` / `imagePath` fields
+
 ### v1.1.3 (2026-04-28)
 
 **ETW Monitoring Extended — EcoQoS Guarantee Regardless of ETW State (§9.18 expanded)**

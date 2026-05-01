@@ -45,10 +45,17 @@ struct EnforcementRequest {
     DWORD pid;
     EnforcementRequestType type;
     uint8_t verifyStep;      // For DEFERRED_VERIFICATION: 1=200ms, 2=1s, 3=3s
+    DWORD parentPid;         // ETW_PROCESS_START: parent PID (0 if none)
+    std::wstring imageName;  // ETW_PROCESS_START: process image name
+    std::wstring imagePath;  // ETW_PROCESS_START: full image path
 
-    EnforcementRequest() : pid(0), type(EnforcementRequestType::ETW_PROCESS_START), verifyStep(0) {}
+    EnforcementRequest() : pid(0), type(EnforcementRequestType::ETW_PROCESS_START),
+                           verifyStep(0), parentPid(0) {}
     EnforcementRequest(DWORD p, EnforcementRequestType t, uint8_t step = 0)
-        : pid(p), type(t), verifyStep(step) {}
+        : pid(p), type(t), verifyStep(step), parentPid(0) {}
+    EnforcementRequest(DWORD p, DWORD parent, const std::wstring& name, const std::wstring& path)
+        : pid(p), type(EnforcementRequestType::ETW_PROCESS_START),
+          verifyStep(0), parentPid(parent), imageName(name), imagePath(path) {}
 };
 
 // Wait handle indices for WaitForMultipleObjects
@@ -473,7 +480,7 @@ private:
     // NON-CRITICAL: ETW_THREAD_START (high-frequency, droppable at SOFT_LIMIT)
     std::deque<EnforcementRequest> criticalQueue_;
     std::deque<EnforcementRequest> nonCriticalQueue_;
-    mutable CriticalSection queueCs_;
+    mutable CriticalSection queueCs_;   // ZERO-I/O, no blocking — deque ops only
     std::atomic<uint32_t> enforcementDropCount_{0};
     std::atomic<uint32_t> criticalDropCount_{0};    // §9.14-A: HARD_LIMIT 超過によるドロップ数
     std::atomic<uint32_t> criticalEvictCount_{0};   // §9.14-A: TOTAL_LIMIT eviction（rotation）数（drop とは区別）

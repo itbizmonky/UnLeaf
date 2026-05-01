@@ -588,27 +588,14 @@ void EngineCore::CleanupHandles() {
 void EngineCore::OnProcessStart(DWORD pid, DWORD parentPid,
                                  const std::wstring& imageName, const std::wstring& imagePath) {
     if (stopRequested_.load()) return;
+    if (IsCriticalProcess(imageName)) return;
 
-    // Skip critical processes
-    if (IsCriticalProcess(imageName)) {
-        return;
-    }
-
-    // Case 1: Parent is already tracked -> this is a child process
-    if (IsTrackedParent(parentPid)) {
-        ApplyOptimization(pid, imageName, true, parentPid, imagePath);
-        return;
-    }
-
-    // Case 2: This process name is a name-only target
-    if (IsTargetName(imageName)) {
-        ApplyOptimization(pid, imageName, false, 0, imagePath);
-        return;
-    }
-
-    // Case 3: Path-based target check (only when path targets are configured)
-    if (HasPathTargets()) {
-        TryApplyByPath(pid, imageName);
+    // ETW callback thread: no blocking OS calls allowed.
+    // IsTargetName/IsTrackedParent/HasPathTargets are atomic/read-only (μs).
+    // Heavy work (OpenProcess, job objects, etc.) is deferred to EngineControlLoop.
+    bool isTarget = IsTargetName(imageName) || IsTrackedParent(parentPid) || HasPathTargets();
+    if (isTarget) {
+        EnqueueRequest(EnforcementRequest(pid, parentPid, imageName, imagePath));
     }
 }
 
@@ -877,6 +864,20 @@ void EngineCore::ProcessEnforcementQueue() {
 
 // Dispatch a single enforcement request
 void EngineCore::DispatchEnforcementRequest(const EnforcementRequest& req) {
+    // ETW_PROCESS_START: new process detected — not yet in trackedProcesses_.
+    // ApplyOptimization acquires trackedCs_ internally; call outside any lock.
+    if (req.type == EnforcementRequestType::ETW_PROCESS_START) {
+        if (stopRequested_.load()) return;
+        if (IsTrackedParent(req.parentPid)) {
+            ApplyOptimization(req.pid, req.imageName, true, req.parentPid, req.imagePath);
+        } else if (IsTargetName(req.imageName)) {
+            ApplyOptimization(req.pid, req.imageName, false, 0, req.imagePath);
+        } else if (HasPathTargets()) {
+            TryApplyByPath(req.pid, req.imageName);
+        }
+        return;
+    }
+
     // Accumulators for timer cleanup: filled inside lock, deleted outside lock
     // (DeleteTimerQueueTimer(INVALID_HANDLE_VALUE) must not be called while holding trackedCs_)
     std::vector<HANDLE>               timersToDelete;

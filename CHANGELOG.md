@@ -4,6 +4,19 @@ All notable changes to UnLeaf will be documented in this file.
 
 ---
 
+## [1.1.4] - 2026-05-01
+
+### Fixed
+- **ETW callback blocking crash (ACCESS VIOLATION — INVALID_PROCESSTRACE_HANDLE)**: `OnProcessStart` was directly calling `ApplyOptimization` on the ETW consumer thread, causing `AssignProcessToJobObject` (and other OS calls) to block for up to 9 minutes when Chrome's sandbox job object management competed with UnLeaf's job assignment. This blocked `consumerThread_.join()`, which in turn blocked `EngineControlLoop`. On the second ETW restart, the stale `INVALID_PROCESSTRACE_HANDLE` value was dereferenced, producing an ACCESS VIOLATION at RVA 0xFA11. Root fix: `OnProcessStart` now enqueues an `ETW_PROCESS_START` request and returns immediately; all heavy OS calls are executed on `EngineControlLoop`
+
+### Changed
+- `OnProcessStart`: replaced direct `ApplyOptimization` call with `EnqueueRequest(ETW_PROCESS_START)`. ETW callback thread now performs only atomic/read-only checks (`IsTargetName`, `IsTrackedParent`, `HasPathTargets`) and returns within μs
+- `EnforcementRequest` struct: added `parentPid`, `imageName`, `imagePath` fields and an `ETW_PROCESS_START`-specific constructor. Existing `(DWORD, EnforcementRequestType, uint8_t)` constructor unchanged
+- `DispatchEnforcementRequest`: added `ETW_PROCESS_START` branch before `trackedProcesses_.find`, handling new-process detection outside any lock (as `ApplyOptimization` acquires `trackedCs_` internally)
+- `queueCs_`: added design-contract comment `// ZERO-I/O, no blocking — deque ops only`
+
+---
+
 ## [1.1.3] - 2026-04-28
 
 ### Fixed
