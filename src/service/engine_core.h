@@ -503,6 +503,7 @@ private:
     std::atomic<uint32_t> totalViolations_;
     ULONGLONG lastStatsLogTime_;
     ULONGLONG lastDiagLogTime_;   // tracks DIAG_LOG_INTERVAL_MS cadence (independent of stats)
+    uint32_t  lastDiagLostCount_; // lostEventCount_ snapshot at previous DIAG tick (for delta)
     LARGE_INTEGER qpcFreq_;       // QueryPerformanceFrequency cache (initialized in Start())
 
     // Job Objects (rootPid -> JobObjectInfo)

@@ -332,6 +332,7 @@ void EngineCore::Start() {
     ULONGLONG now = GetTickCount64();
     lastStatsLogTime_ = now;
     lastDiagLogTime_ = now;
+    lastDiagLostCount_ = 0;
     QueryPerformanceFrequency(&qpcFreq_);
     lastEtwHealthCheck_ = now;
     lastJobQueryTime_ = now;
@@ -1893,7 +1894,10 @@ void EngineCore::PerformPeriodicMaintenance(ULONGLONG now) {
 
         // §9.18 #3: etwEvents（累計）を DIAG 出力に追加
         // ETW silent drop / stall 状態の後追い検証を可能にする。判定ロジックには使わない。
-        uint32_t  etwEvents = processMonitor_.GetEventCount();
+        uint32_t  etwEvents   = processMonitor_.GetEventCount();
+        uint32_t  etwLostNow  = processMonitor_.GetLostEventCount();
+        uint32_t  etwLostDelta = etwLostNow - lastDiagLostCount_;
+        lastDiagLostCount_ = etwLostNow;
         ULONGLONG lastEvtMs = processMonitor_.GetLastEventTime();
         // etwAge=never disambiguates "no event ever received" from "event just
         // arrived (age=0ms)". Numeric value ms-resolved when at least one event
@@ -1911,14 +1915,14 @@ void EngineCore::PerformPeriodicMaintenance(ULONGLONG now) {
         const wchar_t* modeStr = (operationMode_ == OperationMode::NORMAL)
                                  ? L"NORMAL" : L"DEGRADED_ETW";
 
-        wchar_t diagBuf[384];
+        wchar_t diagBuf[416];
         swprintf_s(diagBuf,
             L"[DIAG] wait(reg:%llu unreg:%llu fail:%llu delta:%lld) "
             L"tracked=%zu watchMap=%zu deferCtx=%zu errSup=%zu handles=%u "
-            L"etwEvents=%u etwAge=%s mode=%s",
+            L"etwEvents=%u etwLost=%u etwAge=%s mode=%s",
             regCnt, unregCnt, unregFail, waitDelta,
             trackedSz, watchMapSz, deferCtxCnt, errSupSz, handleCount,
-            etwEvents, etwAgeBuf, modeStr);
+            etwEvents, etwLostDelta, etwAgeBuf, modeStr);
         LOG_DEBUG(diagBuf);
 
         lastDiagLogTime_ = now;

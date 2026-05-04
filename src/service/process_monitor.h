@@ -88,7 +88,8 @@ private:
     std::atomic<ULONGLONG> lastEventTime_;    // Last event received timestamp
     std::atomic<ULONGLONG> startTime_;        // Session start timestamp (for warmup grace period)
     std::atomic<uint32_t> eventCount_;        // Total events received
-    std::atomic<uint32_t> lostEventCount_;    // ETW lost event count (buffer overflow indicator)
+    std::atomic<uint32_t>  lostEventCount_;    // ETW lost event count (buffer overflow indicator)
+    std::atomic<ULONGLONG> lastLostLogTime_;  // Last timestamp a lost-event DEBUG line was emitted (rate limiter)
     std::atomic<bool> sessionHealthy_;        // Session health flag
     // One-shot diagnostic: confirms callback delivery for the CURRENT Start() session.
     // Reset to false in Start() only after EnableTraceEx2 success, so the flag

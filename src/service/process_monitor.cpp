@@ -37,6 +37,7 @@ ProcessMonitor::ProcessMonitor()
     , startTime_(0)
     , eventCount_(0)
     , lostEventCount_(0)
+    , lastLostLogTime_(0)
     , sessionHealthy_(false)
     , lastCheckedLost_(0)
     , lastTraceCheckTime_(0)
@@ -63,6 +64,7 @@ bool ProcessMonitor::Start(ProcessStartCallback processCallback, ThreadStartCall
     // Reset session state for clean start (prevents false starvation after restart)
     eventCount_ = 0;
     lostEventCount_ = 0;
+    lastLostLogTime_ = 0;
     lastEventTime_ = 0;
     startTime_ = GetTickCount64();
     lastCheckedLost_ = 0;
@@ -291,7 +293,14 @@ void WINAPI ProcessMonitor::EventRecordCallback(PEVENT_RECORD pEvent) {
     // ETW uses Opcode EVENT_TRACE_TYPE_LOST_EVENT (0x20) to signal dropped events
     if (pEvent->EventHeader.EventDescriptor.Opcode == EVENT_TRACE_TYPE_LOST_EVENT) {
         uint32_t count = ++self->lostEventCount_;
-        LOG_DEBUG(L"[ETW] Lost event detected (buffer overflow). Total lost: " + std::to_wstring(count));
+        // Rate-limit to at most 1 log/60s — ~1/sec structural noise would otherwise
+        // flood DEBUG output and bury other diagnostics.
+        ULONGLONG now = GetTickCount64();
+        ULONGLONG lastLog = self->lastLostLogTime_.load(std::memory_order_relaxed);
+        if (now - lastLog >= 60000ULL) {
+            self->lastLostLogTime_.store(now, std::memory_order_relaxed);
+            LOG_DEBUG(L"[ETW] Lost event detected (buffer overflow). Total lost: " + std::to_wstring(count));
+        }
         return;
     }
 
