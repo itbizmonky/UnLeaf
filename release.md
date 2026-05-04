@@ -1,62 +1,53 @@
-# 🍃  UnLeaf v1.1.4 — ETW Callback Non-Blocking Fix
+# 🍃  UnLeaf v1.1.5 — ETW Stability Improvements (Windows 11 Build 26200)
 
-Windows 11 / 10 向けゼロオーバーヘッド EcoQoS オプティマイザ **UnLeaf** のパッチリリース **v1.1.4** をリリースしました。
-サービス実行中に発生した **ACCESS VIOLATION クラッシュ**（Chrome 起動時に `AssignProcessToJobObject` が ETW コールバックスレッドをブロックし、最大 9 分の EngineControlLoop 停止 → `INVALID_PROCESSTRACE_HANDLE` 参照）を根本修正します。
+Windows 11 / 10 向けゼロオーバーヘッド EcoQoS オプティマイザ **UnLeaf** のパッチリリース **v1.1.5** をリリースしました。
+Windows 11 Build 26200 環境で発生していた **ETW デリバリ完全停止バグ** (`MatchAnyKeyword=0x30` が `keyword=0` イベントを無音で除外し `DEGRADED_ETW` 遷移を引き起こす) を根本修正します。
 
 - README: [English](README_EN.md) | [日本語](README.md)
 - 詳細な仕様はこちら: [Technical specifications](docs/Engine_Specification.md)
 
 ---
 
-## ⚡ v1.1.4 の変更点 (What's New)
+## ⚡ v1.1.5 の変更点 (What's New)
 
-### 🐛 ETW コールバック非ブロッキング化 — クラッシュ根本修正
+### 🐛 ETW MatchAnyKeyword=0x30 根本修正
 
 #### 障害の概要
 
 | 項目 | 内容 |
 |------|------|
-| 例外コード | `0xC0000005` ACCESS_VIOLATION (READ) |
-| フォールトアドレス | `0xFFFFFFFFFFFFFFFF` = `INVALID_PROCESSTRACE_HANDLE` |
-| 影響バージョン | v1.1.3 以前 |
-| 再現条件 | Chrome 起動時に ETW 再起動が重なった場合 |
+| 症状 | ETW コールバックが一切着火せず、起動後 240 秒で `DEGRADED_ETW` に恒久遷移 |
+| 影響環境 | Windows 11 Build 26200 (確認済み) |
+| 影響バージョン | v1.1.4 以前 |
+| 再現条件 | 常時発生 (設定・構成によらず) |
 
 #### 根本原因
 
-`OnProcessStart` (ETW コールバック) が `ApplyOptimization` を同期呼び出しし、`AssignProcessToJobObject` が Chrome の sandbox job object 管理と競合してカーネルレベルで長時間待機。ブロック中は `consumerThread_.join()` が `EngineControlLoop` を完全停止させ、2 回目の ETW 再起動時に `INVALID_PROCESSTRACE_HANDLE` がポインタとして参照されクラッシュ。
+`Microsoft-Windows-Kernel-Process` プロバイダは Windows 11 Build 26200 において、すべてのイベントを **`keyword=0`** で発行する。ETW のフィルタリング仕様では `MatchAnyKeyword=0x30` と `keyword=0` の AND が常に 0 になるため、非ゼロの `MatchAnyKeyword` を指定すると全イベントが無音で除外される。従来の `MatchAnyKeyword=0x30` (PROCESS|THREAD) はこの仕様に抵触しており、`DEGRADED_ETW` 遷移の真の根本原因となっていた。
 
 #### 修正内容
 
 | # | 変更 |
 |---|------|
-| 1 | **`OnProcessStart` 非ブロッキング化** — `ApplyOptimization` 直接呼び出しを廃止。`IsTargetName` / `IsTrackedParent` / `HasPathTargets` の軽量フィルタのみ実行し、`EnqueueRequest(ETW_PROCESS_START)` でキューに積んで即リターン。ブロッキング OS 呼び出し (`OpenProcess`, `CreateJobObject`, `AssignProcessToJobObject` 等) はすべて `EngineControlLoop` 上で実行 |
-| 2 | **`EnforcementRequest` 構造体拡張** — `parentPid` / `imageName` / `imagePath` フィールドを追加。`ETW_PROCESS_START` 専用コンストラクタを追加。既存コンストラクタとの互換性を維持 |
-| 3 | **`DispatchEnforcementRequest` に `ETW_PROCESS_START` 分岐追加** — `trackedProcesses_.find` の前（lock 外）で `ETW_PROCESS_START` を処理。`IsTrackedParent` / `IsTargetName` / `HasPathTargets` を再チェックし `ApplyOptimization` / `TryApplyByPath` を呼ぶ |
-| 4 | **`queueCs_` 設計契約コメント** — `// ZERO-I/O, no blocking — deque ops only` を宣言に付与し、将来の設計逸脱を防止 |
-
-### 🔧 ETW 安定性改善 (Windows 11 Build 26200)
-
-| # | 変更 |
-|---|------|
-| 5 | **`MatchAnyKeyword=0x30` バグ修正** — `Microsoft-Windows-Kernel-Process` プロバイダが `keyword=0` でイベントを発行するため、`MatchAnyKeyword=0x30` (PROCESS\|THREAD) がすべてのコールバックを無音でブロックしていた。`MatchAnyKeyword=0` に変更し ETW デリバリを回復 |
-| 6 | **ETW バッファ定数拡張** — `ETW_BUFFER_SIZE_KB` 64→128 KB、`ETW_MIN_BUFFERS` 4→8、`ETW_MAX_BUFFERS` 32→64 (`MatchAnyKeyword=0` による高イベント量 ~1,200/sec への対応) |
-| 7 | **ConsumerThread 診断ログ追加** — `OpenTraceW` ハンドル値、`ProcessTrace` 入退出・経過時間、初回コールバック受信確認、初回イベント keyword/eventId を記録 |
-| 8 | **`ResolveProcessPath` ノイズ抑制** — `error=31` (システムプロセス) / `error=87` (終了済みプロセス) を `QueryFullProcessImageNameW` デバッグ出力から除外 |
-| 9 | **ログレベル正規化** — `OpenTraceW handle=` / `ProcessTrace enter/exit` を ALERT→INFO に、`Lost event detected` を ALERT→DEBUG に変更 (このプラットフォームでは約 1/sec の構造的ノイズと確認済み) |
+| 1 | **`MatchAnyKeyword=0` に変更** — すべての keyword 値を通過させ、コールバック着火を回復 |
+| 2 | **ETW バッファ定数拡張** — `ETW_BUFFER_SIZE_KB` 64→128 KB、`ETW_MIN_BUFFERS` 4→8、`ETW_MAX_BUFFERS` 32→64。`MatchAnyKeyword=0` による高イベント量 (~1,200/sec) に対応 |
+| 3 | **ConsumerThread 診断ログ追加** — `OpenTraceW` ハンドル値、`ProcessTrace` 入退出・経過時間 (ms)、初回コールバック受信確認、初回イベント keyword/eventId を記録。ETW 障害の事後分析を支援 |
+| 4 | **`ResolveProcessPath` ノイズ抑制** — `error=31` (システムプロセス) / `error=87` (終了済みプロセス) をデバッグ出力から除外 |
+| 5 | **ログレベル正規化** — `OpenTraceW handle=` / `ProcessTrace enter/exit` を ALERT→INFO に、`Lost event detected` を ALERT→DEBUG に変更 (~1/sec の構造的ノイズと確認済み) |
 
 ---
 
 ## 🛡️ 修正効果
 
-| 障害ケース | v1.1.3 | v1.1.4 |
+| 障害ケース | v1.1.4 | v1.1.5 |
 |---|---|---|
-| Chrome 起動時 `AssignProcessToJobObject` ブロック | EngineControlLoop 停止 → クラッシュ | ETW callback 即リターン、EngineControlLoop 継続 |
-| ETW 再起動中の `INVALID_PROCESSTRACE_HANDLE` 参照 | ACCESS VIOLATION | 発生しない (callback が blocking しない) |
-| `consumerThread_.join()` 無期限ブロック | 発生 (最大 9 分) | 発生しない |
+| Windows 11 Build 26200 での ETW コールバック着火 | ゼロ (全除外) | 正常 (~1,200/sec) |
+| 起動後 240 秒での `DEGRADED_ETW` 遷移 | 常時発生 | 発生しない |
+| `DEGRADED_ETW` 中の EcoQoS 検知遅延 | ≤20 秒 (SafetyNet) | ≒0 ms (ETW リアルタイム) |
 
 ---
 
-## 📊 EcoQoS 検知遅延保証 (v1.1.4 時点)
+## 📊 EcoQoS 検知遅延保証 (v1.1.5 時点)
 
 | ETW 状態 | 新規 Chrome EcoQoS 最大遅延 |
 |---------|---------------------------|
@@ -95,7 +86,7 @@ UnLeaf は、**「コアエンジン (Service) は完全なオープンソース
 ソースコードをビルドする必要はありません。今すぐ使い始めることができます。
 
 1. [Releases](../../releases) ページにアクセスします。
-2. 最新の `UnLeaf_v1.x.x.zip` をダウンロードし、任意のフォルダに解凍します。
+2. 最新の `UnLeaf_v1.1.5.zip` をダウンロードし、任意のフォルダに解凍します。
 3. `UnLeaf_Manager.exe` を実行します (初回のみ、サービス登録のために管理者権限の確認ダイアログが出ます)。
 4. 最適化したいアプリ (例: `discord.exe`, `obs64.exe`) をリストに追加し、「Start Service」を押すだけです。
 5. あとは Manager を閉じても、静かなエンジンが常にあなたの PC を守り続けます。

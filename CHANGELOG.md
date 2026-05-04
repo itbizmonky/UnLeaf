@@ -4,22 +4,30 @@ All notable changes to UnLeaf will be documented in this file.
 
 ---
 
-## [1.1.4] - 2026-05-01 / 2026-05-04
+## [1.1.5] - 2026-05-04
+
+### Fixed
+- **ETW `MatchAnyKeyword=0x30` excluding all events on Windows 11 Build 26200**: `Microsoft-Windows-Kernel-Process` provider emits events with `keyword=0` on this build; any non-zero `MatchAnyKeyword` (including `0x30` PROCESS|THREAD) silently excluded all callbacks, causing persistent `DEGRADED_ETW` mode. Changed to `MatchAnyKeyword=0` to restore normal ETW delivery
+
+### Changed
+- ETW buffer constants expanded: `ETW_BUFFER_SIZE_KB` 64→128 KB, `ETW_MIN_BUFFERS` 4→8, `ETW_MAX_BUFFERS` 32→64 (accommodates high event volume with `MatchAnyKeyword=0`)
+- ConsumerThread diagnostic logging added: `OpenTraceW` handle value, `ProcessTrace` enter/exit with elapsed ms, first-callback receipt confirmation, first event keyword/eventId — all aid post-hoc ETW failure analysis
+- `firstCallbackLogged_` per-session atomic flag: reset to `false` in `Start()` after `EnableTraceEx2` succeeds; accurately tracks whether the current session has delivered any callback
+- `ResolveProcessPath`: suppressed `error=31` (ERROR_GEN_FAILURE, system processes) and `error=87` (ERROR_INVALID_PARAMETER, already-exited processes) from `QueryFullProcessImageNameW` debug output; unknown errors only
+- Log level normalization: `OpenTraceW handle=` / `ProcessTrace enter` / `ProcessTrace exited` downgraded ALERT→INFO; `Lost event detected` downgraded ALERT→DEBUG (confirmed structural noise at ~1/sec on this platform)
+
+---
+
+## [1.1.4] - 2026-05-01
 
 ### Fixed
 - **ETW callback blocking crash (ACCESS VIOLATION — INVALID_PROCESSTRACE_HANDLE)**: `OnProcessStart` was directly calling `ApplyOptimization` on the ETW consumer thread, causing `AssignProcessToJobObject` (and other OS calls) to block for up to 9 minutes when Chrome's sandbox job object management competed with UnLeaf's job assignment. This blocked `consumerThread_.join()`, which in turn blocked `EngineControlLoop`. On the second ETW restart, the stale `INVALID_PROCESSTRACE_HANDLE` value was dereferenced, producing an ACCESS VIOLATION at RVA 0xFA11. Root fix: `OnProcessStart` now enqueues an `ETW_PROCESS_START` request and returns immediately; all heavy OS calls are executed on `EngineControlLoop`
-- **ETW `MatchAnyKeyword=0x30` excluding all events on Windows 11 Build 26200**: `Microsoft-Windows-Kernel-Process` provider emits events with `keyword=0` on this build; any non-zero `MatchAnyKeyword` (including `0x30` PROCESS|THREAD) silently excluded all callbacks, causing persistent `DEGRADED_ETW` mode. Changed to `MatchAnyKeyword=0` to restore normal ETW delivery
 
 ### Changed
 - `OnProcessStart`: replaced direct `ApplyOptimization` call with `EnqueueRequest(ETW_PROCESS_START)`. ETW callback thread now performs only atomic/read-only checks (`IsTargetName`, `IsTrackedParent`, `HasPathTargets`) and returns within μs
 - `EnforcementRequest` struct: added `parentPid`, `imageName`, `imagePath` fields and an `ETW_PROCESS_START`-specific constructor. Existing `(DWORD, EnforcementRequestType, uint8_t)` constructor unchanged
 - `DispatchEnforcementRequest`: added `ETW_PROCESS_START` branch before `trackedProcesses_.find`, handling new-process detection outside any lock (as `ApplyOptimization` acquires `trackedCs_` internally)
 - `queueCs_`: added design-contract comment `// ZERO-I/O, no blocking — deque ops only`
-- ETW buffer constants expanded: `ETW_BUFFER_SIZE_KB` 64→128 KB, `ETW_MIN_BUFFERS` 4→8, `ETW_MAX_BUFFERS` 32→64 (accommodates high event volume with `MatchAnyKeyword=0`)
-- ConsumerThread diagnostic logging added: `OpenTraceW` handle value, `ProcessTrace` enter/exit with elapsed ms, first-callback receipt confirmation, first event keyword/eventId — all aid post-hoc ETW failure analysis
-- `firstCallbackLogged_` per-session atomic flag: reset to `false` in `Start()` after `EnableTraceEx2` succeeds; accurately tracks whether the current session has delivered any callback
-- `ResolveProcessPath`: suppressed `error=31` (ERROR_GEN_FAILURE, system processes) and `error=87` (ERROR_INVALID_PARAMETER, already-exited processes) from `QueryFullProcessImageNameW` debug output; unknown errors only
-- Log level normalization: `OpenTraceW handle=` / `ProcessTrace enter` / `ProcessTrace exited` downgraded ALERT→INFO; `Lost event detected` downgraded ALERT→DEBUG (confirmed structural noise at ~1/sec on this platform)
 
 ---
 

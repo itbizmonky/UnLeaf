@@ -333,12 +333,7 @@ UnLeaf/
 
 ## 更新履歴 (Changelog)
 
-### v1.1.4 (2026-05-01 / 2026-05-04)
-
-**ETW コールバック非ブロッキング化 — クラッシュ根本修正**
-- `OnProcessStart` が ETW コールバックスレッド上で `AssignProcessToJobObject` 等のブロッキング OS 呼び出しを実行し、`consumerThread_.join()` が EngineControlLoop を無期限ブロック → `INVALID_PROCESSTRACE_HANDLE` ACCESS VIOLATION クラッシュを引き起こしていた問題を根本修正
-- `OnProcessStart` を `EnqueueRequest(ETW_PROCESS_START)` のみ実行するよう変更。重処理はすべて `EngineControlLoop` 上で実行
-- `EnforcementRequest` 構造体に `parentPid` / `imageName` / `imagePath` フィールドを追加
+### v1.1.5 (2026-05-04)
 
 **ETW 安定性改善 (Windows 11 Build 26200)**
 - `MatchAnyKeyword=0x30` バグ修正: `Microsoft-Windows-Kernel-Process` プロバイダが `keyword=0` でイベントを発行するため、非ゼロの `MatchAnyKeyword` がすべてのコールバックを無音でブロックしていた問題を修正。`MatchAnyKeyword=0` に変更し ETW デリバリを回復
@@ -346,6 +341,13 @@ UnLeaf/
 - ConsumerThread 診断ログ追加: `OpenTraceW` ハンドル値、`ProcessTrace` 入退出・経過時間、初回コールバック受信確認、初回イベント keyword/eventId を記録
 - `ResolveProcessPath`: `QueryFullProcessImageNameW` の `error=31` (システムプロセス) / `error=87` (終了済みプロセス) をデバッグ出力から抑制
 - ログレベル正規化: `OpenTraceW handle=` / `ProcessTrace enter/exit` を ALERT→INFO に、`Lost event detected` を ALERT→DEBUG に変更 (このプラットフォームでは約 1/sec の構造的ノイズと確認済み)
+
+### v1.1.4 (2026-05-01)
+
+**ETW コールバック非ブロッキング化 — クラッシュ根本修正**
+- `OnProcessStart` が ETW コールバックスレッド上で `AssignProcessToJobObject` 等のブロッキング OS 呼び出しを実行し、`consumerThread_.join()` が EngineControlLoop を無期限ブロック → `INVALID_PROCESSTRACE_HANDLE` ACCESS VIOLATION クラッシュを引き起こしていた問題を根本修正
+- `OnProcessStart` を `EnqueueRequest(ETW_PROCESS_START)` のみ実行するよう変更。重処理はすべて `EngineControlLoop` 上で実行
+- `EnforcementRequest` 構造体に `parentPid` / `imageName` / `imagePath` フィールドを追加
 
 ### v1.1.3 (2026-04-28)
 
