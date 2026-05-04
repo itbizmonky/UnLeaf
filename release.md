@@ -34,6 +34,16 @@ Windows 11 / 10 向けゼロオーバーヘッド EcoQoS オプティマイザ *
 | 3 | **`DispatchEnforcementRequest` に `ETW_PROCESS_START` 分岐追加** — `trackedProcesses_.find` の前（lock 外）で `ETW_PROCESS_START` を処理。`IsTrackedParent` / `IsTargetName` / `HasPathTargets` を再チェックし `ApplyOptimization` / `TryApplyByPath` を呼ぶ |
 | 4 | **`queueCs_` 設計契約コメント** — `// ZERO-I/O, no blocking — deque ops only` を宣言に付与し、将来の設計逸脱を防止 |
 
+### 🔧 ETW 安定性改善 (Windows 11 Build 26200)
+
+| # | 変更 |
+|---|------|
+| 5 | **`MatchAnyKeyword=0x30` バグ修正** — `Microsoft-Windows-Kernel-Process` プロバイダが `keyword=0` でイベントを発行するため、`MatchAnyKeyword=0x30` (PROCESS\|THREAD) がすべてのコールバックを無音でブロックしていた。`MatchAnyKeyword=0` に変更し ETW デリバリを回復 |
+| 6 | **ETW バッファ定数拡張** — `ETW_BUFFER_SIZE_KB` 64→128 KB、`ETW_MIN_BUFFERS` 4→8、`ETW_MAX_BUFFERS` 32→64 (`MatchAnyKeyword=0` による高イベント量 ~1,200/sec への対応) |
+| 7 | **ConsumerThread 診断ログ追加** — `OpenTraceW` ハンドル値、`ProcessTrace` 入退出・経過時間、初回コールバック受信確認、初回イベント keyword/eventId を記録 |
+| 8 | **`ResolveProcessPath` ノイズ抑制** — `error=31` (システムプロセス) / `error=87` (終了済みプロセス) を `QueryFullProcessImageNameW` デバッグ出力から除外 |
+| 9 | **ログレベル正規化** — `OpenTraceW handle=` / `ProcessTrace enter/exit` を ALERT→INFO に、`Lost event detected` を ALERT→DEBUG に変更 (このプラットフォームでは約 1/sec の構造的ノイズと確認済み) |
+
 ---
 
 ## 🛡️ 修正効果

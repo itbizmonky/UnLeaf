@@ -90,6 +90,10 @@ private:
     std::atomic<uint32_t> eventCount_;        // Total events received
     std::atomic<uint32_t> lostEventCount_;    // ETW lost event count (buffer overflow indicator)
     std::atomic<bool> sessionHealthy_;        // Session health flag
+    // One-shot diagnostic: confirms callback delivery for the CURRENT Start() session.
+    // Reset to false in Start() only after EnableTraceEx2 success, so the flag
+    // semantically tracks "did this viable session deliver a callback?".
+    std::atomic<bool> firstCallbackLogged_{false};
 
     // Health check state (mutable: updated by const IsHealthy/IsTraceSessionAliveLocked)
     // All fields below are protected by stopMtx_.
@@ -121,9 +125,9 @@ private:
 
     // ETW session buffer configuration
     // BufferSize must be a multiple of 4KB
-    static constexpr ULONG ETW_BUFFER_SIZE_KB = 64;   // KB per buffer
-    static constexpr ULONG ETW_MIN_BUFFERS    = 4;    // Minimum buffer count
-    static constexpr ULONG ETW_MAX_BUFFERS    = 32;   // Maximum buffer count (Microsoft: CPU*2)
+    static constexpr ULONG ETW_BUFFER_SIZE_KB = 128;  // KB per buffer (was 64; enlarged for MatchAnyKeyword=0 event volume)
+    static constexpr ULONG ETW_MIN_BUFFERS    = 8;    // Minimum buffer count (was 4)
+    static constexpr ULONG ETW_MAX_BUFFERS    = 64;   // Maximum buffer count (was 32; max 8MB total)
     static constexpr ULONG ETW_FLUSH_TIMER    = 0;    // 0 = disabled; real-time consumer pulls directly
 
     // Health check thresholds

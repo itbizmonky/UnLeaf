@@ -2,7 +2,6 @@
 
 #include "process_monitor.h"
 #include "../common/logger.h"
-#include <sstream>
 #include <tdh.h>
 
 // Fallback: EVENT_TRACE_TYPE_LOST_EVENT may not be defined in all SDK versions
@@ -92,26 +91,37 @@ bool ProcessMonitor::Start(ProcessStartCallback processCallback, ThreadStartCall
     // Start new trace session
     ULONG status = StartTraceW(&sessionHandle_, sessionName_.c_str(), properties);
     if (status != ERROR_SUCCESS) {
-        LOG_DEBUG(L"[ETW] Failed to start ETW session: " + std::to_wstring(status));
+        // status=5: ERROR_ACCESS_DENIED (insufficient privilege — typically not LocalSystem)
+        // status=183: ERROR_ALREADY_EXISTS (orphan session owned by another SID)
+        LOG_ALERT(L"[ETW] StartTraceW failed (status=" + std::to_wstring(status) +
+                  L") — likely insufficient privilege or session conflict");
         return false;
     }
 
-    // Enable the Kernel-Process provider
-    // Keywords 0x30 = WINEVENT_KEYWORD_PROCESS (0x10) | WINEVENT_KEYWORD_THREAD (0x20)
-    // Thread events allow event-driven detection of EcoQoS re-enablement triggers
+    // Enable the Kernel-Process provider.
+    // MatchAnyKeyword=0 required: events on Windows 11 26200 carry keyword=0,
+    // so any non-zero MatchAnyKeyword (including 0x30 PROCESS|THREAD) excluded all events.
+    // EventID filter temporarily disabled.
+    // Enabling EVENT_FILTER_TYPE_EVENT_ID caused zero delivered events after provider enable;
+    // root cause not yet isolated (provider support vs filter blob format).
+    // Accepted trade-off: non-matching EventIDs return from the callback immediately.
+    // Buffer overflow persists (~1 lost/sec), but functional impact has not been observed so far.
     status = EnableTraceEx2(
         sessionHandle_,
         &KernelProcessProviderGuid,
         EVENT_CONTROL_CODE_ENABLE_PROVIDER,
         TRACE_LEVEL_INFORMATION,
-        0x30,  // WINEVENT_KEYWORD_PROCESS | WINEVENT_KEYWORD_THREAD
+        0,  // MatchAnyKeyword=0: required (Windows 11 26200 events carry keyword=0)
         0,
         0,
         nullptr
     );
 
     if (status != ERROR_SUCCESS) {
-        LOG_DEBUG(L"[ETW] Failed to enable Kernel-Process provider: " + std::to_wstring(status));
+        // EnableTraceEx2 failure: provider attach rejected. Session was created
+        // but Kernel-Process provider subscription not established → no events flow.
+        LOG_ALERT(L"[ETW] EnableTraceEx2 failed (status=" + std::to_wstring(status) +
+                  L") — provider attach rejected, session will not deliver events");
 
         // Cleanup session
         ControlTraceW(sessionHandle_, nullptr, properties, EVENT_TRACE_CONTROL_STOP);
@@ -121,6 +131,14 @@ bool ProcessMonitor::Start(ProcessStartCallback processCallback, ThreadStartCall
 
     // Start consumer thread
     running_ = true;
+    // Reset per-session diagnostic flag immediately before launching the consumer
+    // thread. Visibility to the callback is guaranteed by the atomic release/
+    // acquire pairing alone: this release-store synchronizes-with the
+    // memory_order_acq_rel CAS in EventRecordCallback, regardless of which
+    // thread context dispatches the callback. The placement here is purely for
+    // semantic clarity ("did this Start session deliver a callback?"), not
+    // because thread-launch ordering is required for correctness.
+    firstCallbackLogged_.store(false, std::memory_order_release);
     consumerThread_ = std::thread(&ProcessMonitor::ConsumerThread, this);
 
     LOG_INFO(L"ETW: Process Monitor started");
@@ -205,26 +223,28 @@ void ProcessMonitor::ConsumerThread() {
 
     // Open trace
     traceHandle_ = OpenTraceW(&logfile);
+    // 戻り値を常に記録 — INVALID_PROCESSTRACE_HANDLE (64bit: 0xFFFFFFFFFFFFFFFF) か即判定可能にする
+    LOG_INFO(L"[ETW] OpenTraceW handle=" + std::to_wstring((uintptr_t)traceHandle_));
     if (traceHandle_ == INVALID_PROCESSTRACE_HANDLE) {
         DWORD error = GetLastError();
-        std::wstringstream ss;
-        ss << L"[ETW] OpenTrace failed (error=" << error << L")";
-        LOG_DEBUG(ss.str());
+        LOG_ALERT(L"[ETW] OpenTraceW failed (error=" + std::to_wstring(error)
+                  + L") — ConsumerThread cannot deliver events");
         sessionHealthy_ = false;
         running_ = false;
         return;
     }
 
     sessionHealthy_ = true;
-    lastEventTime_ = GetTickCount64();
 
     // Process events (blocks until trace is closed)
+    ULONGLONG enterMs = GetTickCount64();
+    LOG_INFO(L"[ETW] ProcessTrace enter");
     ULONG status = ProcessTrace(&traceHandle_, 1, nullptr, nullptr);
-
+    ULONGLONG elapsedMs = GetTickCount64() - enterMs;
+    // elapsed で「即 return」(consumer loop 問題) か「長時間ブロック後停止」(provider 側) かを切り分ける
+    LOG_INFO(L"[ETW] ProcessTrace exited status=" + std::to_wstring(status)
+             + L", elapsed=" + std::to_wstring(elapsedMs) + L"ms");
     if (status != ERROR_SUCCESS && status != ERROR_CANCELLED && !stopRequested_.load()) {
-        std::wstringstream ss;
-        ss << L"[ETW] ProcessTrace ended unexpectedly (status=" << status << L")";
-        LOG_DEBUG(ss.str());
         sessionHealthy_ = false;
     }
 
@@ -245,15 +265,36 @@ void WINAPI ProcessMonitor::EventRecordCallback(PEVENT_RECORD pEvent) {
         return;
     }
 
+    // Updated once per callback (after stopRequested drain exclusion) to record
+    // the last time the ETW session delivered any event, including overflow notices.
+    self->lastEventTime_ = GetTickCount64();
+
+    // One-shot per-session diagnostic: confirm callback delivery for the CURRENT
+    // Start() session. Member flag (not static local) so RestartETW() rearmaments
+    // re-enable the diagnostic for each new session. Placed after stopRequested
+    // check to avoid logging from the prior session's teardown drain. Placed
+    // before LOST_EVENT / provider filter so any callback type counts as proof
+    // of delivery.
+    bool expected = false;
+    if (self->firstCallbackLogged_.compare_exchange_strong(
+            expected, true, std::memory_order_acq_rel)) {
+        LOG_INFO(L"[ETW] First callback received — session is delivering events");
+        // Log keyword bits of first event to confirm whether MatchAnyKeyword=0 is
+        // permanently required (keyword=0 events are excluded by any non-zero mask).
+        wchar_t kwBuf[24];
+        swprintf_s(kwBuf, L"0x%016llX", pEvent->EventHeader.EventDescriptor.Keyword);
+        LOG_DEBUG(L"[ETW] First event: keyword=" + std::wstring(kwBuf)
+                  + L" eventId=" + std::to_wstring(pEvent->EventHeader.EventDescriptor.Id));
+    }
+
     // Detect ETW buffer overflow: lost event notification
     // ETW uses Opcode EVENT_TRACE_TYPE_LOST_EVENT (0x20) to signal dropped events
     if (pEvent->EventHeader.EventDescriptor.Opcode == EVENT_TRACE_TYPE_LOST_EVENT) {
         uint32_t count = ++self->lostEventCount_;
-        LOG_ALERT(L"[ETW] Lost event detected (buffer overflow). Total lost: " + std::to_wstring(count));
+        LOG_DEBUG(L"[ETW] Lost event detected (buffer overflow). Total lost: " + std::to_wstring(count));
         return;
     }
 
-    self->lastEventTime_ = GetTickCount64();
     self->eventCount_.fetch_add(1, std::memory_order_relaxed);
 
     // Filter by provider

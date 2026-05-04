@@ -333,12 +333,19 @@ UnLeaf/
 
 ## Changelog
 
-### v1.1.4 (2026-05-01)
+### v1.1.4 (2026-05-01 / 2026-05-04)
 
 **ETW Callback Non-Blocking — Crash Root Fix**
 - Fixed ACCESS VIOLATION crash (INVALID_PROCESSTRACE_HANDLE) caused by blocking OS calls (`AssignProcessToJobObject` etc.) executing on the ETW consumer thread inside `OnProcessStart`, which could block `consumerThread_.join()` for up to 9 minutes and freeze `EngineControlLoop`
 - `OnProcessStart` now only calls `EnqueueRequest(ETW_PROCESS_START)` and returns immediately; all heavy work executes on `EngineControlLoop`
 - `EnforcementRequest` struct extended with `parentPid` / `imageName` / `imagePath` fields
+
+**ETW Stability Improvements (Windows 11 Build 26200)**
+- Fixed `MatchAnyKeyword=0x30` bug: `Microsoft-Windows-Kernel-Process` provider emits events with `keyword=0`; any non-zero `MatchAnyKeyword` (including `0x30` = PROCESS|THREAD) silently blocked all callbacks. Changed to `MatchAnyKeyword=0` to restore ETW delivery
+- Expanded ETW buffer constants: `ETW_BUFFER_SIZE_KB` 64→128 KB, `ETW_MIN_BUFFERS` 4→8, `ETW_MAX_BUFFERS` 32→64 (accommodates ~1,200 events/sec with `MatchAnyKeyword=0`)
+- Added ConsumerThread diagnostic logging: `OpenTraceW` handle value, `ProcessTrace` enter/exit with elapsed ms, first-callback receipt confirmation, first event keyword/eventId — aids post-hoc ETW failure analysis
+- `ResolveProcessPath`: suppressed `error=31` (system processes) and `error=87` (already-exited processes) from `QueryFullProcessImageNameW` debug output
+- Log level normalization: `OpenTraceW handle=` / `ProcessTrace enter/exit` downgraded ALERT→INFO; `Lost event detected` downgraded ALERT→DEBUG (confirmed structural noise at ~1/sec on this platform)
 
 ### v1.1.3 (2026-04-28)
 

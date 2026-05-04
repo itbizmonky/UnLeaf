@@ -1893,14 +1893,32 @@ void EngineCore::PerformPeriodicMaintenance(ULONGLONG now) {
 
         // §9.18 #3: etwEvents（累計）を DIAG 出力に追加
         // ETW silent drop / stall 状態の後追い検証を可能にする。判定ロジックには使わない。
-        uint32_t etwEvents = processMonitor_.GetEventCount();
+        uint32_t  etwEvents = processMonitor_.GetEventCount();
+        ULONGLONG lastEvtMs = processMonitor_.GetLastEventTime();
+        // etwAge=never disambiguates "no event ever received" from "event just
+        // arrived (age=0ms)". Numeric value ms-resolved when at least one event
+        // has been seen.
+        wchar_t etwAgeBuf[24];
+        if (lastEvtMs == 0) {
+            wcscpy_s(etwAgeBuf, L"never");
+        } else if (now >= lastEvtMs) {
+            swprintf_s(etwAgeBuf, L"%llums", now - lastEvtMs);
+        } else {
+            // Defensive: GetTickCount64 is monotonic, so this is unreachable in
+            // practice. Cheaper than asserting in a hot log path.
+            wcscpy_s(etwAgeBuf, L"skew");
+        }
+        const wchar_t* modeStr = (operationMode_ == OperationMode::NORMAL)
+                                 ? L"NORMAL" : L"DEGRADED_ETW";
 
         wchar_t diagBuf[384];
         swprintf_s(diagBuf,
             L"[DIAG] wait(reg:%llu unreg:%llu fail:%llu delta:%lld) "
-            L"tracked=%zu watchMap=%zu deferCtx=%zu errSup=%zu handles=%u etwEvents=%u",
+            L"tracked=%zu watchMap=%zu deferCtx=%zu errSup=%zu handles=%u "
+            L"etwEvents=%u etwAge=%s mode=%s",
             regCnt, unregCnt, unregFail, waitDelta,
-            trackedSz, watchMapSz, deferCtxCnt, errSupSz, handleCount, etwEvents);
+            trackedSz, watchMapSz, deferCtxCnt, errSupSz, handleCount,
+            etwEvents, etwAgeBuf, modeStr);
         LOG_DEBUG(diagBuf);
 
         lastDiagLogTime_ = now;
@@ -3267,8 +3285,13 @@ std::wstring EngineCore::ResolveProcessPath(HANDLE hProcess) const {
     wchar_t rawBuf[MAX_PATH + 1] = {};
     DWORD rawSize = MAX_PATH;
     if (!QueryFullProcessImageNameW(hProcess, 0, rawBuf, &rawSize)) {
-        LOG_DEBUG(L"[DIAG] ResolveProcessPath: QueryFullProcessImageNameW failed, error="
-                  + std::to_wstring(GetLastError()));
+        DWORD err = GetLastError();
+        // error=31 (ERROR_GEN_FAILURE): 毎 SafetyNet tick で発生する定常ノイズ — 抑制
+        // error=87 (ERROR_INVALID_PARAMETER): PID 無効化済み (プロセス終了) — 期待値
+        if (err != ERROR_GEN_FAILURE && err != ERROR_INVALID_PARAMETER) {
+            LOG_DEBUG(L"[DIAG] ResolveProcessPath: QueryFullProcessImageNameW failed, error="
+                      + std::to_wstring(err));
+        }
         return L"";
     }
 
