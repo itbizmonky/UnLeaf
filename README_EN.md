@@ -341,6 +341,8 @@ UnLeaf/
 - Added ConsumerThread diagnostic logging: `OpenTraceW` handle value, `ProcessTrace` enter/exit with elapsed ms, first-callback receipt confirmation, first event keyword/eventId — aids post-hoc ETW failure analysis
 - `ResolveProcessPath`: suppressed `error=31` (system processes) and `error=87` (already-exited processes) from `QueryFullProcessImageNameW` debug output
 - Log level normalization: `OpenTraceW handle=` / `ProcessTrace enter/exit` downgraded ALERT→INFO; `Lost event detected` downgraded ALERT→DEBUG (confirmed structural noise at ~1/sec on this platform)
+- Lost event DEBUG log rate-limited: `lastLostLogTime_` (atomic ULONGLONG) 60-second debounce — at most 1 log/minute regardless of event volume; suppresses DEBUG flood from structural noise while maintaining observability
+- `etwLost=N` field added to `[DIAG]` log: `lastDiagLostCount_` snapshot tracks lost event count delta per DIAG interval (not cumulative total); aids burst/spike detection
 
 ### v1.1.4 (2026-05-01)
 

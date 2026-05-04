@@ -341,6 +341,8 @@ UnLeaf/
 - ConsumerThread 診断ログ追加: `OpenTraceW` ハンドル値、`ProcessTrace` 入退出・経過時間、初回コールバック受信確認、初回イベント keyword/eventId を記録
 - `ResolveProcessPath`: `QueryFullProcessImageNameW` の `error=31` (システムプロセス) / `error=87` (終了済みプロセス) をデバッグ出力から抑制
 - ログレベル正規化: `OpenTraceW handle=` / `ProcessTrace enter/exit` を ALERT→INFO に、`Lost event detected` を ALERT→DEBUG に変更 (このプラットフォームでは約 1/sec の構造的ノイズと確認済み)
+- Lost event DEBUG ログ レート制限: `lastLostLogTime_` (atomic ULONGLONG) による 60 秒デバウンスで最大 1 回/分に制限。構造的ノイズによる DEBUG ログ洪水を抑制しつつ観測可能性を維持
+- `[DIAG]` ログに `etwLost=N` フィールド追加: `lastDiagLostCount_` スナップショットにより DIAG インターバルごとの lost event 増分 (デルタ) を記録。バースト/スパイク検出を支援
 
 ### v1.1.4 (2026-05-01)
 

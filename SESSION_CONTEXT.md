@@ -1,7 +1,7 @@
 # UnLeaf v1.1.0 Project Context
 
-> **最終更新**: 2026-04-28
-> **ステータス**: **v1.1.3 リリース済み** — §9.18 拡張: ETW cold-dead 検知 + 3 ステート復帰機械 (EtwState: HEALTHY/VERIFYING_RECOVERY/DEGRADED) + PERIODIC_FULL_SCAN_INTERVAL 60s→20s (根本要件対応: ETW 状態によらず新規 Chrome EcoQoS ≤20s 保証) + DEGRADED_SCAN_INTERVAL 30s→20s + ETW_COLD_DEAD_THRESHOLD_MS=240s + ETW_RECOVERY_VERIFY_MS=30s。ビルド警告ゼロ・151/151 PASS 確認済み。ドキュメント同期完了。
+> **最終更新**: 2026-05-04
+> **ステータス**: **v1.1.5 リリース済み** — §9.20: ETW 安定性改善 (Windows 11 Build 26200)。`MatchAnyKeyword=0x30` → `0` 根本修正 (プロバイダが keyword=0 でイベント発行するため非ゼロ MatchAnyKeyword が全コールバックを無音ブロックしていた)。ETW バッファ拡張 (128KB/8min/64max)。ConsumerThread 診断ログ強化。ログレベル正規化 (OpenTraceW/ProcessTrace ALERT→INFO、Lost event ALERT→DEBUG)。Lost event DEBUG ログ 60s レート制限 (`lastLostLogTime_`)。`[DIAG]` に `etwLost=N` フィールド追加。ビルド警告ゼロ・151/151 PASS 確認済み。
 
 ---
 
@@ -24,10 +24,14 @@
 
 | 検証項目 | 結果 |
 |---------|------|
-| ビルド (Service / Manager / Tests) | ✅ 警告ゼロ Release (2026-04-03) |
-| ユニットテスト | ✅ 151/151 PASS (2026-04-03) |
+| ビルド (Service / Manager / Tests) | ✅ 警告ゼロ Release (2026-05-01) |
+| ユニットテスト | ✅ 151/151 PASS (2026-05-01) |
 | §9.14 ServiceEngine メモリ増加対策 | ✅ 実装完了 (2026-04-03) |
 | §9.18 EcoQoS 検出補強 + ETW cold-dead 検知拡張 | ✅ 実装完了・v1.1.3 リリース済み (2026-04-28) |
+| §9.19 ETW Callback Non-Blocking Fix | ✅ 実装完了・v1.1.4 リリース済み (2026-05-01) |
+| ETW 観測性強化 (LOG_ALERT + firstCallbackLogged_ + DIAG etwAge/mode) | ✅ 実装完了・v1.1.4 に含む (2026-05-01) |
+| ETW 調査: MatchAnyKeyword=0x30 root cause 特定・修正 | ✅ 確認済み (2026-05-04) — MatchAnyKeyword=0 に変更し ETW デリバリ回復 |
+| §9.20 ETW 安定性改善 (MatchAnyKeyword・バッファ拡張・ログ最適化) | ✅ 実装完了・v1.1.5 リリース済み (2026-05-04) |
 | v1.1.0 リリース (§9.00〜§9.09 メモリ安定化) | ✅ 完了 (2026-03-26) |
 | RegistryPolicyManager v5 (IFEO/PT split) | ✅ 実装完了 (2026-03-29) |
 | CPU 暴走対策 (SetEvent 責務分離 + スピン検知) | ✅ 実装完了 (2026-03-29) |
@@ -41,17 +45,17 @@
 
 > **WDAC 注記 (解消)**: §8.42 で ctest による全 104 件の PASS を確認。WDAC によるブロックは現環境では発生せず。
 
-### ドキュメント状態 (2026-03-30 更新)
+### ドキュメント状態 (2026-05-04 更新)
 
 | ファイル | 状態 |
 |---------|------|
-| `docs/Engine_Specification.md` | ⚠️ 要更新 (v1.0.3 のまま — RegistryPolicyManager v5 未反映) |
+| `docs/Engine_Specification.md` | ✅ 最新 (v1.1.5・最終更新 2026-05-04) |
 | `docs/Manager_Specification.md` | ✅ 最新 (v1.0.3・最終更新 2026-03-24) |
 | `docs/UI_RULES.md` | ✅ 最新 (v1.0.3・最終更新 2026-03-24) |
 | `docs/GitHub_CI_Operation.md` | ✅ 最新 (v1.0.3・最終更新 2026-03-24) |
-| `README.md` | ⚠️ 要更新 (v1.0.3 のまま) |
-| `README_EN.md` | ⚠️ 要更新 (v1.0.3 のまま) |
-| `CHANGELOG.md` | ⚠️ 要更新 (v1.0.3 のまま — v5 改修未記載) |
+| `README.md` | ✅ 最新 (v1.1.5・最終更新 2026-05-04) |
+| `README_EN.md` | ✅ 最新 (v1.1.5・最終更新 2026-05-04) |
+| `CHANGELOG.md` | ✅ 最新 (v1.1.5・最終更新 2026-05-04) |
 
 ---
 
@@ -228,6 +232,8 @@ ctest --test-dir build -C Release --output-on-failure
 | §9.15 | **ProcessMonitor Hardening + CrashDump 対応** (`process_monitor.h/cpp`, `crash_handler.h/cpp` 新設, `service_main.cpp`, `config.h/cpp`, `engine_core.cpp`): ① `instance_` を `std::atomic<ProcessMonitor*>` に変更 (ABA 安全)。② Stop() に `stopMtx_` 導入 — CloseTrace → ControlTrace(STOP) → join の順序を保証し、join 外への mutex 解放で IPC スレッドブロックを最小化。③ IsHealthy() 完全再設計 — warmup 猶予期間 (120s)・starvation 検知 (lost event delta)・IsTraceSessionAliveLocked() (ControlTrace(QUERY) + キャッシュ 5s)。④ ImageName の unbounded read を bounded ループに修正 (AV 根絶)。⑤ Stop() のステップ経過時間ログ追加 (クラッシュ時フェーズ特定)。⑥ `crash_handler.cpp` 新設 — `SetUnhandledExceptionFilter` + `MiniDumpWriteDump` (ThreadInfo + IndirectlyReferencedMemory)。`[Logging] CrashDump=1` で有効化。dump 先: `<install>\crash\UnLeaf_Service_<timestamp>.dmp`。151/151 PASS 確認済み | 2026/04/10 |
 | §9.16 | **jobObjects_ ハンドルリーク修正 + ETW ヒープ断片化抑制** (`engine_core.h/cpp`, `process_monitor.cpp`): ① `RemoveTrackedProcess()` に `jobObjects_.erase(pid)` 追加 — プロセス終了時に Job Object ハンドルが `jobObjects_` に残留し続けるリークを根絶。trackedCs_ 解放後・jobCs_ 単独取得で実行し lock inversion (jobCs_→trackedCs_) を回避。② `ParseProcessStartEvent()` の TDH バッファを `thread_local std::vector<BYTE>` に変更 — イベント毎の heap alloc/free をゼロに削減しヒープ断片化を抑制。③ `wstringstream` → `to_wstring` 置換 (4箇所)。④ `engineControlThreadId_` を `std::atomic<DWORD>` 化 — DEBUG アサートの可視性保証を完全化。⑤ §9.17-B: `HeapOptimizeResources` を `EngineCore::Start()` に追加 — idle 時に未使用コミットページを積極 decommit (Win8.1+)。**根本原因**: v1.1.1 の 52時間稼働後クラッシュ (UnLeaf_Service_20260419_204543.dmp) は jobObjects_ stale エントリ蓄積によるハンドルテーブル枯渇が原因と分析。v1.1.2 で修正済み。Private Bytes 増加率: ~220KB/時 → 収束。Handle Count: 単調増加 → 収束。151/151 PASS 確認済み | 2026/04/20 |
 | §9.18 | **EcoQoS 根本要件保証 + ETW cold-dead 検知拡張** (`engine_core.h/cpp`): Windows 11 Update (2026-04-26 以降) での EcoQoS OFF 不全に対する拡張実装。**根本要件**: 「EcoQoS を OFF にする」は ETW 状態によらず保証すべき。`PERIODIC_FULL_SCAN_INTERVAL` 60s→**20s** で ETW 破損中でも新規 Chrome ≤20s 以内に検知。`DEGRADED_SCAN_INTERVAL` 30s→**20s**。**ETW cold-dead 検知**: 起動/再起動後 eventCount=0 が `ETW_COLD_DEAD_THRESHOLD_MS=240s` 継続 + HasAnyTargetRunning()=true で強制再起動。`IsHealthy()` は ControlTrace(QUERY) 成功なら healthy 誤判定し cold dead を見逃す盲点を補完。**EtwState 3ステート機械**: HEALTHY → VERIFYING_RECOVERY (RestartETW 後) → DEGRADED (ETW_RECOVERY_VERIFY_MS=30s タイムアウト×2回)。`etwVerificationBaseCount_` で Start() 直後の基準値を固定し hotStall 後の lastEtwEventCount_ 汚染回避。`RestartETW()` ヘルパーで Stop/Sleep(50ms)/Start/state 更新を集約。HasAnyTargetRunning() に trackedProcesses_ fast path 追加。**障害カバー時間**: PID 張り付き〜30s / ETW silent drop〜20s / ETW cold dead〜240s+30s×2 / ETW hot stall〜30s+3min cooldown / ETW 完全停止〜90s。VERSION=`L"1.1.3"`。Release ビルド警告ゼロ・151/151 PASS 確認済み | 2026/04/28 |
+| §9.19 | **ETW Callback Non-Blocking Fix** (`engine_core.h/cpp`, `types.h`): ETW コールバックスレッド (`OnProcessStart`) からブロッキング OS コールを完全排除。変更前: コールバック内で `IsTrackedParent`/`IsTargetName`/`HasPathTargets`/`TryApplyByPath` を直接呼び出し、場合によっては `OpenProcess`/Job Object 操作等の重い処理が発生していた。変更後: 対象プロセス判定のみコールバック内で実施 (`IsTargetName \|\| IsTrackedParent \|\| HasPathTargets` — いずれも atomic/read-only でμs以内)、重い処理は `EnqueueRequest(EnforcementRequest(...))` で EngineControlLoop に委譲。`DispatchEnforcementRequest` に `ETW_PROCESS_START` 型の dispatch ロジックを新設。**ETW 観測性強化** (`process_monitor.h/cpp`, `engine_core.cpp`): ① `StartTraceW`/`EnableTraceEx2` 失敗を `LOG_DEBUG` → `LOG_ALERT` に昇格。② `firstCallbackLogged_` (per-session atomic<bool>) — ETW セッション開始後の初回コールバック到達を一回限りで `LOG_INFO` 出力。③ DIAG 行に `etwAge=` (最終イベント経過時間、未受信は "never") と `mode=` (NORMAL/DEGRADED_ETW) を追加。VERSION=`L"1.1.4"`。Release ビルド警告ゼロ・151/151 PASS 確認済み | 2026/05/01 |
+| §9.20 | **ETW 安定性改善 — MatchAnyKeyword=0x30 根本修正** (`process_monitor.h/cpp`, `engine_core.h/cpp`, `types.h`): ① `MatchAnyKeyword=0x30` → `0` 根本修正 — `Microsoft-Windows-Kernel-Process` プロバイダが Windows 11 Build 26200 で `keyword=0` のイベントを発行することを確認。非ゼロの `MatchAnyKeyword` (=0x30: PROCESS\|THREAD) が zero値と AND を取ると常に 0 になるため全コールバックが無音で除外され `DEGRADED_ETW` 遷移を引き起こしていた。`MatchAnyKeyword=0` に変更し ETW デリバリを回復。② ETW バッファ定数拡張: `ETW_BUFFER_SIZE_KB` 64→128 KB、`ETW_MIN_BUFFERS` 4→8、`ETW_MAX_BUFFERS` 32→64 (~1,200 events/sec に対応)。③ ConsumerThread 診断ログ追加: `OpenTraceW` ハンドル値、`ProcessTrace` 入退出・経過時間 (ms)、`firstCallbackLogged_` per-session リセット。④ `ResolveProcessPath` ノイズ抑制: `error=31`/`error=87` を DEBUG 出力から除外。⑤ ログレベル正規化: OpenTraceW/ProcessTrace ALERT→INFO、Lost event ALERT→DEBUG。⑥ Lost event DEBUG ログ 60s レート制限 (`lastLostLogTime_` atomic ULONGLONG デバウンス)。⑦ `[DIAG]` に `etwLost=N` フィールド追加 (`lastDiagLostCount_` スナップショットによるデルタ記録)。VERSION=`L"1.1.5"`。Release ビルド警告ゼロ・151/151 PASS 確認済み | 2026/05/04 |
 
 ---
 
@@ -320,9 +326,9 @@ stale エントリとして蓄積し続ける。chrome.exe の頻繁な起動・
 
 ---
 
-## 10. v1.1.2 開発状況 + バックログ
+## 10. v1.1.4 開発状況 + バックログ
 
-### 9-0. v1.1.2 リリース済み + §9.18 追加実装 (2026-04-27 現在最新)
+### 9-0. v1.1.4 リリース済み (2026-05-01 現在最新)
 
 | 項目 | 状態 |
 |------|------|
@@ -334,9 +340,10 @@ stale エントリとして蓄積し続ける。chrome.exe の頻繁な起動・
 | §9.15 ProcessMonitor Hardening + CrashDump 対応 | ✅ リリース済み (v1.1.1 / 2026-04-10) |
 | §9.16 jobObjects_ ハンドルリーク修正 + ETW ヒープ断片化抑制 | ✅ リリース済み (v1.1.2 / 2026-04-20) |
 | §9.17-B HeapOptimizeResources 適用 | ✅ リリース済み (v1.1.2 / 2026-04-20) |
-| §9.18 EcoQoS 検出補強 (Windows 11 Update 対策) | ✅ 実装完了 (2026-04-27, **未リリース**) |
-| ユニットテスト | ✅ 151/151 (build 成功確認、ctest は WDAC ブロック) |
-| `VERSION` 定数 | `L"1.1.2"` (§9.18 後もユーザー指示待ち) |
+| §9.18 EcoQoS 検出補強 (Windows 11 Update 対策) | ✅ リリース済み (v1.1.3 / 2026-04-28) |
+| §9.19 ETW Callback Non-Blocking Fix + 観測性強化 | ✅ リリース済み (v1.1.4 / 2026-05-01) |
+| ユニットテスト | ✅ 151/151 PASS (2026-05-01) |
+| `VERSION` 定数 | `L"1.1.4"` |
 
 ### 9-A. 解消済み項目
 

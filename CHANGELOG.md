@@ -15,6 +15,8 @@ All notable changes to UnLeaf will be documented in this file.
 - `firstCallbackLogged_` per-session atomic flag: reset to `false` in `Start()` after `EnableTraceEx2` succeeds; accurately tracks whether the current session has delivered any callback
 - `ResolveProcessPath`: suppressed `error=31` (ERROR_GEN_FAILURE, system processes) and `error=87` (ERROR_INVALID_PARAMETER, already-exited processes) from `QueryFullProcessImageNameW` debug output; unknown errors only
 - Log level normalization: `OpenTraceW handle=` / `ProcessTrace enter` / `ProcessTrace exited` downgraded ALERT→INFO; `Lost event detected` downgraded ALERT→DEBUG (confirmed structural noise at ~1/sec on this platform)
+- Lost event DEBUG log rate-limited: `lastLostLogTime_` (atomic ULONGLONG) 60-second debounce added to `EVENT_TRACE_TYPE_LOST_EVENT` handler; at most 1 log line per minute — structural ~1/sec noise was flooding DEBUG output and burying other diagnostics. Time-series observability maintained at lower frequency
+- `etwLost=N` field added to `[DIAG]` log: `lastDiagLostCount_` snapshot tracks lost event count per DIAG interval; delta value emitted each tick. Enables burst/spike detection and rate-trend analysis from log review
 
 ---
 
