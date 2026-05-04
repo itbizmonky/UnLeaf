@@ -720,14 +720,14 @@ STABLE / PERSISTENT での ETW_THREAD_START 処理で使用される。enforceme
 |------|-----|
 | プロバイダ | Microsoft-Windows-Kernel-Process |
 | GUID | `{22FB2CD6-0E7B-422B-A0C7-2FAD1FD0E716}` |
-| キーワード | `0x30` (PROCESS `0x10` \| THREAD `0x20`) |
+| キーワード | `0` (**v1.1.5:** `Microsoft-Windows-Kernel-Process` プロバイダは `keyword=0` でイベントを発行するため、非ゼロの `MatchAnyKeyword` は全イベントを除外する。`0` で全通過) |
 | レベル | `TRACE_LEVEL_INFORMATION` |
 | モード | `EVENT_TRACE_REAL_TIME_MODE` |
 | クロック | QPC (`ClientContext = 1`) |
 | セッション名 | `UnLeafProcessMonitor_<PID>` |
-| バッファサイズ | `64 KB` (v1.0.2 で明示化) |
-| 最小バッファ数 | `4` |
-| 最大バッファ数 | `32` |
+| バッファサイズ | `128 KB` (**v1.1.5:** 64→128) |
+| 最小バッファ数 | `8` (**v1.1.5:** 4→8) |
+| 最大バッファ数 | `64` (**v1.1.5:** 32→64) |
 | フラッシュタイマー | `0` (リアルタイムコンシューマーモード) |
 
 ### 7.2 イベント処理
